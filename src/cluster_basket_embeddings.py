@@ -23,6 +23,8 @@ team's real GMM_smoothening.py / best_k_value.py logic — swap them in once
 you share those files.
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -55,7 +57,12 @@ GMM_K_MAX          = 60
 GMM_K_STEP         = 5
 GMM_N_INIT         = 3
 GMM_COVARIANCE     = "diag"   # "diag" scales to more dimensions than "full" without blowing up
-GMM_MODEL_PATH     = "gmm_basket_model.pkl"   # fitted model, reloaded by score_new_baskets.py
+
+# All pipeline-produced artifacts land here, not the working directory.
+OUTPUT_DIR         = "../data/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+GMM_MODEL_PATH     = os.path.join(OUTPUT_DIR, "gmm_basket_model.pkl")   # fitted model, reloaded by score_new_baskets.py
 
 
 # ─────────────────────────────────────────────
@@ -77,8 +84,20 @@ def build_basket_knn_graph(
     Returns
     -------
     DataFrame with columns: basket_a, basket_b, weight
+
+    Edge construction is fully vectorized (NumPy arrays + a sorted-array
+    lookup for the mutual-kNN membership check) rather than a per-basket-pair
+    Python loop. At real data scale (tens of millions of baskets x k
+    neighbors), the previous version accumulated results into a plain Python
+    dict keyed by (i, j) tuples — hundreds of millions of entries, each
+    costing far more memory than its two ints + one float actually need, and
+    a pure-Python loop over that many iterations is also far too slow to
+    finish in practical time at this N. Neither of those costs depend on the
+    math changing here — same neighbors, same similarities, same mutual-kNN
+    rule, just computed over arrays instead of one basket-pair at a time.
     """
     basket_ids = basket_gnn_embeddings["basket_id"].tolist()
+    n = len(basket_ids)
     X = normalize(np.stack(basket_gnn_embeddings["gnn_embedding"].values))
 
     if HAVE_PYNNDESCENT:
@@ -89,40 +108,57 @@ def build_basket_knn_graph(
         nn.fit(X)
         distances, indices = nn.kneighbors(X)
 
-    # per-basket top-K neighbor sets + directional similarities, needed for
-    # the mutual-kNN check below
-    neighbor_sets, directional_sim = [], {}
-    for i in range(len(basket_ids)):
-        neighbors_i = set()
-        for j_pos in range(1, k + 1):
-            j = int(indices[i, j_pos])
-            if j != i:
-                neighbors_i.add(j)
-                directional_sim[(i, j)] = 1 - distances[i, j_pos]
-        neighbor_sets.append(neighbors_i)
+    # Drop each row's own self-match (its nearest "neighbor" is itself, at
+    # column 0), keep the k candidate neighbor columns, and flatten into one
+    # (src, dst, similarity) edge per directed pair — same neighbors the old
+    # per-basket loop iterated, just as arrays instead of a Python loop body.
+    neighbor_idx  = indices[:, 1:k + 1].astype(np.int64)
+    neighbor_dist = distances[:, 1:k + 1]
 
-    rows = []
+    src = np.repeat(np.arange(n, dtype=np.int64), neighbor_idx.shape[1])
+    dst = neighbor_idx.reshape(-1)
+    sim = (1 - neighbor_dist).reshape(-1).astype(np.float64)
+
+    # Defensive: drop any self-match that slipped in at a position other
+    # than 0 (e.g. duplicate embeddings) — same as the old loop's `j != i`.
+    not_self = dst != src
+    src, dst, sim = src[not_self], dst[not_self], sim[not_self]
+
+    # Mutual-kNN check: "does the reverse edge (j, i) also exist among the
+    # edges above" — done via one integer key per directed pair and a sorted
+    # search, instead of hundreds of millions of dict lookups.
+    keys = src * n + dst
+    order = np.argsort(keys)
+    sorted_keys = keys[order]
+
+    rev_keys   = dst * n + src
+    pos        = np.clip(np.searchsorted(sorted_keys, rev_keys), 0, len(sorted_keys) - 1)
+    rev_exists = sorted_keys[pos] == rev_keys
+    rev_sim    = sim[order[pos]]
+
+    basket_id_arr = np.array(basket_ids)
+
     if use_mutual:
-        for i in range(len(basket_ids)):
-            for j in neighbor_sets[i]:
-                if i < j and i in neighbor_sets[j]:
-                    sim_ij = directional_sim.get((i, j))
-                    sim_ji = directional_sim.get((j, i))
-                    avg_sim = float(np.mean([s for s in [sim_ij, sim_ji] if s is not None]))
-                    if avg_sim > 0:
-                        rows.append({"basket_a": basket_ids[i], "basket_b": basket_ids[j], "similarity": avg_sim})
+        # Reverse direction must exist (mutual), and each undirected pair is
+        # kept exactly once via src < dst — same as the old `i < j` check.
+        avg_sim = (sim + rev_sim) / 2.0
+        keep = rev_exists & (src < dst) & (avg_sim > 0)
+        edge_a, edge_b, edge_sim = src[keep], dst[keep], avg_sim[keep]
     else:
-        for i in range(len(basket_ids)):
-            for j in neighbor_sets[i]:
-                if directional_sim[(i, j)] > 0:
-                    a, b = sorted([basket_ids[i], basket_ids[j]])
-                    rows.append({"basket_a": a, "basket_b": b, "similarity": directional_sim[(i, j)]})
+        keep = sim > 0
+        edge_a = np.minimum(src[keep], dst[keep])
+        edge_b = np.maximum(src[keep], dst[keep])
+        edge_sim = sim[keep]
 
-    edges = pd.DataFrame(rows).drop_duplicates(subset=["basket_a", "basket_b"])
+    edges = pd.DataFrame({
+        "basket_a": basket_id_arr[edge_a],
+        "basket_b": basket_id_arr[edge_b],
+        "similarity": edge_sim,
+    }).drop_duplicates(subset=["basket_a", "basket_b"])
     edges["weight"] = minmax_scale(edges["similarity"])
 
     print(f"Basket kNN graph ({'mutual' if use_mutual else 'one-directional'}): "
-          f"{len(edges)} edges over {len(basket_ids)} baskets")
+          f"{len(edges)} edges over {n} baskets")
     return edges[["basket_a", "basket_b", "weight"]]
 
 

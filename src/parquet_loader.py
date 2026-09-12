@@ -3,7 +3,7 @@ parquet_loader.py
 
 Reads two parquet files:
 
-    data/product_embeddings.parquet   <- built by build_product_embeddings.py
+    data/output/product_embeddings.parquet   <- built by build_product_embeddings.py
                                                (sql/01, 02, 03 feed that script,
                                                not this one directly — embeddings
                                                don't exist in your warehouse yet)
@@ -24,7 +24,7 @@ import pandas as pd
 # Update these two paths to your downloaded files
 # ─────────────────────────────────────────────
 
-PRODUCT_EMBEDDINGS_PARQUET = Path("../data/product_embeddings.parquet")
+PRODUCT_EMBEDDINGS_PARQUET = Path("../data/output/product_embeddings.parquet")
 HOUSEHOLD_TPNB_PERIOD_PARQUET   = Path("../data/ns_household_tpnb_period_agg_train")
 
 REQUIRED_PRODUCT_COLS   = {"tpnb", "embedding"}

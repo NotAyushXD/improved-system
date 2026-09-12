@@ -44,6 +44,7 @@ no product_theme.pkl anymore — that concept no longer exists.
 """
 
 import os
+import gc
 import numpy as np
 import torch
 from torch_geometric.data import Data
@@ -62,8 +63,15 @@ from sklearn.preprocessing import normalize
 
 TOP_K               = 10
 N_TRAIN_SAMPLES      = 1_000_000
-GRAPH_CACHE_PATH     = "training_graphs.pkl"
 SEED                 = 42
+
+# All pipeline-produced artifacts (caches, models, embeddings) live under
+# this folder rather than scattered in the working directory. Created here
+# so any of this module's write sites can assume it already exists.
+OUTPUT_DIR           = "../data/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+GRAPH_CACHE_PATH     = os.path.join(OUTPUT_DIR, "training_graphs.pkl")
 
 # Global product sub-clustering (whole catalog, no theme/category
 # pre-grouping of any kind). K is selected from these candidates via
@@ -75,7 +83,7 @@ SUBCL_K_CANDIDATES   = [50, 100, 200, 400]
 SUBCL_N_INIT         = 5
 SUBCL_BATCH_SIZE      = 4096
 SUBCL_SIL_SAMPLE      = 5000   # silhouette evaluated on a sample, not the whole catalog
-SUBCL_CACHE_PATH      = "product_subclusters.pkl"  # cached after first run
+SUBCL_CACHE_PATH      = os.path.join(OUTPUT_DIR, "product_subclusters.pkl")  # cached after first run
 
 
 # ─────────────────────────────────────────────
@@ -356,61 +364,77 @@ def sample_baskets(baskets, n_samples=N_TRAIN_SAMPLES, seed=SEED):
     """
     Stratified sampling by basket size only — no theme/category dimension
     anywhere in this function.
+
+    Works with size/index arrays rather than copying `baskets` itself:
+    `baskets` holds list-typed products/units columns that can run into tens
+    of GB at real data scale, and the previous version's `baskets.copy()`
+    plus five per-stratum boolean-filtered subsets duplicated a meaningful
+    fraction of that just to add two small helper columns. Only the FINAL
+    sampled rows (n_samples, not the full population) are ever materialized
+    out of `baskets`.
     """
     import pandas as pd
 
-    df = baskets.copy()
-    df["_size"] = df["products"].apply(len)
-
+    sizes = baskets["products"].apply(len)
     bins   = [0, 1, 5, 15, 50, 10_000]
     labels = ["1", "2-5", "6-15", "16-50", "50+"]
-    df["_size_bin"] = pd.cut(df["_size"], bins=bins, labels=labels)
+    size_bin = pd.cut(sizes, bins=bins, labels=labels)
 
-    stratum_counts = df["_size_bin"].value_counts()
-    total          = len(df)
-    sampled_parts  = []
+    stratum_counts = size_bin.value_counts()
+    total          = len(baskets)
+    rng            = np.random.default_rng(seed)
 
+    sampled_idx_parts = []
     for stratum, count in stratum_counts.items():
-        quota = max(1, round(n_samples * count / total))
-        group = df[df["_size_bin"] == stratum]
-        sampled_parts.append(group.sample(n=min(len(group), quota), random_state=seed))
+        quota       = max(1, round(n_samples * count / total))
+        stratum_idx = size_bin.index[size_bin == stratum].to_numpy()
+        take        = min(len(stratum_idx), quota)
+        sampled_idx_parts.append(rng.choice(stratum_idx, size=take, replace=False))
 
-    sampled = pd.concat(sampled_parts)
-    if len(sampled) > n_samples:
-        sampled = sampled.sample(n=n_samples, random_state=seed)
+    sampled_idx = np.concatenate(sampled_idx_parts)
+    if len(sampled_idx) > n_samples:
+        sampled_idx = rng.choice(sampled_idx, size=n_samples, replace=False)
 
-    n_strata = sampled["_size_bin"].nunique()
+    sampled  = baskets.loc[sampled_idx].reset_index(drop=True)
+    n_strata = size_bin.loc[sampled_idx].nunique()
     print(f"  Sampled {len(sampled):,} baskets across {n_strata} basket-size strata")
-    return sampled.drop(columns=["_size", "_size_bin"]).reset_index(drop=True)
+    return sampled
 
 
 # ─────────────────────────────────────────────
-# DENSE CO-PURCHASE SUBMATRIX
+# PER-BASKET DENSE CO-PURCHASE SUBMATRIX
+#
+# There is deliberately no whole-sample dense co-purchase matrix anywhere in
+# this file anymore. An earlier version pre-built ONE dense matrix covering
+# every product touched anywhere across the whole training sample — but at
+# real catalog sizes, a random sample of tens/hundreds of thousands of
+# baskets typically touches nearly the ENTIRE catalog (a basic
+# coupon-collector argument: covering a catalog of size N needs on the
+# order of N*ln(N) product draws, far fewer than a large training sample
+# actually produces), so that matrix tends toward catalog_size^2 * 4 bytes —
+# well over 100GB for a ~200k-product catalog — no matter how carefully the
+# sample is chosen. There is no safe fixed size threshold to fall back on,
+# so instead this is solved by never needing that matrix at all: every
+# basket only ever needs co-purchase counts between ITS OWN products, so
+# each basket gets its own small submatrix, sliced from the sparse GLOBAL
+# co-purchase matrix on the fly. Its size is bounded by that one basket's
+# product count squared — independent of catalog size — and is used
+# identically by both build_training_graphs() (training) and
+# embed_all_baskets_fast() (inference/scoring), so both remain guaranteed to
+# compute this the same way.
 # ─────────────────────────────────────────────
 
-def build_dense_cp_submatrix(sampled_baskets, product_id_to_index, csr):
-    print("  Collecting unique product indices in sampled baskets...")
-    all_pids = set()
-    for products in sampled_baskets["products"]:
-        for p in products:
-            if p in product_id_to_index:
-                all_pids.add(product_id_to_index[p])
-
-    global_idx = np.array(sorted(all_pids), dtype=np.int64)
-    local_idx  = {g: l for l, g in enumerate(global_idx)}
-    n          = len(global_idx)
-    mem_gb     = (n * n * 4) / 1e9
-
-    print(f"  Unique products in sampled baskets: {n:,}  |  Dense matrix: {mem_gb:.1f} GB")
-
-    if mem_gb > 200:
-        print("  WARNING: >200GB, falling back to sparse")
-        dense_cp = None
-    else:
-        dense_cp = np.asarray(csr[global_idx][:, global_idx].todense(), dtype=np.float32)
-        print("  Dense submatrix ready.")
-
-    return dense_cp, local_idx, global_idx
+def _basket_dense_cp_submatrix(products, csr, pid2idx):
+    global_idx_arr = np.array(
+        sorted({pid2idx[p] for p in products if p in pid2idx}), dtype=np.int64
+    )
+    if len(global_idx_arr) == 0:
+        return {}, np.zeros((0, 0), dtype=np.float32)
+    local_idx_map = {int(g): l for l, g in enumerate(global_idx_arr)}
+    dense_cp = np.asarray(
+        csr[global_idx_arr][:, global_idx_arr].todense(), dtype=np.float32
+    )
+    return local_idx_map, dense_cp
 
 
 # ─────────────────────────────────────────────
@@ -533,13 +557,17 @@ def build_one_graph(
 # BUILD ALL TRAINING GRAPHS
 # ─────────────────────────────────────────────
 
-def build_training_graphs(sampled_baskets, G, dense_cp, local_idx):
+def build_training_graphs(sampled_baskets, G):
     """
     Builds the in-memory graph list. Does NOT save/cache to disk — see
-    save_training_graphs() for that, called separately by the caller after
-    dense_cp (often tens of GB) can be freed. Splitting these two means
-    dense_cp doesn't have to stay alive in the caller's scope right through
-    the disk-write step, which is exactly when peak memory is highest.
+    save_training_graphs() for that.
+
+    Each basket gets its own small, basket-scoped dense co-purchase
+    submatrix (_basket_dense_cp_submatrix — the same one
+    embed_all_baskets_fast() uses at inference), built on the fly from a
+    sparse slice of G["csr"]. See the comment above
+    _basket_dense_cp_submatrix for why there is no shared, whole-sample
+    dense matrix here.
     """
     if os.path.exists(GRAPH_CACHE_PATH):
         print(f"Loading cached training graphs from {GRAPH_CACHE_PATH}...")
@@ -552,19 +580,23 @@ def build_training_graphs(sampled_baskets, G, dense_cp, local_idx):
     print("Warming up numba...")
     _warmup_numba()
 
-    has_units  = "units" in sampled_baskets.columns
-    basket_ids = (
+    has_units    = "units" in sampled_baskets.columns
+    basket_ids   = (
         sampled_baskets["basket_id"].tolist()
         if "basket_id" in sampled_baskets.columns
         else list(range(len(sampled_baskets)))
     )
+    all_products = sampled_baskets["products"].tolist()
+    all_units    = sampled_baskets["units"].tolist() if has_units else None
+
+    csr     = G["csr"]
+    pid2idx = G["product_id_to_index"]
 
     graphs = []
-    for i, (_, row) in enumerate(tqdm(sampled_baskets.iterrows(),
-                                       total=len(sampled_baskets),
-                                       desc="Building training graphs")):
-        products = row["products"]
-        units    = row["units"] if has_units else [1.0] * len(products)
+    for i in tqdm(range(len(sampled_baskets)), desc="Building training graphs"):
+        products = all_products[i]
+        units    = all_units[i] if all_units is not None else [1.0] * len(products)
+        local_idx_map, basket_dense_cp = _basket_dense_cp_submatrix(products, csr, pid2idx)
         g = build_one_graph(
             products            = products,
             units               = units,
@@ -573,9 +605,9 @@ def build_training_graphs(sampled_baskets, G, dense_cp, local_idx):
             emb_dim             = G["emb_dim"],
             subcluster_arr      = G["subcluster_arr"],
             distinctiveness_arr = G["distinctiveness_arr"],
-            dense_cp            = dense_cp,
-            local_idx           = local_idx,
-            product_id_to_index = G["product_id_to_index"],
+            dense_cp            = basket_dense_cp,
+            local_idx           = local_idx_map,
+            product_id_to_index = pid2idx,
         )
         graphs.append(g)
 
@@ -584,10 +616,9 @@ def build_training_graphs(sampled_baskets, G, dense_cp, local_idx):
 
 def save_training_graphs(graphs):
     """
-    Separated from build_training_graphs() on purpose — call this AFTER
-    dense_cp has been deleted in the caller's scope (and ideally after
-    gc.collect()), so the disk-write doesn't have to compete with a huge
-    matrix that's no longer needed for anything.
+    Separated from build_training_graphs() as its own step so a caller can
+    free anything else it no longer needs before this disk write, since a
+    write of this size is exactly when peak memory tends to be highest.
 
     Writes to a temp file and atomically renames it into place only once the
     write fully succeeds — if this crashes partway (MemoryError, killed
@@ -625,13 +656,20 @@ def save_training_graphs(graphs):
 # function, used both times.
 # ─────────────────────────────────────────────
 
-def embed_all_baskets_fast(baskets, G, model, device, batch_size=4096):
+def embed_all_baskets_fast(baskets, G, model, device, batch_size=4096, graph_chunk_size=50_000):
     """
-    At inference there's no training-sample-scoped dense_cp to reuse (any
-    basket can contain any product in the catalog), so each basket gets its
-    own small, basket-scoped dense co-purchase submatrix built on the fly
-    from a sparse slice of G["csr"] — cheap, since a basket is typically
-    tens of products, not the whole catalog.
+    Builds a REAL per-basket graph for every basket — reusing build_one_graph
+    and _basket_dense_cp_submatrix, the exact same per-basket construction
+    build_training_graphs() uses — and runs it through the model's full
+    encode() pipeline.
+
+    Graphs are built and encoded in chunks of `graph_chunk_size` baskets,
+    never all at once: at real data scale (tens of millions of baskets),
+    holding every basket's graph object in memory simultaneously before
+    running any of them through the model needs on the order of terabytes.
+    Only the final embeddings (n_baskets x out_dim floats — a few GB even at
+    20M+ baskets) are accumulated across chunks; each chunk's graphs are
+    discarded once encoded.
     """
     from torch_geometric.loader import DataLoader as PyGDataLoader
 
@@ -646,49 +684,46 @@ def embed_all_baskets_fast(baskets, G, model, device, batch_size=4096):
 
     csr     = G["csr"]
     pid2idx = G["product_id_to_index"]
+    n_total = len(all_products)
 
-    print("Building per-basket graphs for inference (same construction as training)...")
-    graphs = []
-    for i, products in enumerate(tqdm(all_products, desc="Building inference graphs")):
-        units = all_units[i] if all_units is not None else [1.0] * len(products)
-
-        global_idx_arr = np.array(
-            sorted({pid2idx[p] for p in products if p in pid2idx}), dtype=np.int64
-        )
-
-        if len(global_idx_arr) == 0:
-            local_idx_map   = {}
-            basket_dense_cp = np.zeros((0, 0), dtype=np.float32)
-        else:
-            local_idx_map   = {int(g): l for l, g in enumerate(global_idx_arr)}
-            basket_dense_cp = np.asarray(
-                csr[global_idx_arr][:, global_idx_arr].todense(), dtype=np.float32
-            )
-
-        g = build_one_graph(
-            products             = products,
-            units                = units,
-            basket_id            = basket_ids[i],
-            emb_matrix           = G["emb_matrix"],
-            emb_dim              = G["emb_dim"],
-            subcluster_arr       = G["subcluster_arr"],
-            distinctiveness_arr  = G["distinctiveness_arr"],
-            dense_cp             = basket_dense_cp,
-            local_idx            = local_idx_map,
-            product_id_to_index  = pid2idx,
-        )
-        graphs.append(g)
-
-    print("Running full GNN encoding (node_encoder -> conv1 -> conv2 -> pool -> proj)...")
+    print(f"Embedding {n_total:,} baskets in chunks of {graph_chunk_size:,} baskets "
+          f"(built and encoded per chunk — graphs for the whole population are "
+          f"never held in memory at once)...")
     model.eval()
-    loader = PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
-    all_z = []
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="GNN encoding"):
-            batch = batch.to(device)
-            z = model.encode(batch)
-            all_z.append(z.detach().cpu().numpy().astype(np.float32))
 
-    all_z = np.vstack(all_z)
+    all_z_parts = []
+    for chunk_start in tqdm(range(0, n_total, graph_chunk_size), desc="Basket chunks"):
+        chunk_end = min(chunk_start + graph_chunk_size, n_total)
+
+        graphs = []
+        for i in range(chunk_start, chunk_end):
+            products = all_products[i]
+            units    = all_units[i] if all_units is not None else [1.0] * len(products)
+            local_idx_map, basket_dense_cp = _basket_dense_cp_submatrix(products, csr, pid2idx)
+            g = build_one_graph(
+                products             = products,
+                units                = units,
+                basket_id            = basket_ids[i],
+                emb_matrix           = G["emb_matrix"],
+                emb_dim              = G["emb_dim"],
+                subcluster_arr       = G["subcluster_arr"],
+                distinctiveness_arr  = G["distinctiveness_arr"],
+                dense_cp             = basket_dense_cp,
+                local_idx            = local_idx_map,
+                product_id_to_index  = pid2idx,
+            )
+            graphs.append(g)
+
+        loader = PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(device)
+                z = model.encode(batch)
+                all_z_parts.append(z.detach().cpu().numpy().astype(np.float32))
+
+        del graphs, loader
+        gc.collect()
+
+    all_z = np.vstack(all_z_parts)
     print(f"Final embedding shape: {all_z.shape}")
     return basket_ids, all_z

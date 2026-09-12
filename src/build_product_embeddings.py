@@ -35,7 +35,7 @@ as parquet:
     data/tpnb_to_tpna_mapping.parquet      <- sql/02_tpnb_to_tpna_mapping.sql
 
 Produces:
-    data/product_embeddings.parquet   (the file pipeline_main.py reads)
+    data/output/product_embeddings.parquet   (the file pipeline_main.py reads)
 
 Install:  pip install sentence-transformers --break-system-packages
 
@@ -62,7 +62,7 @@ from sklearn.decomposition import PCA
 PRODUCT_ATTRIBUTES_TPNA_PARQUET = Path("../data/ns_item_lookup_tpna")
 TPNB_TO_TPNA_MAPPING_PARQUET    = Path("../data/ns_tpnb_to_tpna_mapping")
 
-OUTPUT_PARQUET = Path("../data/product_embeddings.parquet")
+OUTPUT_PARQUET = Path("../data/output/product_embeddings.parquet")
 
 # Swap for a local model path if you're on an offline machine — same as
 # multiview_clustering_v5.py's local E:\...\miniLMV6L2 copy.

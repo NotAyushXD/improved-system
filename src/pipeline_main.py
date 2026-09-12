@@ -25,7 +25,8 @@ unused — see REFACTOR_NOTES.md).
 BREAKING CHANGE — cached artifact schema: GraphBuilder.py's node feature
 layout changed (in_dim = emb_dim + 4, was + 5) and its sub-clustering
 algorithm changed (global MiniBatchKMeans, was per-theme KMeans). Delete
-these before running this version, if they exist from an earlier run:
+these under data/output/ before running this version, if they exist from an
+earlier run:
     product_subclusters.pkl, training_graphs.pkl, basket_gnn_model.pt,
     copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl
 There is no product_theme.pkl to delete — that file is never written by
@@ -47,7 +48,9 @@ use "../data/..." on that assumption):
     │   ├── ns_tpnb_to_tpna_mapping/                (folder)
     │   ├── ns_household_tpnb_period_agg_train/     (folder)
     │   ├── ns_household_tpnb_period_agg_score/     (folder — used later by score_new_baskets.py)
-    │   └── product_embeddings.parquet              (single file — written by build_product_embeddings.py)
+    │   └── output/                                 (everything this pipeline WRITES lands here —
+    │                                                 product_embeddings.parquet, caches, the
+    │                                                 trained model, embeddings, need-state output)
     └── src/
         ├── build_product_embeddings.py
         ├── pipeline_main.py
@@ -92,6 +95,24 @@ MIN_BASKET_PRODUCTS = 2
 # reports BIC/AIC per K if you want to eyeball it first.
 GMM_N_COMPONENTS = 30
 
+# Co-purchase matrix is built in row-chunks of this many baskets at a time,
+# with the running result checkpointed to disk after every chunk. This
+# bounds peak memory during that step and survives a crash/restart without
+# losing already-completed work — it does NOT change the result: X.T @ X is
+# exactly additive over row-disjoint chunks of X (a basket only contributes
+# co-purchase pairs to itself, never across baskets, and `baskets` is
+# already one row per basket, so no basket ever straddles two chunks).
+# Lower this if you still see memory pressure; raise it for fewer, faster
+# chunks once you've confirmed headroom.
+COPURCHASE_CHUNK_BASKETS = 500_000
+
+# All pipeline-produced artifacts (caches, models, embeddings, cluster
+# output) live under this one folder — nothing gets written to the working
+# directory. Input SQL exports you downloaded by hand stay under data/
+# directly (they're inputs, not outputs of this script).
+OUTPUT_DIR = "../data/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 # ─────────────────────────────────────────────
 # Cache-staleness guard
 # ─────────────────────────────────────────────
@@ -103,7 +124,8 @@ GMM_N_COMPONENTS = 30
 # feature schema (in_dim = emb_dim + 5, per-theme sub-clustering), which
 # will silently corrupt this run rather than error loudly. Delete both
 # before your first run against this version.
-for _stale_cache in ("product_subclusters.pkl", "training_graphs.pkl"):
+for _stale_cache in (os.path.join(OUTPUT_DIR, "product_subclusters.pkl"),
+                     os.path.join(OUTPUT_DIR, "training_graphs.pkl")):
     if os.path.exists(_stale_cache):
         print(f"WARNING: {_stale_cache} exists and will be REUSED AS-IS by GraphBuilder "
               f"(cached by fixed filename, not by data or code fingerprint). If this is "
@@ -123,7 +145,7 @@ for _stale_cache in ("product_subclusters.pkl", "training_graphs.pkl"):
 # .parquet file — pandas reads that folder directly, so these point straight
 # at the folder names as downloaded. Paths are relative to running this
 # script from inside src/ (see the note at the top of this file).
-PRODUCT_EMBEDDINGS_PARQUET    = "../data/output/product_embeddings.parquet"
+PRODUCT_EMBEDDINGS_PARQUET    = os.path.join(OUTPUT_DIR, "product_embeddings.parquet")
 HOUSEHOLD_TPNB_PERIOD_PARQUET = "../data/ns_household_tpnb_period_agg_train"
 
 print("[Stage 0] Reading warehouse exports...")
@@ -173,23 +195,74 @@ if len(baskets) > BASKET_COUNT_WARN_THRESHOLD:
           f"intentional, stop now (Ctrl+C) and check sql/04's household-sampling filter "
           f"is actually being applied to the data you downloaded.")
 
-print("Building co-purchase matrix...")
-basket_items = baskets.explode("products").rename(columns={"products": "product_id"})
-basket_items = basket_items.drop_duplicates(["basket_id", "product_id"])
-basket_codes, basket_uniques   = pd.factorize(basket_items["basket_id"])
-product_codes, product_uniques = pd.factorize(basket_items["product_id"])
-X = csr_matrix(
-    (np.ones(len(basket_items), dtype=np.int32), (basket_codes, product_codes)),
-    shape=(len(basket_uniques), len(product_uniques)),
-)
-copurchase_sparse    = X.T @ X
-product_id_to_index  = {pid: idx for idx, pid in enumerate(product_uniques)}
+print("Building co-purchase matrix "
+      f"(chunked {COPURCHASE_CHUNK_BASKETS:,} baskets at a time, checkpointed to disk)...")
 
-# basket_items (and the intermediate X) are only needed to build
-# copurchase_sparse — not used again. Freeing them here rather than letting
-# them sit until the script ends matters at real data scale.
-del basket_items, X, basket_codes, product_codes
-gc.collect()
+# Global product vocabulary — bounded by the number of DISTINCT products
+# (tens/hundreds of thousands), not the ~1 billion basket-product rows. Built
+# by scanning the already-in-memory `products` lists once; no explode of the
+# full basket table needed just to find this.
+product_set = set()
+for products in baskets["products"]:
+    product_set.update(products)
+product_uniques     = np.array(sorted(product_set))
+product_id_to_index = {pid: idx for idx, pid in enumerate(product_uniques)}
+n_products_cp        = len(product_uniques)
+print(f"  {n_products_cp:,} distinct products across all baskets")
+
+# Checkpoint files for this step only — deleted once the matrix is complete.
+# If this crashes partway, re-running the script picks up from the last
+# completed chunk instead of starting the whole matrix over.
+_CP_CHECKPOINT = os.path.join(OUTPUT_DIR, "copurchase_sparse.checkpoint.npz")
+_CP_PROGRESS   = os.path.join(OUTPUT_DIR, "copurchase_sparse.progress.txt")
+
+n_baskets_total = len(baskets)
+n_chunks = (n_baskets_total + COPURCHASE_CHUNK_BASKETS - 1) // COPURCHASE_CHUNK_BASKETS
+
+start_chunk = 0
+if os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
+    copurchase_sparse = sp.load_npz(_CP_CHECKPOINT).tocsr()
+    start_chunk = int(open(_CP_PROGRESS).read().strip())
+    print(f"  Resuming from checkpoint: {start_chunk}/{n_chunks} chunks already done "
+          f"(nnz so far={copurchase_sparse.nnz:,}) — delete {_CP_CHECKPOINT} and "
+          f"{_CP_PROGRESS} if you want this step to start over from scratch instead.")
+else:
+    copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
+
+for chunk_i in range(start_chunk, n_chunks):
+    lo = chunk_i * COPURCHASE_CHUNK_BASKETS
+    hi = min(lo + COPURCHASE_CHUNK_BASKETS, n_baskets_total)
+
+    # Explode only this chunk's "products" column (not the whole row, which
+    # would needlessly duplicate every other column — units, household_number,
+    # etc. — across every exploded row, the way the old single-shot version did).
+    chunk_items = baskets["products"].iloc[lo:hi].explode()
+    if len(chunk_items) == 0:
+        continue
+    local_basket_codes, _ = pd.factorize(chunk_items.index, sort=False)
+    product_idx = chunk_items.map(product_id_to_index).to_numpy()
+
+    X_chunk = csr_matrix(
+        (np.ones(len(chunk_items), dtype=np.int32), (local_basket_codes, product_idx)),
+        shape=(local_basket_codes.max() + 1, n_products_cp),
+    )
+    copurchase_sparse = (copurchase_sparse + (X_chunk.T @ X_chunk)).tocsr()
+    del chunk_items, local_basket_codes, product_idx, X_chunk
+    gc.collect()
+
+    tmp_ckpt = _CP_CHECKPOINT + ".writing.npz"
+    sp.save_npz(tmp_ckpt, copurchase_sparse)
+    os.replace(tmp_ckpt, _CP_CHECKPOINT)   # atomic — never leaves a truncated checkpoint
+    with open(_CP_PROGRESS, "w") as f:
+        f.write(str(chunk_i + 1))
+
+    print(f"  chunk {chunk_i + 1}/{n_chunks}  ({hi:,}/{n_baskets_total:,} baskets)  "
+          f"running nnz={copurchase_sparse.nnz:,}")
+
+os.remove(_CP_CHECKPOINT)
+os.remove(_CP_PROGRESS)
+print(f"  Co-purchase matrix complete: {n_products_cp:,} x {n_products_cp:,}, "
+      f"nnz={copurchase_sparse.nnz:,}")
 
 product_embedding = dict(zip(product_df_2["tpnb"], product_df_2["embedding"]))
 product_units_avg = tpnb_x_hh.groupby("tpnb")["quantity"].mean().to_dict()
@@ -207,12 +280,12 @@ gc.collect()
 # under exactly these names. Save them now while they're in scope. No
 # product_theme to save — that concept doesn't exist in this pipeline.
 print("Saving inference-time artifacts (needed later to score new baskets)...")
-sp.save_npz("copurchase_sparse.npz", copurchase_sparse.tocsr())
-with open("product_id_to_index.pkl", "wb") as f:
+sp.save_npz(os.path.join(OUTPUT_DIR, "copurchase_sparse.npz"), copurchase_sparse.tocsr())
+with open(os.path.join(OUTPUT_DIR, "product_id_to_index.pkl"), "wb") as f:
     pickle.dump(product_id_to_index, f)
-with open("product_units_avg.pkl", "wb") as f:
+with open(os.path.join(OUTPUT_DIR, "product_units_avg.pkl"), "wb") as f:
     pickle.dump(product_units_avg, f)
-print("  Saved copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl")
+print(f"  Saved copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl to {OUTPUT_DIR}")
 
 print("\n[Stage 1] Training GNN + embedding baskets...")
 basket_gnn_embeddings = train_and_embed(
@@ -240,8 +313,9 @@ compare_leiden_gmm(leiden_clusters, gmm_clusters)
 # need_state_cluster_gmm (GMM) — rather than collapsing to one, since the
 # real decision (compare vs. combine, and how) isn't settled yet.
 need_state_clusters = leiden_clusters.merge(gmm_clusters, on="basket_id", how="outer")
-need_state_clusters.to_parquet("basket_need_state_clusters.parquet", index=False)
-print(f"  Saved basket_need_state_clusters.parquet ({len(need_state_clusters):,} rows, "
+need_state_clusters_path = os.path.join(OUTPUT_DIR, "basket_need_state_clusters.parquet")
+need_state_clusters.to_parquet(need_state_clusters_path, index=False)
+print(f"  Saved {need_state_clusters_path} ({len(need_state_clusters):,} rows, "
       f"columns: need_state_cluster [Leiden], need_state_cluster_gmm [GMM])")
 
 # ─────────────────────────────────────────────
@@ -249,12 +323,12 @@ print(f"  Saved basket_need_state_clusters.parquet ({len(need_state_clusters):,}
 # ─────────────────────────────────────────────
 # No live write-back connection here, same as Stage 0. Two options:
 #   1. Run sql/06_write_back_need_states.sql once to create the landing table,
-#      then upload basket_need_state_clusters.parquet through your workspace
-#      web tool's import feature.
+#      then upload data/output/basket_need_state_clusters.parquet through your
+#      workspace web tool's import feature.
 #   2. If your web tool doesn't support parquet import, re-save as CSV first:
-#        need_state_clusters.to_csv("basket_need_state_clusters.csv", index=False)
+#        need_state_clusters.to_csv(os.path.join(OUTPUT_DIR, "basket_need_state_clusters.csv"), index=False)
 
-print("\n[Stage 3] Skipped — reload basket_need_state_clusters.parquet into "
+print(f"\n[Stage 3] Skipped — reload {need_state_clusters_path} into "
       "your warehouse manually (see sql/06_write_back_need_states.sql).")
 
 print("\nPipeline complete.")

@@ -26,7 +26,8 @@ how need-states are decided here:
   - GMM: via the saved gmm_basket_model.pkl's own .predict() — a fitted GMM
     scores new points directly, no workaround needed
 
-Requires these files to already exist, from a prior pipeline_main.py run:
+Requires these files to already exist under data/output/, from a prior
+pipeline_main.py run:
     basket_gnn_model.pt
     product_id_to_index.pkl
     copurchase_sparse.npz
@@ -40,6 +41,7 @@ Usage:
 """
 
 import argparse
+import os
 import pickle
 from pathlib import Path
 
@@ -59,26 +61,31 @@ from cluster_basket_embeddings import assign_new_baskets_to_clusters
 # CONFIG
 # ─────────────────────────────────────────────
 
-MODEL_PATH         = "basket_gnn_model.pt"
-PRODUCT_IDX_PATH   = "product_id_to_index.pkl"
-COPURCHASE_PATH    = "copurchase_sparse.npz"
-PRODUCT_UNITS_PATH = "product_units_avg.pkl"
+# All pipeline-produced artifacts (from a prior pipeline_main.py run, and
+# this script's own outputs) live under this folder, not the working directory.
+OUTPUT_DIR = "../data/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MODEL_PATH         = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
+PRODUCT_IDX_PATH   = os.path.join(OUTPUT_DIR, "product_id_to_index.pkl")
+COPURCHASE_PATH    = os.path.join(OUTPUT_DIR, "copurchase_sparse.npz")
+PRODUCT_UNITS_PATH = os.path.join(OUTPUT_DIR, "product_units_avg.pkl")
 
 MIN_BASKET_PRODUCTS = 2   # same floor pipeline_main.py applies at training time
 
 # Same file used in training (Stage 0 of pipeline_main.py) — reusing it here,
 # rather than a fresh pull, keeps product embeddings identical between train
 # and score so nothing shifts underneath the model.
-PRODUCT_EMBEDDINGS_PARQUET = "../data/product_embeddings.parquet"
+PRODUCT_EMBEDDINGS_PARQUET = os.path.join(OUTPUT_DIR, "product_embeddings.parquet")
 
-EXISTING_EMBEDDINGS_PATH = "basket_gnn_embeddings.parquet"
-EXISTING_CLUSTERS_PATH   = "basket_need_state_clusters.parquet"
-GMM_MODEL_PATH           = "gmm_basket_model.pkl"
+EXISTING_EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet")
+EXISTING_CLUSTERS_PATH   = os.path.join(OUTPUT_DIR, "basket_need_state_clusters.parquet")
+GMM_MODEL_PATH           = os.path.join(OUTPUT_DIR, "gmm_basket_model.pkl")
 
-NEW_EMBEDDINGS_OUT    = "new_basket_gnn_embeddings.parquet"
-NEW_CLUSTERS_OUT      = "new_basket_need_states.parquet"
-MERGED_EMBEDDINGS_OUT = "basket_gnn_embeddings_merged.parquet"
-MERGED_CLUSTERS_OUT   = "basket_need_state_clusters_merged.parquet"
+NEW_EMBEDDINGS_OUT    = os.path.join(OUTPUT_DIR, "new_basket_gnn_embeddings.parquet")
+NEW_CLUSTERS_OUT      = os.path.join(OUTPUT_DIR, "new_basket_need_states.parquet")
+MERGED_EMBEDDINGS_OUT = os.path.join(OUTPUT_DIR, "basket_gnn_embeddings_merged.parquet")
+MERGED_CLUSTERS_OUT   = os.path.join(OUTPUT_DIR, "basket_need_state_clusters_merged.parquet")
 
 EMBED_BATCH_SIZE = 8192
 

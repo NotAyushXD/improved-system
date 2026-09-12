@@ -25,7 +25,6 @@ import joblib
 from GraphBuilder import (
     prepare_globals,
     sample_baskets,
-    build_dense_cp_submatrix,
     build_training_graphs,
     save_training_graphs,
     embed_all_baskets_fast,
@@ -44,11 +43,14 @@ EPOCHS          = 20
 LR              = 1e-4   # reduced from 1e-3 — prevents divergence with new features
 WEIGHT_DECAY    = 1e-5
 N_TRAIN_SAMPLES = 300_000  # was 1_000_000 — reduced as an extra memory safety
-                            # margin on a shared machine, on top of the
-                            # dense_cp-release fix above. 300k graphs is still
+                            # margin on a shared machine. 300k graphs is still
                             # plenty for training; raise it back up once a run
                             # succeeds cleanly and you've confirmed headroom.
 NUM_WORKERS     = 0 if os.name == "nt" else 4
+
+# All pipeline-produced artifacts land here, not the working directory.
+OUTPUT_DIR      = "../data/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────
@@ -122,7 +124,7 @@ def train_and_embed(
     print(f"Using device: {device}\n")
 
     # ── Step 1: Prepare globals ──
-    print("[ 1 / 5 ] Preparing globals...")
+    print("[ 1 / 4 ] Preparing globals...")
     G = prepare_globals(
         product_embedding   = product_embedding,
         product_id_to_index = product_id_to_index,
@@ -133,32 +135,21 @@ def train_and_embed(
     print(f"  Node feature dim: {in_dim}  (emb_dim={G['emb_dim']} + 4 extra features)")
 
     # ── Step 2: Sample baskets ──
-    print("\n[ 2 / 5 ] Sampling training baskets...")
+    print("\n[ 2 / 4 ] Sampling training baskets...")
     sampled = sample_baskets(baskets, n_samples=N_TRAIN_SAMPLES)
 
-    # ── Step 3: Dense co-purchase submatrix ──
-    print("\n[ 3 / 5 ] Building dense co-purchase submatrix...")
-    dense_cp, local_idx, _ = build_dense_cp_submatrix(
-        sampled, G["product_id_to_index"], G["csr"]
-    )
-
-    # ── Step 4: Build training graphs ──
-    print("\n[ 4 / 5 ] Building training graphs...")
-    graph_list = build_training_graphs(sampled, G, dense_cp, local_idx)
+    # ── Step 3: Build training graphs ──
+    # Each basket's co-purchase submatrix is built on the fly, scoped to just
+    # that basket's own products — see GraphBuilder._basket_dense_cp_submatrix
+    # — so there's no whole-sample dense matrix to build (or free) here.
+    print("\n[ 3 / 4 ] Building training graphs...")
+    graph_list = build_training_graphs(sampled, G)
     print(f"  Training graphs ready: {len(graph_list):,}")
-
-    # dense_cp can be a very large dense matrix (tens of GB at real data
-    # scale) — it's not needed again after this point, but stayed alive here
-    # for the rest of the function before this fix, right through the
-    # disk-write below, which is exactly when peak memory is highest.
-    del dense_cp, local_idx
-    import gc
-    gc.collect()
 
     save_training_graphs(graph_list)
 
-    # ── Step 5: Train ──
-    print(f"\n[ 5 / 5 ] Training GNN for {EPOCHS} epochs...")
+    # ── Step 4: Train ──
+    print(f"\n[ 4 / 4 ] Training GNN for {EPOCHS} epochs...")
     train_loader = DataLoader(
         graph_list, batch_size=TRAIN_BATCH,
         shuffle=True, num_workers=NUM_WORKERS,
@@ -232,11 +223,13 @@ def train_and_embed(
         "basket_id":     basket_ids,
         "gnn_embedding": list(all_z),
     })
-    basket_gnn_embeddings.to_parquet("basket_gnn_embeddings.parquet", index=False)
-    torch.save(model.state_dict(), "basket_gnn_model.pt")
+    embeddings_path = os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet")
+    model_path      = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
+    basket_gnn_embeddings.to_parquet(embeddings_path, index=False)
+    torch.save(model.state_dict(), model_path)
 
     print("\nDone. Saved:")
-    print(f"  basket_gnn_embeddings.parquet  ({len(basket_gnn_embeddings):,} rows)")
-    print(f"  basket_gnn_model.pt")
+    print(f"  {embeddings_path}  ({len(basket_gnn_embeddings):,} rows)")
+    print(f"  {model_path}")
 
     return basket_gnn_embeddings

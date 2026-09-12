@@ -145,7 +145,6 @@ def check_functional():
     from GraphBuilder import (
         prepare_globals,
         sample_baskets,
-        build_dense_cp_submatrix,
         build_training_graphs,
         save_training_graphs,
         embed_all_baskets_fast,
@@ -183,9 +182,7 @@ def check_functional():
     sampled = sample_baskets(baskets, n_samples=len(baskets))
     print(f"  sample_baskets(): {len(sampled)} baskets sampled, no product_theme arg — OK")
 
-    dense_cp, local_idx, _ = build_dense_cp_submatrix(sampled, G["product_id_to_index"], G["csr"])
-
-    graphs = build_training_graphs(sampled, G, dense_cp, local_idx)
+    graphs = build_training_graphs(sampled, G)
     assert len(graphs) == len(sampled)
     for g in graphs:
         assert g.x.shape[1] == G["in_dim"], (
@@ -197,7 +194,7 @@ def check_functional():
           f"edge_attr width == 2 — OK")
 
     save_training_graphs(graphs)
-    reloaded = build_training_graphs(sampled, G, dense_cp, local_idx)  # should hit cache
+    reloaded = build_training_graphs(sampled, G)  # should hit cache
     assert len(reloaded) == len(graphs), "cache round-trip returned a different graph count"
     print(f"  save_training_graphs() + cache reload round-trip — OK")
 
