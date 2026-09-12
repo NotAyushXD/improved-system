@@ -33,11 +33,23 @@ data/TABLE_REFERENCE.md for what each source table actually contains.
 
 BREAKING CHANGE — cached artifact schema: GraphBuilder.py's node feature
 layout changed (in_dim = emb_dim + 4, was + 5) and its sub-clustering
-algorithm changed (global MiniBatchKMeans, was per-theme KMeans). Delete
-these under data/output/ before running this version, if they exist from an
-earlier run:
-    product_subclusters.pkl, training_graphs.pkl, basket_gnn_model.pt,
-    copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl
+algorithm changed (global MiniBatchKMeans, was per-theme KMeans). The basket
+grain also changed (household x WEEK, was household x PERIOD — see above),
+which invalidates everything derived from basket composition. Delete these
+under data/output/ before running this version against any changed data or
+basket definition:
+    training_graphs.pkl, basket_gnn_model.pt, copurchase_sparse.npz,
+    product_id_to_index.pkl, product_units_avg.pkl,
+    basket_gnn_embeddings.parquet, gmm_basket_model.pkl,
+    basket_need_state_clusters.parquet
+product_subclusters.pkl and product_embeddings.parquet do NOT need deleting
+for a basket-grain change — both are derived purely from product text
+attributes, never from basket/purchase data.
+The co-purchase-matrix build's own checkpoint (copurchase_sparse.checkpoint.npz
++ .progress.txt) is self-protecting: it fingerprints the basket/product
+counts it was built from and rebuilds from scratch automatically if they
+don't match the current run, rather than silently resuming into stale data —
+but the files above are NOT fingerprinted, so they must be deleted manually.
 There is no product_theme.pkl to delete — that file is never written by
 this version, and never read by score_new_baskets.py either.
 
@@ -226,7 +238,14 @@ print(f"  {n_products_cp:,} distinct products across all baskets")
 
 # Checkpoint files for this step only — deleted once the matrix is complete.
 # If this crashes partway, re-running the script picks up from the last
-# completed chunk instead of starting the whole matrix over.
+# completed chunk instead of starting the whole matrix over — but ONLY if
+# the checkpoint was built from the SAME baskets. The progress file stores a
+# fingerprint (n_baskets_total, n_products_cp) alongside the chunk index
+# precisely so a checkpoint left over from a different run (different data,
+# different basket grain, etc.) gets rejected and rebuilt from scratch
+# instead of being silently resumed into — same class of risk as the
+# product_subclusters.pkl / training_graphs.pkl staleness guard above, just
+# for a fixed-filename cache added later.
 _CP_CHECKPOINT = os.path.join(OUTPUT_DIR, "copurchase_sparse.checkpoint.npz")
 _CP_PROGRESS   = os.path.join(OUTPUT_DIR, "copurchase_sparse.progress.txt")
 
@@ -235,11 +254,33 @@ n_chunks = (n_baskets_total + COPURCHASE_CHUNK_BASKETS - 1) // COPURCHASE_CHUNK_
 
 start_chunk = 0
 if os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
-    copurchase_sparse = sp.load_npz(_CP_CHECKPOINT).tocsr()
-    start_chunk = int(open(_CP_PROGRESS).read().strip())
-    print(f"  Resuming from checkpoint: {start_chunk}/{n_chunks} chunks already done "
-          f"(nnz so far={copurchase_sparse.nnz:,}) — delete {_CP_CHECKPOINT} and "
-          f"{_CP_PROGRESS} if you want this step to start over from scratch instead.")
+    try:
+        _progress_fields = open(_CP_PROGRESS).read().split(",")
+        _ckpt_chunk = int(_progress_fields[0])
+        _ckpt_fingerprint = tuple(_progress_fields[1:3]) if len(_progress_fields) >= 3 else None
+    except (ValueError, IndexError):
+        # Malformed/empty progress file (e.g. a crash mid-write, before the
+        # atomic rename below existed, or any other corruption) — treat
+        # exactly like a fingerprint mismatch: rebuild from scratch rather
+        # than crash on a cache file that was never meant to be load-bearing.
+        _ckpt_chunk = 0
+        _ckpt_fingerprint = None
+    _current_fingerprint = (str(n_baskets_total), str(n_products_cp))
+
+    if _ckpt_fingerprint != _current_fingerprint:
+        print(f"  IGNORING stale checkpoint at {_CP_CHECKPOINT}: it was built for "
+              f"n_baskets={_ckpt_fingerprint[0] if _ckpt_fingerprint else '?'}, "
+              f"n_products={_ckpt_fingerprint[1] if _ckpt_fingerprint else '?'}, but this run has "
+              f"n_baskets={n_baskets_total:,}, n_products={n_products_cp:,} — almost certainly "
+              f"a different dataset or basket grain. Rebuilding from scratch rather than risking "
+              f"silently blending stale partial results into this run.")
+        copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
+    else:
+        copurchase_sparse = sp.load_npz(_CP_CHECKPOINT).tocsr()
+        start_chunk = _ckpt_chunk
+        print(f"  Resuming from checkpoint: {start_chunk}/{n_chunks} chunks already done "
+              f"(nnz so far={copurchase_sparse.nnz:,}) — delete {_CP_CHECKPOINT} and "
+              f"{_CP_PROGRESS} if you want this step to start over from scratch instead.")
 else:
     copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
 
@@ -267,14 +308,19 @@ for chunk_i in range(start_chunk, n_chunks):
     tmp_ckpt = _CP_CHECKPOINT + ".writing.npz"
     sp.save_npz(tmp_ckpt, copurchase_sparse)
     os.replace(tmp_ckpt, _CP_CHECKPOINT)   # atomic — never leaves a truncated checkpoint
-    with open(_CP_PROGRESS, "w") as f:
-        f.write(str(chunk_i + 1))
+
+    tmp_progress = _CP_PROGRESS + ".tmp"
+    with open(tmp_progress, "w") as f:
+        f.write(f"{chunk_i + 1},{n_baskets_total},{n_products_cp}")
+    os.replace(tmp_progress, _CP_PROGRESS)   # atomic — never leaves an empty/truncated progress file
 
     print(f"  chunk {chunk_i + 1}/{n_chunks}  ({hi:,}/{n_baskets_total:,} baskets)  "
           f"running nnz={copurchase_sparse.nnz:,}")
 
-os.remove(_CP_CHECKPOINT)
-os.remove(_CP_PROGRESS)
+if os.path.exists(_CP_CHECKPOINT):
+    os.remove(_CP_CHECKPOINT)
+if os.path.exists(_CP_PROGRESS):
+    os.remove(_CP_PROGRESS)
 print(f"  Co-purchase matrix complete: {n_products_cp:,} x {n_products_cp:,}, "
       f"nnz={copurchase_sparse.nnz:,}")
 

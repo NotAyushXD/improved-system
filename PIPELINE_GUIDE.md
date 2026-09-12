@@ -149,22 +149,34 @@ python pipeline_main.py
 
 ### Cache-staleness warning (read this first)
 
-`GraphBuilder.py` caches two intermediates to **fixed filenames** under
-`data/output/` (`product_subclusters.pkl`, `training_graphs.pkl`), reused
-as-is on any future run regardless of whether the underlying data or code
-changed. If any of these exist from a previous run (especially a
-pre-refactor or pre-week-grain run), **delete them before your first run**,
-or they will silently produce embeddings that don't mean what you think they
-mean:
+Several files under `data/output/` are derived from **basket composition**
+(which products appear together in which basket) — if you change the input
+data or the basket grain (e.g. the period→week change described above),
+every one of these is stale and must be deleted before your next run, or
+they'll silently produce results that don't mean what you think they mean:
 
 ```
-data/output/product_subclusters.pkl
 data/output/training_graphs.pkl
 data/output/basket_gnn_model.pt
 data/output/copurchase_sparse.npz
 data/output/product_id_to_index.pkl
 data/output/product_units_avg.pkl
+data/output/basket_gnn_embeddings.parquet
+data/output/gmm_basket_model.pkl
+data/output/basket_need_state_clusters.parquet
 ```
+
+`data/output/product_subclusters.pkl` and `data/output/product_embeddings.parquet`
+do **not** need deleting for a basket-grain or transaction-data change — both
+are derived purely from product text attributes, never from basket/purchase
+data. They only go stale if the *product catalog or embedding logic* changes.
+
+The co-purchase-matrix build's own checkpoint
+(`copurchase_sparse.checkpoint.npz` + `.progress.txt`) is self-protecting:
+it stores a fingerprint of the basket/product counts it was built from, and
+automatically rebuilds from scratch if a stale checkpoint doesn't match the
+current run, rather than silently resuming into mismatched data. The list
+above is not fingerprinted, though — those must be deleted manually.
 
 ### Stage 0 — Read warehouse exports (`parquet_loader.py`)
 
@@ -371,9 +383,12 @@ python test_theme_free_pipeline.py
 python build_product_embeddings.py
 
 # 3. Delete stale caches under data/output/ if this is a first run after any
-#    refactor or grain change: product_subclusters.pkl, training_graphs.pkl,
-#    basket_gnn_model.pt, copurchase_sparse.npz, product_id_to_index.pkl,
-#    product_units_avg.pkl
+#    data or basket-grain change: training_graphs.pkl, basket_gnn_model.pt,
+#    copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl,
+#    basket_gnn_embeddings.parquet, gmm_basket_model.pkl,
+#    basket_need_state_clusters.parquet
+#    (product_subclusters.pkl / product_embeddings.parquet do NOT need
+#    deleting — they're product-text-derived, not basket-derived)
 
 # 4. Train the GNN + cluster into need-states
 python pipeline_main.py
