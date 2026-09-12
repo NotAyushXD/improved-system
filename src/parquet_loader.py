@@ -83,6 +83,16 @@ def load_household_tpnb_week(path: Path = HOUSEHOLD_TPNB_WEEK_PARQUET) -> pd.Dat
     """
     Returns a DataFrame shaped exactly like graph_main.py's `tpnb_x_hh`:
         household_number, tpnb, year_number, period_number, week_number, quantity
+
+    Loads the WHOLE table into memory in one shot via pd.read_parquet() — fine
+    for a small/sampled export, but at real data scale (week grain routinely
+    runs into billions of rows, since it no longer sums multiple weeks
+    together the way the old period-grain export did) a single load like
+    this can fail outright — pyarrow needs one big contiguous allocation for
+    the conversion to pandas, and that can exceed what's available even on a
+    machine with plenty of total RAM. Use
+    stream_build_baskets_and_units_avg() instead for real data — it never
+    materializes this table at all.
     """
     path = Path(path)
     if not path.exists():
@@ -105,3 +115,113 @@ def load_household_tpnb_week(path: Path = HOUSEHOLD_TPNB_WEEK_PARQUET) -> pd.Dat
 
     print(f"Loaded tpnb_x_hh from {path}: {len(df):,} household x tpnb x week rows")
     return df
+
+
+def stream_build_baskets_and_units_avg(
+    path: Path = HOUSEHOLD_TPNB_WEEK_PARQUET,
+    min_basket_products: int = 2,
+    batch_size: int = 20_000_000,
+):
+    """
+    Streams the household x tpnb x week export in bounded-size batches and
+    builds `baskets` (and per-product average units) directly from the
+    stream — the raw flat table is NEVER materialized as one object, only
+    one batch (bounded by `batch_size` rows) at a time, plus the growing
+    aggregated result (which is much smaller than the raw table, since it's
+    already grouped).
+
+    This replaces the old pattern of load_household_tpnb_week() followed by
+    a groupby in pipeline_main.py — that pattern needs the ENTIRE raw table
+    in memory before any grouping can happen, which is exactly what fails
+    at real data scale (see load_household_tpnb_week()'s docstring).
+
+    Correctness note: the same (household_number, week) basket's rows can
+    legitimately land in different batches (nothing guarantees the export
+    is sorted by household), so partial per-batch aggregations are merged
+    into a single running accumulator across the whole stream — no basket
+    is ever finalized from just one batch's worth of its rows.
+
+    Returns
+    -------
+    baskets : DataFrame [household_number, year_week_number, basket_id, products, units]
+        Same shape pipeline_main.py's old groupby produced — nothing
+        downstream of this needs to change.
+    product_units_avg : dict  tpnb -> mean quantity per household x tpnb x week row
+    """
+    import pyarrow.dataset as pa_dataset
+    from collections import defaultdict
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found — run ns_household_tpnb_week_agg_train.sql on "
+            f"your workspace, download the result as parquet, and save it here."
+        )
+
+    dataset = pa_dataset.dataset(str(path), format="parquet")
+    missing = REQUIRED_HOUSEHOLD_COLS - set(dataset.schema.names)
+    if missing:
+        raise ValueError(
+            f"{path} is missing columns {missing}. Check that the SQL query's "
+            f"column aliases survived the export."
+        )
+    required_cols = list(REQUIRED_HOUSEHOLD_COLS)
+
+    basket_products = defaultdict(list)   # (household_number, year_week_number) -> [tpnb, ...]
+    basket_units    = defaultdict(list)   # same key -> [quantity, ...]
+    tpnb_qty_sum    = defaultdict(float)
+    tpnb_qty_count  = defaultdict(int)
+
+    n_rows, n_batches = 0, 0
+    for record_batch in dataset.to_batches(columns=required_cols, batch_size=batch_size):
+        df = record_batch.to_pandas()
+        n_batches += 1
+        n_rows += len(df)
+        df["tpnb"] = df["tpnb"].astype(str)
+        df["year_week_number"] = df["year_number"] * 100 + df["week_number"]
+
+        # Streaming mean accumulation for product_units_avg — sum/count per
+        # tpnb, divided only once at the very end.
+        qty_stats = df.groupby("tpnb")["quantity"].agg(["sum", "count"])
+        for tpnb, s, c in zip(qty_stats.index, qty_stats["sum"], qty_stats["count"]):
+            tpnb_qty_sum[tpnb]   += s
+            tpnb_qty_count[tpnb] += c
+
+        # Per-batch basket aggregation (vectorized pandas groupby — fast),
+        # then merged into the growing accumulator dict (bounded by unique
+        # baskets touched, not raw row count).
+        batch_baskets = (
+            df.groupby(["household_number", "year_week_number"])
+              .agg(products=("tpnb", list), units=("quantity", list))
+        )
+        for key, row in zip(batch_baskets.index, batch_baskets.itertuples(index=False)):
+            basket_products[key].extend(row.products)
+            basket_units[key].extend(row.units)
+
+        del df, qty_stats, batch_baskets
+        print(f"  batch {n_batches}: {n_rows:,} rows streamed so far, "
+              f"{len(basket_products):,} distinct baskets so far")
+
+    print(f"Streamed {n_rows:,} household x tpnb x week rows across {n_batches} batches "
+          f"(from {path})")
+
+    all_keys = list(basket_products.keys())
+    before_filter = len(all_keys)
+    keys = [k for k in all_keys if len(basket_products[k]) >= min_basket_products]
+
+    baskets = pd.DataFrame({
+        "household_number": [k[0] for k in keys],
+        "year_week_number": [k[1] for k in keys],
+        "products":         [basket_products[k] for k in keys],
+        "units":            [basket_units[k] for k in keys],
+    })
+    baskets["basket_id"] = (
+        baskets["household_number"].astype(str) + "_" +
+        baskets["year_week_number"].astype(str)
+    )
+    print(f"  Full baskets: {len(baskets):,} "
+          f"({before_filter - len(baskets):,} dropped with < {min_basket_products} products)")
+
+    product_units_avg = {t: tpnb_qty_sum[t] / tpnb_qty_count[t] for t in tpnb_qty_sum}
+
+    return baskets, product_units_avg

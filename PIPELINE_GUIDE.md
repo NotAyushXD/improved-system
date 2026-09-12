@@ -181,12 +181,22 @@ above is not fingerprinted, though — those must be deleted manually.
 ### Stage 0 — Read warehouse exports (`parquet_loader.py`)
 
 Loads:
-- `data/output/product_embeddings.parquet` → `product_df_2` (tpnb, embedding)
-- `ns_household_tpnb_week_agg_train` → `tpnb_x_hh` (household_number, tpnb, year_number, period_number, week_number, quantity)
+- `data/output/product_embeddings.parquet` → `product_df_2` (tpnb, embedding) — one shot, small file
+- `ns_household_tpnb_week_agg_train` → **streamed**, not loaded as one table (see Stage 1)
 
 ### Stage 1 — Build baskets, train the GNN
 
-1. **Whole-basket construction**: every product a household bought in a
+1. **Whole-basket construction, streamed**: `parquet_loader.stream_build_baskets_and_units_avg()`
+   reads the household×tpnb×week export in bounded batches
+   (`batch_size`, default 20,000,000 rows) via `pyarrow.dataset`, and builds
+   `baskets` and `product_units_avg` directly from the stream — the raw flat
+   table is never materialized as one object. This matters because at week
+   grain this export routinely reaches billions of rows (no longer
+   collapsed across weeks the way the old period grain was), large enough
+   that a single `pd.read_parquet()` can fail outright
+   (`pyarrow.lib.ArrowMemoryError`) even on a machine with plenty of total
+   RAM free — pyarrow needs one big contiguous allocation to convert the
+   whole table to pandas in one go. Every product a household bought in a
    given **week** becomes one basket (`household_number` + `year_week_number`
    → `basket_id`) — see the grain warning at the top of this doc. No
    category/theme split. Baskets with fewer than `MIN_BASKET_PRODUCTS = 2`
@@ -407,6 +417,7 @@ python score_new_baskets.py --new-transactions <path to new weeks' parquet>
 | `MIN_BASKET_PRODUCTS` | `pipeline_main.py` / `score_new_baskets.py` | 2 | Drops 1-item baskets |
 | `N_TRAIN_SAMPLES` | `GNN_Train.py` | 300,000 | Reduced from 1,000,000 for memory safety; raise once you've confirmed headroom |
 | `COPURCHASE_CHUNK_BASKETS` | `pipeline_main.py` | 500,000 | Baskets per co-purchase-matrix chunk; lower if still memory-constrained |
+| `batch_size` (of `stream_build_baskets_and_units_avg`) | `parquet_loader.py` | 20,000,000 | Rows per streamed read batch from the household×tpnb×week export; lower if still memory-constrained at Stage 0/1 |
 | `SUBCL_K_CANDIDATES` | `GraphBuilder.py` | [50, 100, 200, 400] | Global product sub-cluster K candidates — tune to catalog size |
 | `TOP_K` | `GraphBuilder.py` | 10 | Co-purchase edges kept per node per basket graph |
 | `EPOCHS` / `LR` | `GNN_Train.py` | 20 / 1e-4 | GNN training |

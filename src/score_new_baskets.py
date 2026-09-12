@@ -153,26 +153,24 @@ def load_globals_and_model():
 
 def build_new_baskets(new_transactions_path: str) -> pd.DataFrame:
     print(f"Loading new transaction data from {new_transactions_path}...")
-    df = pd.read_parquet(new_transactions_path)
 
     # Same whole-basket construction as pipeline_main.py Stage 1 — basket
     # grain is WEEK (household_number x year_week_number), not a true
     # single-visit basket. See the "BASKET GRAIN" note at the top of
     # pipeline_main.py and data/ns_household_tpnb_week_agg_train.sql.
-    df["year_week_number"] = df["year_number"] * 100 + df["week_number"]
-    baskets = (
-        df.groupby(["household_number", "year_week_number"])
-        .agg(products=("tpnb", list), units=("quantity", list))
-        .reset_index()
+    #
+    # Streamed the same way pipeline_main.py's Stage 1 now is (see
+    # parquet_loader.stream_build_baskets_and_units_avg docstring) — a
+    # single pd.read_parquet() of a held-out scoring window can be just as
+    # large as the training export, so it needs the same bounded-batch
+    # treatment rather than loading the whole thing at once. The returned
+    # product_units_avg is discarded here — this script already has its own
+    # from training (PRODUCT_UNITS_PATH), and reusing that one (rather than
+    # a fresh one computed only from the new/held-out data) is what keeps
+    # product features consistent between train and score.
+    baskets, _ = parquet_loader.stream_build_baskets_and_units_avg(
+        new_transactions_path, min_basket_products=MIN_BASKET_PRODUCTS,
     )
-    baskets["basket_id"] = (
-        baskets["household_number"].astype(str) + "_" +
-        baskets["year_week_number"].astype(str)
-    )
-    before_filter = len(baskets)
-    baskets = baskets[baskets["products"].apply(len) >= MIN_BASKET_PRODUCTS].reset_index(drop=True)
-    print(f"  New full baskets: {len(baskets):,} "
-          f"({before_filter - len(baskets):,} dropped with < {MIN_BASKET_PRODUCTS} products)")
     return baskets
 
 

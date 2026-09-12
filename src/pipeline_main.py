@@ -171,7 +171,6 @@ HOUSEHOLD_TPNB_WEEK_PARQUET = "../data/ns_household_tpnb_week_agg_train"
 
 print("[Stage 0] Reading warehouse exports...")
 product_df_2 = parquet_loader.load_product_embeddings(PRODUCT_EMBEDDINGS_PARQUET)
-tpnb_x_hh    = parquet_loader.load_household_tpnb_week(HOUSEHOLD_TPNB_WEEK_PARQUET)
 
 # ─────────────────────────────────────────────
 # Stage 1: build whole baskets (no category split), train the GNN
@@ -180,24 +179,19 @@ tpnb_x_hh    = parquet_loader.load_household_tpnb_week(HOUSEHOLD_TPNB_WEEK_PARQU
 print("\n[Stage 1] Building features...")
 # Basket grain is WEEK, not a true single-visit basket — see the
 # "BASKET GRAIN" note at the top of this file for why.
-tpnb_x_hh["year_week_number"] = tpnb_x_hh["year_number"] * 100 + tpnb_x_hh["week_number"]
-
+#
+# The household x tpnb x week export is streamed in bounded batches (never
+# loaded as one flat table) straight into the aggregated `baskets` table and
+# `product_units_avg` — see parquet_loader.stream_build_baskets_and_units_avg()
+# and its docstring for why: at week grain this export routinely runs into
+# billions of rows (no longer collapsed across weeks the way period grain
+# was), large enough that a single pd.read_parquet() can fail outright on a
+# single pyarrow allocation even with plenty of total RAM free.
 print("Building baskets (whole basket — every product a household bought in "
-      "the week, no category/theme split)...")
-baskets = (
-    tpnb_x_hh
-    .groupby(["household_number", "year_week_number"])
-    .agg(products=("tpnb", list), units=("quantity", list))
-    .reset_index()
+      "the week, no category/theme split) — streamed in bounded batches...")
+baskets, product_units_avg = parquet_loader.stream_build_baskets_and_units_avg(
+    HOUSEHOLD_TPNB_WEEK_PARQUET, min_basket_products=MIN_BASKET_PRODUCTS,
 )
-baskets["basket_id"] = (
-    baskets["household_number"].astype(str) + "_" +
-    baskets["year_week_number"].astype(str)
-)
-before_filter = len(baskets)
-baskets = baskets[baskets["products"].apply(len) >= MIN_BASKET_PRODUCTS].reset_index(drop=True)
-print(f"  Full baskets: {len(baskets):,} "
-      f"({before_filter - len(baskets):,} dropped with < {MIN_BASKET_PRODUCTS} products)")
 
 # This DataFrame is held in memory for the ENTIRE rest of this script — it's
 # needed both as GNN training input and, afterward, to embed every single
@@ -325,14 +319,9 @@ print(f"  Co-purchase matrix complete: {n_products_cp:,} x {n_products_cp:,}, "
       f"nnz={copurchase_sparse.nnz:,}")
 
 product_embedding = dict(zip(product_df_2["tpnb"], product_df_2["embedding"]))
-product_units_avg = tpnb_x_hh.groupby("tpnb")["quantity"].mean().to_dict()
-
-# tpnb_x_hh (the full raw purchase table — tens of millions of rows even at
-# a 1% household sample) isn't needed again after this. baskets IS still
-# needed later (passed into train_and_embed, then reused for embedding every
-# basket after training), so that one stays.
-del tpnb_x_hh
-gc.collect()
+# product_units_avg was already computed by stream_build_baskets_and_units_avg()
+# above, alongside `baskets` — there's no separate raw tpnb_x_hh table to
+# compute it from (or delete afterward) anymore.
 
 # train_and_embed() only saves the model + training embeddings — it does NOT
 # persist these three inputs, but score_new_baskets.py (scoring new baskets
