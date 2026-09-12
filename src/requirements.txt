@@ -1,0 +1,28 @@
+# requirements.txt
+#
+# Install torch FIRST, matching your machine (CPU-only or a specific CUDA
+# version) — follow https://pytorch.org/get-started/locally/ for the right
+# command, since the wheel differs by platform and this file can't pick that
+# for you. Then install torch-geometric the same way, matching whichever
+# torch version you just installed — see
+# https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+# Everything below this line is platform-independent and pip-installable
+# normally.
+
+torch-geometric
+pandas
+pyarrow              # parquet engine — needed to read the folder-of-part-files
+                     # shape Databricks/Spark exports tables in
+numpy
+scipy
+scikit-learn          # also covers GaussianMixture (GMM) used in cluster_basket_embeddings.py
+numba
+joblib
+tqdm
+python-igraph
+leidenalg
+sentence-transformers # needed by build_product_embeddings.py to build product
+                       # embeddings from scratch (they don't exist yet)
+pynndescent            # optional — cluster_basket_embeddings.py falls back to
+                       # sklearn's NearestNeighbors automatically if this isn't
+                       # installed, just slower on large datasets
