@@ -22,6 +22,15 @@ Need-states are found across the WHOLE basket — split_basket_by_theme.py
 is not used anywhere in this pipeline (it's fully decommissioned, not just
 unused — see REFACTOR_NOTES.md).
 
+BASKET GRAIN — WEEK, NOT A TRUE SINGLE-VISIT BASKET: a "basket" here is
+everything one household bought in one WEEK (household_number x
+year_week_number), not one shopping trip. None of the tables available in
+this warehouse carry a transaction/order/checkout identifier, so a true
+single-visit basket can't be built from what's available — week is the
+finest grain the data supports. See the comment at the top of
+data/ns_household_tpnb_week_agg_train.sql for the full reasoning, and
+data/TABLE_REFERENCE.md for what each source table actually contains.
+
 BREAKING CHANGE — cached artifact schema: GraphBuilder.py's node feature
 layout changed (in_dim = emb_dim + 4, was + 5) and its sub-clustering
 algorithm changed (global MiniBatchKMeans, was per-theme KMeans). Delete
@@ -39,15 +48,15 @@ its own docstring).
 
 Run this from inside the src/ folder, with a sibling data/ folder holding
 your downloaded tables (see the folder layout each script's path constants
-assume — PRODUCT_EMBEDDINGS_PARQUET / HOUSEHOLD_TPNB_PERIOD_PARQUET below
+assume — PRODUCT_EMBEDDINGS_PARQUET / HOUSEHOLD_TPNB_WEEK_PARQUET below
 use "../data/..." on that assumption):
 
     project/
     ├── data/
     │   ├── ns_item_lookup_tpna/                    (folder — Spark export)
     │   ├── ns_tpnb_to_tpna_mapping/                (folder)
-    │   ├── ns_household_tpnb_period_agg_train/     (folder)
-    │   ├── ns_household_tpnb_period_agg_score/     (folder — used later by score_new_baskets.py)
+    │   ├── ns_household_tpnb_week_agg_train/       (folder)
+    │   ├── ns_household_tpnb_week_agg_score/       (folder — used later by score_new_baskets.py)
     │   └── output/                                 (everything this pipeline WRITES lands here —
     │                                                 product_embeddings.parquet, caches, the
     │                                                 trained model, embeddings, need-state output)
@@ -145,31 +154,33 @@ for _stale_cache in (os.path.join(OUTPUT_DIR, "product_subclusters.pkl"),
 # .parquet file — pandas reads that folder directly, so these point straight
 # at the folder names as downloaded. Paths are relative to running this
 # script from inside src/ (see the note at the top of this file).
-PRODUCT_EMBEDDINGS_PARQUET    = os.path.join(OUTPUT_DIR, "product_embeddings.parquet")
-HOUSEHOLD_TPNB_PERIOD_PARQUET = "../data/ns_household_tpnb_period_agg_train"
+PRODUCT_EMBEDDINGS_PARQUET  = os.path.join(OUTPUT_DIR, "product_embeddings.parquet")
+HOUSEHOLD_TPNB_WEEK_PARQUET = "../data/ns_household_tpnb_week_agg_train"
 
 print("[Stage 0] Reading warehouse exports...")
 product_df_2 = parquet_loader.load_product_embeddings(PRODUCT_EMBEDDINGS_PARQUET)
-tpnb_x_hh    = parquet_loader.load_household_tpnb_period(HOUSEHOLD_TPNB_PERIOD_PARQUET)
+tpnb_x_hh    = parquet_loader.load_household_tpnb_week(HOUSEHOLD_TPNB_WEEK_PARQUET)
 
 # ─────────────────────────────────────────────
 # Stage 1: build whole baskets (no category split), train the GNN
 # ─────────────────────────────────────────────
 
 print("\n[Stage 1] Building features...")
-tpnb_x_hh["year_period_number"] = tpnb_x_hh["year_number"] * 100 + tpnb_x_hh["period_number"]
+# Basket grain is WEEK, not a true single-visit basket — see the
+# "BASKET GRAIN" note at the top of this file for why.
+tpnb_x_hh["year_week_number"] = tpnb_x_hh["year_number"] * 100 + tpnb_x_hh["week_number"]
 
 print("Building baskets (whole basket — every product a household bought in "
-      "the period, no category/theme split)...")
+      "the week, no category/theme split)...")
 baskets = (
     tpnb_x_hh
-    .groupby(["household_number", "year_period_number"])
+    .groupby(["household_number", "year_week_number"])
     .agg(products=("tpnb", list), units=("quantity", list))
     .reset_index()
 )
 baskets["basket_id"] = (
     baskets["household_number"].astype(str) + "_" +
-    baskets["year_period_number"].astype(str)
+    baskets["year_week_number"].astype(str)
 )
 before_filter = len(baskets)
 baskets = baskets[baskets["products"].apply(len) >= MIN_BASKET_PRODUCTS].reset_index(drop=True)
@@ -182,8 +193,11 @@ print(f"  Full baskets: {len(baskets):,} "
 # ~30 products/basket, roughly 3-4KB per row once you account for real
 # per-object Python overhead in the products/units list cells — 20 million+
 # baskets is on the order of 50-100GB for this one object alone, before
-# anything else the rest of the script needs. If you're not intentionally
-# running the full, un-sampled population, check sql/04's
+# anything else the rest of the script needs. Note baskets are now WEEK grain
+# (~4x more baskets than the old PERIOD grain, for the same household
+# population), so this threshold trips more easily than before — that's
+# expected, not a regression. If you're not intentionally running the full,
+# un-sampled population, check ns_household_tpnb_week_agg_train.sql's
 # MOD(household_number, N) = 0 filter is actually being applied — this
 # number should look dramatically smaller than your household count.
 BASKET_COUNT_WARN_THRESHOLD = 2_000_000

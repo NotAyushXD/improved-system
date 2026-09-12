@@ -10,6 +10,15 @@ to pre-group products or baskets. Need-states emerge purely from a graph
 neural network (GNN) trained on co-purchase behavior, followed by clustering
 of the resulting basket embeddings.
 
+⚠️ **Basket grain is WEEK, not a true single-visit basket.** None of the
+tables in this warehouse (see `data/TABLE_REFERENCE.md`) carry a
+transaction/order/checkout identifier — `cltv_hh_metrics_tpnb_base` (the
+household-purchase source table) is already pre-aggregated to week grain,
+and its `orders` column is a count, not a preserved per-visit ID. So a
+"basket" here means *everything one household bought in one week*, not one
+shopping trip. Week is the finest grain available; see the comment at the
+top of `data/ns_household_tpnb_week_agg_train.sql` for the full reasoning.
+
 ---
 
 ## 1. Big-picture flow
@@ -24,12 +33,12 @@ of the resulting basket embeddings.
                                      │         style, TPNA grain)
                                      │              │
                                      │              ▼
-                                     │     data/product_embeddings.parquet
+                                     │     data/output/product_embeddings.parquet
                                      │
- ns_household_tpnb_period_agg_train.sql ──►  pipeline_main.py  (Stage 0)
-   (household x product x period)            │
+ ns_household_tpnb_week_agg_train.sql ──►  pipeline_main.py  (Stage 0)
+   (household x product x WEEK)             │
                                               ▼
-                                   Stage 1: build whole baskets,
+                                   Stage 1: build whole baskets (week grain),
                                    co-purchase matrix, train GNN
                                    (GraphBuilder.py + GNN_Train.py)
                                               │
@@ -39,15 +48,15 @@ of the resulting basket embeddings.
                                    (cluster_basket_embeddings.py)
                                               │
                                               ▼
-                              basket_need_state_clusters.parquet
+                        data/output/basket_need_state_clusters.parquet
                                               │
                                               ▼
                                    Stage 3: manually re-upload into
                                    the warehouse (need_state_cluster,
                                    need_state_cluster_gmm per basket)
 
- ns_household_tpnb_period_agg_score.sql ──►  score_new_baskets.py
-   (later/held-out period)                  (scores NEW baskets against
+ ns_household_tpnb_week_agg_score.sql ──►  score_new_baskets.py
+   (later/held-out weeks)                  (scores NEW baskets against
                                               the already-trained model —
                                               no retraining)
 ```
@@ -64,9 +73,13 @@ improved-system/
 ├── data/
 │   ├── ns_item_lookup_tpna/                    (Spark/Databricks export — a folder of part-files)
 │   ├── ns_tpnb_to_tpna_mapping/                 (folder)
-│   ├── ns_household_tpnb_period_agg_train/      (folder)
-│   ├── ns_household_tpnb_period_agg_score/      (folder — only needed for scoring new baskets)
-│   └── product_embeddings.parquet               (single file — written by build_product_embeddings.py)
+│   ├── ns_household_tpnb_week_agg_train/        (folder)
+│   ├── ns_household_tpnb_week_agg_score/        (folder — only needed for scoring new baskets)
+│   ├── *.sql                                    (run manually against the warehouse; see §3)
+│   ├── TABLE_REFERENCE.md                       (what each source table actually contains)
+│   └── output/                                  (ALL pipeline-written artifacts — nothing is written
+│                                                  to the working directory. product_embeddings.parquet,
+│                                                  caches, the trained model, embeddings, cluster output)
 └── src/
     ├── build_product_embeddings.py
     ├── pipeline_main.py
@@ -78,15 +91,6 @@ improved-system/
     └── test_theme_free_pipeline.py
 ```
 
-⚠️ **Path mismatch to fix before running**: `build_product_embeddings.py`
-writes `../data/product_embeddings.parquet`, and `score_new_baskets.py` reads
-from that same path — but `pipeline_main.py` currently points at
-`../data/output/product_embeddings.parquet` (line 126). Either move the file
-into a `data/output/` subfolder after building it, or edit that constant in
-`pipeline_main.py` so it matches where `build_product_embeddings.py` actually
-wrote the file. Otherwise Stage 0 of `pipeline_main.py` will raise
-`FileNotFoundError`.
-
 ---
 
 ## 3. Step 0 — Run the SQL against your warehouse
@@ -94,20 +98,22 @@ wrote the file. Otherwise Stage 0 of `pipeline_main.py` will raise
 These live in `improved-system/data/*.sql` and must be run manually (no live
 DB connection exists anywhere in the Python code — everything is
 file-based). Run each, then download the resulting table as parquet into the
-matching `data/` folder above.
+matching `data/` folder above. See `data/TABLE_REFERENCE.md` for what the
+underlying source tables (`product.product`, `cltv_hh_metrics_tpnb_base`,
+etc.) actually contain.
 
-| # | File | Produces (grain) | Feeds |
-|---|------|----|----|
-| 1 | `ns_item_lookup_tpna.sql` | one row per TPNA style (description, brand, hierarchy) — scoped to TPNAs actually purchased in the training period | `build_product_embeddings.py` |
-| 2 | `ns_tpnb_to_tpna_mapping.sql` | one row per TPNB → TPNA, full/unfiltered mapping | `build_product_embeddings.py` |
-| 3 | `ns_product_theme_mapping.sql` | TPNB → category (`theme_name`) | **Not consumed anywhere in the current pipeline** — kept only for optional post-hoc profiling of clusters (see §7). Safe to skip for the core run. |
-| 4 | `ns_household_tpnb_period_agg_train.sql` | household × TPNB × year_period, summed quantity/orders/sales | `pipeline_main.py` (training baskets) |
-| 5 | `ns_household_tpnb_period_agg_score.sql` | same grain as #4, but a **later/held-out period** | `score_new_baskets.py` (scoring new baskets) — only needed once you want to score new data |
+| File | Produces (grain) | Feeds |
+|---|----|----|
+| `ns_item_lookup_tpna.sql` | one row per TPNA style (description, brand, hierarchy) — scoped to TPNAs actually purchased in the training window | `build_product_embeddings.py` |
+| `ns_tpnb_to_tpna_mapping.sql` | one row per TPNB → TPNA, full/unfiltered mapping | `build_product_embeddings.py` |
+| `ns_product_theme_mapping.sql` | TPNB → category (`theme_name`) | **Not consumed anywhere in the current pipeline** — kept only for optional post-hoc profiling of clusters (see §7). Safe to skip for the core run. |
+| `ns_household_tpnb_week_agg_train.sql` | household × TPNB × year_week, summed quantity/orders/sales | `pipeline_main.py` (training baskets) |
+| `ns_household_tpnb_week_agg_score.sql` | same grain, but later/held-out weeks | `score_new_baskets.py` (scoring new baskets) — only needed once you want to score new data |
 
 **Important — keep period ranges consistent:**
-- File #1's `<START_YEAR_PERIOD>`/`<END_YEAR_PERIOD>` placeholders **must match** file #4's training period range. If they don't, some products in your training baskets will have no embedding, and `GraphBuilder.py` silently falls back to a zero vector for them rather than erroring.
-- File #5 should use a period range **after** file #4's, since it's meant to be data the model never trained on.
-- If you haven't confirmed the real period values yet, there's a mention of a `diagnostic_check_periods.sql` check to run first (referenced in file #1's comments, not included in this folder — write one if needed, or just query `MIN/MAX(year_number*100+period_number)` on the source table).
+- `ns_item_lookup_tpna.sql`'s `<START_YEAR_PERIOD>`/`<END_YEAR_PERIOD>` placeholders **must match** `ns_household_tpnb_week_agg_train.sql`'s training period range. If they don't, some products in your training baskets will have no embedding, and `GraphBuilder.py` silently falls back to a zero vector for them rather than erroring.
+- `ns_household_tpnb_week_agg_score.sql` should use a period range **after** the training one, since it's meant to be data the model never trained on.
+- If you haven't confirmed the real period values yet, query `MIN/MAX(year_number*100+period_number)` on `cltv_hh_metrics_tpnb_base` first.
 
 There is no `06_write_back_need_states.sql` file currently in this folder —
 `pipeline_main.py`'s Stage 3 comment references it, but you'll need to write
@@ -129,7 +135,7 @@ What it does (`build_product_embeddings.py`):
 3. Embeds that text with `sentence-transformers` (`all-MiniLM-L6-v2` by default).
 4. Applies an "all-but-the-top" anisotropy correction (removes the top 2 principal components after mean-centering) — a carried-over default, not re-validated for this specific product set; worth checking downstream clustering quality with/without it.
 5. Loads the TPNB→TPNA mapping and **broadcasts** each TPNA's embedding down to every sibling TPNB (every size/color variant of one style gets an identical vector).
-6. Writes `data/product_embeddings.parquet` (columns: `tpnb`, `embedding`).
+6. Writes `data/output/product_embeddings.parquet` (columns: `tpnb`, `embedding`).
 
 Requires `pip install sentence-transformers` (see `requirements.txt` note about installing `torch`/`torch-geometric` first, matching your platform/CUDA version).
 
@@ -143,46 +149,50 @@ python pipeline_main.py
 
 ### Cache-staleness warning (read this first)
 
-`GraphBuilder.py` caches two intermediates to **fixed filenames**
-(`product_subclusters.pkl`, `training_graphs.pkl`), reused as-is on any
-future run regardless of whether the underlying data or code changed. If any
-of these exist from a previous run (especially a pre-refactor run), **delete
-them before your first run**, or they will silently produce embeddings that
-don't mean what you think they mean:
+`GraphBuilder.py` caches two intermediates to **fixed filenames** under
+`data/output/` (`product_subclusters.pkl`, `training_graphs.pkl`), reused
+as-is on any future run regardless of whether the underlying data or code
+changed. If any of these exist from a previous run (especially a
+pre-refactor or pre-week-grain run), **delete them before your first run**,
+or they will silently produce embeddings that don't mean what you think they
+mean:
 
 ```
-product_subclusters.pkl
-training_graphs.pkl
-basket_gnn_model.pt
-copurchase_sparse.npz
-product_id_to_index.pkl
-product_units_avg.pkl
+data/output/product_subclusters.pkl
+data/output/training_graphs.pkl
+data/output/basket_gnn_model.pt
+data/output/copurchase_sparse.npz
+data/output/product_id_to_index.pkl
+data/output/product_units_avg.pkl
 ```
 
 ### Stage 0 — Read warehouse exports (`parquet_loader.py`)
 
 Loads:
-- `product_embeddings.parquet` → `product_df_2` (tpnb, embedding)
-- `ns_household_tpnb_period_agg_train` → `tpnb_x_hh` (household_number, tpnb, year_number, period_number, quantity)
+- `data/output/product_embeddings.parquet` → `product_df_2` (tpnb, embedding)
+- `ns_household_tpnb_week_agg_train` → `tpnb_x_hh` (household_number, tpnb, year_number, period_number, week_number, quantity)
 
 ### Stage 1 — Build baskets, train the GNN
 
 1. **Whole-basket construction**: every product a household bought in a
-   given year-period becomes one basket (`household_number` + `year_period_number`
-   → `basket_id`). No category/theme split. Baskets with fewer than
-   `MIN_BASKET_PRODUCTS = 2` items are dropped.
+   given **week** becomes one basket (`household_number` + `year_week_number`
+   → `basket_id`) — see the grain warning at the top of this doc. No
+   category/theme split. Baskets with fewer than `MIN_BASKET_PRODUCTS = 2`
+   items are dropped.
    - ⚠️ Watch the `BASKET_COUNT_WARN_THRESHOLD` (2M) check — if you exceed
      it, the full basket table can run into 50–100GB in memory. If that's
      not intentional, verify the household-sampling filter you expect
      (e.g. `MOD(household_number, N) = 0`) is actually applied at the SQL
      stage.
 
-2. **Co-purchase matrix**: builds a sparse product×basket incidence matrix,
-   then `X.T @ X` → a product×product co-purchase count matrix
-   (`copurchase_sparse`), plus a `product_id_to_index` map and
-   `product_units_avg` (mean quantity per product). These three are saved to
-   disk immediately (`copurchase_sparse.npz`, `product_id_to_index.pkl`,
-   `product_units_avg.pkl`) — they're what `score_new_baskets.py` needs later.
+2. **Co-purchase matrix**: built in row-chunks of `COPURCHASE_CHUNK_BASKETS`
+   baskets at a time (default 500,000), checkpointed to disk after every
+   chunk so a crash resumes instead of restarting — mathematically identical
+   to computing `X.T @ X` over the whole population in one shot, not an
+   approximation. Produces `copurchase_sparse` (product×product co-purchase
+   counts), `product_id_to_index`, and `product_units_avg` (mean quantity per
+   product) — saved to `data/output/` immediately since `score_new_baskets.py`
+   needs them later.
 
 3. **Train + embed** (`GNN_Train.train_and_embed`, delegating heavily to
    `GraphBuilder.py`):
@@ -196,18 +206,17 @@ Loads:
      (`[embedding | co-purchase score | sub_cluster_id | distinctiveness | log_units]`).
    - `sample_baskets()` — stratified sampling **by basket size only** (bins:
      1, 2-5, 6-15, 16-50, 50+), capped at `N_TRAIN_SAMPLES = 300,000` (set in
-     `GNN_Train.py`; `GraphBuilder.py`'s own default of 1,000,000 is
-     overridden by this).
-   - `build_dense_cp_submatrix()` — a dense co-purchase submatrix restricted
-     to only the products appearing in the sampled training baskets (memory
-     safety check: falls back to sparse if the dense version would exceed
-     ~200GB).
+     `GNN_Train.py`).
    - `build_training_graphs()` — builds one PyTorch Geometric graph per
      sampled basket via `build_one_graph()`: nodes = products in the basket
      (with the 4 extra features above), edges = each product's top-`TOP_K=10`
      co-purchase partners **within that basket**, with edge features
      `[log(co-purchase count), relative strength vs. that node's own
-     strongest link]`. Cached to `training_graphs.pkl`.
+     strongest link]`. Each basket's co-purchase values come from a small
+     **per-basket** dense submatrix sliced from the sparse global co-purchase
+     matrix on the fly (bounded by that basket's own product count squared —
+     independent of catalog size, no size threshold anywhere). Cached to
+     `data/output/training_graphs.pkl`.
    - **Model** (`BasketGNN` in `GNN_Train.py`): a graph autoencoder —
      `node_encoder (Linear) → GINEConv → GINEConv → global_mean_pool → proj`
      produces the basket embedding (`out_dim = 64`); a `decoder` reconstructs
@@ -220,10 +229,12 @@ Loads:
      `GraphBuilder.py`) — after training, builds a **real graph for every
      basket** (not just the sampled training subset) using the exact same
      `build_one_graph()` function, and runs it through the model's full
-     `encode()` path. This guarantees training and scoring can never compute
-     features differently.
-   - Saves `basket_gnn_embeddings.parquet` (`basket_id`, `gnn_embedding`) and
-     `basket_gnn_model.pt`.
+     `encode()` path. Processed in chunks (`graph_chunk_size`, default
+     50,000 baskets) so the whole population's graphs are never all held in
+     memory at once — only the final embeddings accumulate. This guarantees
+     training and scoring can never compute features differently.
+   - Saves `data/output/basket_gnn_embeddings.parquet` (`basket_id`,
+     `gnn_embedding`) and `data/output/basket_gnn_model.pt`.
 
 ### Stage 2 — Cluster basket embeddings into need-states (`cluster_basket_embeddings.py`)
 
@@ -233,7 +244,8 @@ upfront:
 - **2a — Leiden** (`cluster_basket_embeddings`): builds a mutual-kNN graph
   over the L2-normalized basket embeddings (`BASKET_KNN_K = 15`, cosine
   similarity via `pynndescent` if installed, else sklearn
-  `NearestNeighbors`), then runs Leiden community detection
+  `NearestNeighbors`; edge construction is fully vectorized with NumPy, not a
+  per-pair Python loop), then runs Leiden community detection
   (`LEIDEN_RESOLUTION = 1.0` — described as a starting point; use
   `sweep_resolution()` to check other values before trusting this one).
   Output column: `need_state_cluster`.
@@ -243,9 +255,9 @@ upfront:
   `pipeline_main.py` is explicitly called out as a **placeholder** — swap it
   for a real best-K selection once available (`select_k_via_bic()` gives a
   BIC/AIC sweep to eyeball a better value). Saves the fitted model to
-  `gmm_basket_model.pkl` (needed later to score new baskets directly, since
-  GMM natively supports `.predict()` on new points — Leiden does not).
-  Output columns: `need_state_cluster_gmm`, `gmm_confidence`.
+  `data/output/gmm_basket_model.pkl` (needed later to score new baskets
+  directly, since GMM natively supports `.predict()` on new points — Leiden
+  does not). Output columns: `need_state_cluster_gmm`, `gmm_confidence`.
 - **2c — Compare** (`compare_leiden_gmm`): Adjusted Rand Index between the
   two label sets — close to 1 means they agree, close to 0 means they're
   finding different structure. Purely diagnostic, printed to console.
@@ -256,7 +268,7 @@ yet.
 
 ### Stage 3 — Reload into the warehouse (manual)
 
-Output: `basket_need_state_clusters.parquet`
+Output: `data/output/basket_need_state_clusters.parquet`
 (`basket_id`, `need_state_cluster`, `need_state_cluster_gmm`). No live
 write-back connection exists — upload this parquet (or re-save as CSV first
 if your workspace tool doesn't support parquet import) through your
@@ -266,20 +278,17 @@ warehouse's manual import feature.
 
 ## 6. Scoring new baskets later (no retraining)
 
-Once you have a period of new/held-out data (`ns_household_tpnb_period_agg_score.sql`
+Once you have held-out weeks of new data (`ns_household_tpnb_week_agg_score.sql`
 → downloaded parquet), score it against the already-trained model:
 
 ```
-python score_new_baskets.py --new-transactions ../data/ns_household_tpnb_period_agg_score/... 
+python score_new_baskets.py --new-transactions ../data/ns_household_tpnb_week_agg_score/...
 ```
 
-(Path arg should point at wherever you saved that download — the docstring
-example uses `data/new_basket_source.parquet`, matching the naming in
-`05_new_basket_source.sql`'s header comment even though the actual file in
-this repo is `ns_household_tpnb_period_agg_score.sql`.)
+(Path arg should point at wherever you saved that download.)
 
-Requires these artifacts to already exist from a prior `pipeline_main.py`
-run: `basket_gnn_model.pt`, `product_id_to_index.pkl`,
+Requires these artifacts to already exist under `data/output/` from a prior
+`pipeline_main.py` run: `basket_gnn_model.pt`, `product_id_to_index.pkl`,
 `copurchase_sparse.npz`, `product_units_avg.pkl`,
 `basket_gnn_embeddings.parquet`, `basket_need_state_clusters.parquet`, and
 optionally `gmm_basket_model.pkl` (GMM assignment is skipped, not an error,
@@ -291,12 +300,12 @@ What it does:
    current config — and **warns loudly** if the checkpoint's `in_dim` doesn't
    match what `prepare_globals()` computes now (a strong signal of a
    pre-refactor checkpoint, i.e. retrain rather than continue).
-2. Builds new whole-baskets from the new transactions, using the exact same
-   logic as `pipeline_main.py` Stage 1.
+2. Builds new whole-baskets (week grain) from the new transactions, using
+   the exact same logic as `pipeline_main.py` Stage 1.
 3. Filters out any basket_id that's already been embedded before (dedup
    against `basket_gnn_embeddings.parquet`).
 4. Embeds the new baskets via `embed_all_baskets_fast()` — same function,
-   same code path as training.
+   same code path, same chunking as training.
 5. Assigns each new basket to a need-state via **both** methods:
    - Leiden: `assign_new_baskets_to_clusters()` — Leiden has no native way to
      place a new point into an existing community, so this does a k-NN
@@ -308,7 +317,8 @@ What it does:
      workaround needed.
 6. Saves `new_basket_gnn_embeddings.parquet`, `new_basket_need_states.parquet`,
    and merges everything into `basket_gnn_embeddings_merged.parquet` /
-   `basket_need_state_clusters_merged.parquet` for re-upload.
+   `basket_need_state_clusters_merged.parquet` (all under `data/output/`) for
+   re-upload.
 
 ---
 
@@ -360,16 +370,17 @@ python test_theme_free_pipeline.py
 #    catalog / attributes change)
 python build_product_embeddings.py
 
-# 3. Delete stale caches if this is a first run after any refactor:
-#    product_subclusters.pkl, training_graphs.pkl, basket_gnn_model.pt,
-#    copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl
+# 3. Delete stale caches under data/output/ if this is a first run after any
+#    refactor or grain change: product_subclusters.pkl, training_graphs.pkl,
+#    basket_gnn_model.pt, copurchase_sparse.npz, product_id_to_index.pkl,
+#    product_units_avg.pkl
 
 # 4. Train the GNN + cluster into need-states
 python pipeline_main.py
-#    -> basket_need_state_clusters.parquet  (upload this to the warehouse)
+#    -> data/output/basket_need_state_clusters.parquet  (upload this to the warehouse)
 
-# 5. (Later, periodically) score new/held-out periods without retraining
-python score_new_baskets.py --new-transactions <path to new period's parquet>
+# 5. (Later, periodically) score new/held-out weeks without retraining
+python score_new_baskets.py --new-transactions <path to new weeks' parquet>
 ```
 
 ---
@@ -380,9 +391,14 @@ python score_new_baskets.py --new-transactions <path to new period's parquet>
 |---|---|---|---|
 | `MIN_BASKET_PRODUCTS` | `pipeline_main.py` / `score_new_baskets.py` | 2 | Drops 1-item baskets |
 | `N_TRAIN_SAMPLES` | `GNN_Train.py` | 300,000 | Reduced from 1,000,000 for memory safety; raise once you've confirmed headroom |
+| `COPURCHASE_CHUNK_BASKETS` | `pipeline_main.py` | 500,000 | Baskets per co-purchase-matrix chunk; lower if still memory-constrained |
 | `SUBCL_K_CANDIDATES` | `GraphBuilder.py` | [50, 100, 200, 400] | Global product sub-cluster K candidates — tune to catalog size |
 | `TOP_K` | `GraphBuilder.py` | 10 | Co-purchase edges kept per node per basket graph |
 | `EPOCHS` / `LR` | `GNN_Train.py` | 20 / 1e-4 | GNN training |
 | `LEIDEN_RESOLUTION` | `cluster_basket_embeddings.py` | 1.0 | Run `sweep_resolution()` first rather than trusting this |
 | `GMM_N_COMPONENTS` | `pipeline_main.py` | 30 | Explicit placeholder — replace with real best-K logic, or eyeball `select_k_via_bic()` |
-| Training/scoring period ranges | `ns_household_tpnb_period_agg_train.sql` / `..._score.sql` | `202603–202604` | Must match `ns_item_lookup_tpna.sql`'s range for training; scoring range should be later |
+| Training/scoring period ranges | `ns_household_tpnb_week_agg_train.sql` / `..._score.sql` | `202603–202604` | Must match `ns_item_lookup_tpna.sql`'s range for training; scoring range should be later |
+
+See `data/TABLE_REFERENCE.md` for what each underlying warehouse table
+actually contains, and why basket grain landed on WEEK rather than a true
+single-visit basket.

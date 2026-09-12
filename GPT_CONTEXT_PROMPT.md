@@ -30,9 +30,10 @@ project/
 ├── data/
 │   ├── ns_item_lookup_tpna/                    (input — Spark/Databricks export, folder of part-files)
 │   ├── ns_tpnb_to_tpna_mapping/                 (input — folder)
-│   ├── ns_household_tpnb_period_agg_train/      (input — folder; THIS IS THE BIG ONE, see scale below)
-│   ├── ns_household_tpnb_period_agg_score/      (input — folder, used later by score_new_baskets.py)
+│   ├── ns_household_tpnb_week_agg_train/       (input — folder; THIS IS THE BIG ONE, see scale below)
+│   ├── ns_household_tpnb_week_agg_score/       (input — folder, used later by score_new_baskets.py)
 │   ├── *.sql                                     (SQL run manually against the warehouse to produce the folders above)
+│   ├── TABLE_REFERENCE.md                        (what each underlying warehouse table contains)
 │   └── output/                                   (ALL pipeline-written artifacts land here — nothing is written
 │                                                    to the working directory. Includes: product_embeddings.parquet,
 │                                                    product_subclusters.pkl, training_graphs.pkl,
@@ -45,7 +46,7 @@ project/
     ├── build_product_embeddings.py   Embeds product text (TPNA grain, brand excluded) via sentence-transformers;
     │                                 writes data/output/product_embeddings.parquet. Run BEFORE pipeline_main.py.
     ├── parquet_loader.py             Reads the two warehouse exports (product embeddings, household x tpnb x
-    │                                 period purchases) into the DataFrame shapes the rest of the pipeline expects.
+    │                                 week purchases) into the DataFrame shapes the rest of the pipeline expects.
     ├── pipeline_main.py              Main entry point / orchestrator. Stage 0: read exports. Stage 1: build whole
     │                                 baskets (no category split), build the co-purchase matrix, train the GNN via
     │                                 GNN_Train.py. Stage 2: cluster basket embeddings (Leiden AND GMM, both kept).
@@ -70,13 +71,40 @@ project/
 ## Real data scale (this matters — several fixes below exist BECAUSE of these numbers)
 
 - **198,645** distinct products (tpnb) in the catalog
-- **1,025,332,391** raw household×tpnb×period rows in the training export
-- **21,978,316** baskets after grouping to household×period grain (a "basket"
-  here = everything one household bought in one period, not a single
-  checkout — periods are wide enough that basket sizes run large)
-- **~47 products/basket on average** (some baskets almost certainly much
-  larger — long-tail households)
+- **1,025,332,391** raw household×tpnb×**period** rows in the training export
+  (this was measured before the basket-grain fix below moved from period to
+  week grain — expect roughly the same row count at week grain too, since
+  the source table `cltv_hh_metrics_tpnb_base` is already at week grain and
+  the period version was just summing weeks together)
+- **21,978,316 baskets** at the OLD period grain (~4 weeks/basket) — expect
+  meaningfully MORE, smaller baskets now that basket construction groups by
+  week instead of period (roughly 4x more baskets, each ~4x smaller, is a
+  reasonable first guess, not yet confirmed against a real run)
+- **~47 products/basket on average at period grain** (expect noticeably
+  fewer per basket at week grain, since each basket now spans 1 week instead
+  of ~4)
 - Running on a Windows machine (`D:\cie\src`, PowerShell, a `.venv`)
+
+## Basket grain — WEEK, not a true single-visit basket
+
+None of the 4 tables available in this warehouse (`product.product`,
+`LAB_INSIGHT_CUSTOMER_ANALYTICS.IN22915286_UPDATED_PRODUCT_TABLE`,
+`lab_customer_value_analytics.cltv_hh_metrics_tpnb_base`,
+`product.buyer_hierarchy` — see `data/TABLE_REFERENCE.md`) carry a
+transaction/order/checkout identifier. `cltv_hh_metrics_tpnb_base` (the only
+household-purchase table) is already pre-aggregated to WEEK grain, and its
+`orders` column is a COUNT of separate orders folded into that week's total,
+not a preserved per-order identity. A true single-visit basket cannot be
+built from what's available. Basket construction was therefore changed from
+household×PERIOD (~4 weeks, an earlier design) to household×WEEK (the
+finest grain the data supports) — `ns_household_tpnb_period_agg_train.sql` /
+`_score.sql` were renamed to `ns_household_tpnb_week_agg_train.sql` /
+`_score.sql`, and `pipeline_main.py` / `score_new_baskets.py` / `parquet_loader.py`
+were updated to match (`year_period_number` → `year_week_number` throughout,
+`load_household_tpnb_period` → `load_household_tpnb_week`). This is a real
+improvement (4x less occasion-mixing) but still NOT a true single-visit
+basket — flag this if the user asks about basket-level accuracy or need-state
+quality, and don't assume week-grain fully resolves it.
 
 ## Recent engineering history — already fixed, please don't re-suggest these
 
@@ -136,13 +164,21 @@ environment was available in the environment these fixes were made in):
    what `build_product_embeddings.py` wrote and what `pipeline_main.py` /
    `score_new_baskets.py` read).
 
+## What HAS been verified
+
+`test_theme_free_pipeline.py` (both the static no-theme check and the
+functional synthetic-data check) has been run on the real target machine
+and passes end-to-end — confirms the API wiring from fixes 1-5 above is
+correct, but only at toy scale (30 products, 25 baskets).
+
 ## What has NOT been verified yet
 
-None of the above has been run against the real ~1B-row dataset or a
-matching installed environment (torch/torch-geometric/numba/etc.) — only
-reviewed by reading the code. `test_theme_free_pipeline.py`'s functional
-check (synthetic data, tiny catalog) is the one thing that can currently be
-run to sanity-check the wiring, but it does not exercise real-data scale.
+None of the fixes above (or the basket-grain change) have been run against
+the real ~1B-row dataset. `pipeline_main.py` has not yet been re-run since
+the co-purchase-matrix crash that started this thread, and hasn't been run
+at all since the basket grain changed from period to week — so the "21.98M
+baskets, ~47/basket" numbers above are now stale and need to be re-measured
+after re-running the SQL and Stage 0/1.
 
 ## What I'd like from you
 

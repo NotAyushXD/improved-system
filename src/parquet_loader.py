@@ -7,8 +7,14 @@ Reads two parquet files:
                                                (sql/01, 02, 03 feed that script,
                                                not this one directly — embeddings
                                                don't exist in your warehouse yet)
-    data/household_tpnb_period_agg.parquet <- sql/04_household_tpnb_period_agg.sql,
+    data/ns_household_tpnb_week_agg_train  <- ns_household_tpnb_week_agg_train.sql,
                                                run manually and downloaded as parquet
+
+BASKET GRAIN — WEEK: this table (and the "basket" it feeds) is at
+household x tpnb x WEEK grain, not a true single-visit basket — see the
+comment at the top of ns_household_tpnb_week_agg_train.sql for why (none of
+the tables available in this warehouse carry a transaction/order identifier;
+week is the finest grain the data supports).
 
 No live warehouse connection required — this only reads local files. Update
 the two path constants below to wherever you've saved the downloads, or pass
@@ -25,10 +31,10 @@ import pandas as pd
 # ─────────────────────────────────────────────
 
 PRODUCT_EMBEDDINGS_PARQUET = Path("../data/output/product_embeddings.parquet")
-HOUSEHOLD_TPNB_PERIOD_PARQUET   = Path("../data/ns_household_tpnb_period_agg_train")
+HOUSEHOLD_TPNB_WEEK_PARQUET    = Path("../data/ns_household_tpnb_week_agg_train")
 
 REQUIRED_PRODUCT_COLS   = {"tpnb", "embedding"}
-REQUIRED_HOUSEHOLD_COLS = {"household_number", "tpnb", "year_number", "period_number", "quantity"}
+REQUIRED_HOUSEHOLD_COLS = {"household_number", "tpnb", "year_number", "period_number", "week_number", "quantity"}
 
 
 def _parse_embedding_cell(x) -> np.ndarray:
@@ -73,17 +79,17 @@ def load_product_embeddings(path: Path = PRODUCT_EMBEDDINGS_PARQUET) -> pd.DataF
     return df
 
 
-def load_household_tpnb_period(path: Path = HOUSEHOLD_TPNB_PERIOD_PARQUET) -> pd.DataFrame:
+def load_household_tpnb_week(path: Path = HOUSEHOLD_TPNB_WEEK_PARQUET) -> pd.DataFrame:
     """
     Returns a DataFrame shaped exactly like graph_main.py's `tpnb_x_hh`:
-        household_number, tpnb, year_number, period_number, quantity
+        household_number, tpnb, year_number, period_number, week_number, quantity
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found — run sql/04_household_tpnb_period_agg.sql on the "
+            f"{path} not found — run ns_household_tpnb_week_agg_train.sql on "
             f"your workspace, download the result as parquet, and save it here "
-            f"(or pass the real path into load_household_tpnb_period())."
+            f"(or pass the real path into load_household_tpnb_week())."
         )
 
     df = pd.read_parquet(path)
@@ -97,5 +103,5 @@ def load_household_tpnb_period(path: Path = HOUSEHOLD_TPNB_PERIOD_PARQUET) -> pd
 
     df["tpnb"] = df["tpnb"].astype(str)
 
-    print(f"Loaded tpnb_x_hh from {path}: {len(df):,} household x tpnb x period rows")
+    print(f"Loaded tpnb_x_hh from {path}: {len(df):,} household x tpnb x week rows")
     return df

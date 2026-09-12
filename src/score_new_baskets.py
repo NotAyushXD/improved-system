@@ -155,16 +155,19 @@ def build_new_baskets(new_transactions_path: str) -> pd.DataFrame:
     print(f"Loading new transaction data from {new_transactions_path}...")
     df = pd.read_parquet(new_transactions_path)
 
-    # Same whole-basket construction as pipeline_main.py Stage 1
-    df["year_period_number"] = df["year_number"] * 100 + df["period_number"]
+    # Same whole-basket construction as pipeline_main.py Stage 1 — basket
+    # grain is WEEK (household_number x year_week_number), not a true
+    # single-visit basket. See the "BASKET GRAIN" note at the top of
+    # pipeline_main.py and data/ns_household_tpnb_week_agg_train.sql.
+    df["year_week_number"] = df["year_number"] * 100 + df["week_number"]
     baskets = (
-        df.groupby(["household_number", "year_period_number"])
+        df.groupby(["household_number", "year_week_number"])
         .agg(products=("tpnb", list), units=("quantity", list))
         .reset_index()
     )
     baskets["basket_id"] = (
         baskets["household_number"].astype(str) + "_" +
-        baskets["year_period_number"].astype(str)
+        baskets["year_week_number"].astype(str)
     )
     before_filter = len(baskets)
     baskets = baskets[baskets["products"].apply(len) >= MIN_BASKET_PRODUCTS].reset_index(drop=True)
@@ -181,7 +184,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--new-transactions", required=True,
-        help="Parquet downloaded after running sql/05_new_basket_source.sql on your warehouse",
+        help="Parquet downloaded after running ns_household_tpnb_week_agg_score.sql on your warehouse",
     )
     args = parser.parse_args()
 

@@ -22,7 +22,7 @@
 --
 -- IMPORTANT: the <START_YEAR_PERIOD> / <END_YEAR_PERIOD> placeholders below
 -- should be the SAME values you use in
--- sql/04_household_tpnb_period_agg.sql. Different ranges here vs. there
+-- ns_household_tpnb_week_agg_train.sql. Different ranges here vs. there
 -- means some products your training baskets actually contain would have no
 -- embedding at all (GraphBuilder.py silently falls back to a zero vector for
 -- those, rather than erroring — worth avoiding, not relying on).
@@ -35,7 +35,7 @@ USING PARQUET
 AS
 
 WITH purchased_tpnb AS (
-    -- <<< CONFIRM: same period range as sql/04_household_tpnb_period_agg.sql.
+    -- <<< CONFIRM: same period range as ns_household_tpnb_week_agg_train.sql.
     -- Run diagnostic_check_periods.sql first if you haven't confirmed real
     -- values yet.
     SELECT DISTINCT CAST(tpnb AS STRING) AS tpnb
