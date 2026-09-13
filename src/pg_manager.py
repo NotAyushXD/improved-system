@@ -23,7 +23,12 @@ alongside output/ instead of inside it.
 import atexit
 import os
 
-PGDATA_DIR = os.path.join("..", "data", "pgdata")
+# Overridable via an env var so this can be pointed at a plain local folder
+# if the default location turns out to sit on a drive/filesystem that
+# doesn't support the permission changes `initdb` needs (e.g. a cloud-sync
+# folder like OneDrive, or certain mapped/network drives) — initdb needs to
+# set restrictive ACLs on this directory, which some drive types refuse.
+PGDATA_DIR = os.environ.get("PIPELINE_PGDATA_DIR") or os.path.join("..", "data", "pgdata")
 
 _server = None  # module-level singleton — one server per process
 
@@ -41,7 +46,13 @@ def get_connection_uri() -> str:
     if _server is None:
         import pgserver  # requirements.txt dependency — never pip-installed here
 
-        os.makedirs(PGDATA_DIR, exist_ok=True)
+        # Deliberately NOT pre-creating PGDATA_DIR here: initdb behaves
+        # differently (and more reliably, permission-wise) when it creates
+        # its data directory itself from scratch versus being handed one
+        # that already exists — it takes an extra "fix up permissions on
+        # an existing directory" path in the latter case, which can fail
+        # outright on some drives/filesystems even though initdb creating
+        # the directory itself, fresh, would have succeeded.
         print(f"Starting local self-contained Postgres instance at {PGDATA_DIR} "
               f"(via pgserver — no manual install/config needed)...")
         _server = pgserver.get_server(PGDATA_DIR)

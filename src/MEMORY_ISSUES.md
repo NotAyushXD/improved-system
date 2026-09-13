@@ -215,15 +215,15 @@ pull a small, bounded piece into Python at any one time.
 
 ## Summary table
 
-| Section | Where the issue was | Main solution |
-|---|---|---|
-| Stage 0 | Loading the raw warehouse export in one shot (`pd.read_parquet()`) | Read in bounded batches instead of one giant load |
-| Stage 0/1 | Grouping raw rows into baskets (Python dict accumulators) | Do the grouping inside Postgres, not Python |
-| Stage 1 | Building the co-purchase matrix in one shot | Build it in checkpointed chunks, resumable on crash |
-| Stage 1 | Per-basket co-purchase lookup table (200GB threshold) | Slice a tiny per-basket table on the fly instead of one shared giant one |
-| Stage 1 | Picking the training sample (copied the whole basket table) | Sample via lightweight indexes, then via a database query |
-| Stage 1 | Holding all 300k training graphs in memory at once | Cache built graphs to disk (LMDB), read by index during training |
-| Stage 1 | Embedding every basket after training | Process in bounded, restartable chunks; save and discard per chunk |
-| Stage 1 | Duplicate full-size copy of the co-purchase matrix | Removed the redundant whole-matrix copy |
-| Stage 2 | Nearest-neighbor search across all basket embeddings | Use an approximate method (`pynndescent`), confirmed active; log graph size before clustering |
-| Scoring | Checking new baskets against every previously-scored basket ID | Compare inside the database (anti-join), never build a Python set of all IDs |
+| # | Stage | Where the issue was | Main solution | File(s) changed |
+|---|---|---|---|---|
+| 1 | Stage 0 | Loading the raw warehouse export in one shot (`pd.read_parquet()`) | Read in bounded batches instead of one giant load | `parquet_loader.py` (original streaming fix) → `basket_store.py` (`load_raw_export_to_postgres`) |
+| 2 | Stage 0/1 | Grouping raw rows into baskets (Python dict accumulators) | Do the grouping inside Postgres, not Python | `parquet_loader.py` (`stream_build_baskets_and_units_avg`, now retired) → `basket_store.py` (`build_baskets_table`) |
+| 3 | Stage 1 | Building the co-purchase matrix in one shot | Build it in checkpointed chunks, resumable on crash | `pipeline_main.py` (co-purchase chunk loop + checkpoint files) |
+| 4 | Stage 1 | Per-basket co-purchase lookup table (200GB threshold) | Slice a tiny per-basket table on the fly instead of one shared giant one | `GraphBuilder.py` (`_basket_dense_cp_submatrix`) |
+| 5 | Stage 1 | Picking the training sample (copied the whole basket table) | Sample via lightweight indexes, then via a database query | `GraphBuilder.py` (`sample_baskets`, now retired) → `basket_store.py` (`sample_training_baskets`) |
+| 6 | Stage 1 | Holding all 300k training graphs in memory at once | Cache built graphs to disk (LMDB), read by index during training | `GraphBuilder.py` (`build_training_graphs`/`save_training_graphs`, now retired) → `lmdb_graph_cache.py`, `GNN_Train.py` |
+| 7 | Stage 1 | Embedding every basket after training | Process in bounded, restartable chunks; save and discard per chunk | `GraphBuilder.py` (`embed_all_baskets_fast` → `_embed_basket_chunk` + `run_inference`), `basket_store.py` (chunk-queue table) |
+| 8 | Stage 1 | Duplicate full-size copy of the co-purchase matrix | Removed the redundant whole-matrix copy | `GraphBuilder.py` (`prepare_globals`) |
+| 9 | Stage 2 | Nearest-neighbor search across all basket embeddings | Use an approximate method (`pynndescent`), confirmed active; log graph size before clustering | `cluster_basket_embeddings.py` (`build_basket_knn_graph`) |
+| 10 | Scoring | Checking new baskets against every previously-scored basket ID | Compare inside the database (anti-join), never build a Python set of all IDs | `score_new_baskets.py`, `basket_store.py` (`exclude_existing_basket_ids`) |
