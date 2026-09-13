@@ -1,0 +1,229 @@
+# Memory issues in this pipeline — what broke, and how it was fixed
+
+This document walks through every stage of the pipeline where we hit (or
+could have hit) an out-of-memory problem, in the order those stages
+actually run. The short version of the whole story: **almost every issue
+here came from the same root cause** — holding the entire population of
+baskets (tens of millions of rows at real scale) as one object in Python's
+memory for the whole script. Each fix either shrank what's held at a given
+moment, moved the data somewhere that isn't Python's memory (disk,
+Postgres, LMDB), or removed a redundant copy of something already large.
+
+No fix ever reduced the amount of data used or the quality of the model —
+every fix is an engineering/storage change, not a data-reduction one.
+
+---
+
+## Stage 0 — Reading the raw warehouse export
+
+**Problem:** The household × product × week export is a huge flat table —
+one row per household, per product, per week. Loading it in one shot with
+`pd.read_parquet()` tries to build one giant table in memory in a single
+step. At real scale this failed outright with `pyarrow.lib.ArrowMemoryError`
+— pyarrow needs one big contiguous block of memory to do the conversion,
+and there wasn't one available even though the machine had free RAM overall
+(free RAM being fragmented/scattered doesn't help if one operation needs it
+all in one contiguous piece).
+
+**Fix:** Never load the whole file at once. Read it in bounded batches (a
+few million rows at a time) and only ever hold one batch in memory. This
+alone bought some headroom, but the *real* fix (below) was to stop
+building anything basket-shaped in Python at all — the batches now get
+piped straight into a local database instead.
+
+---
+
+## Stage 0/1 — Turning raw rows into "baskets"
+
+**Problem:** Even reading the file in batches, the code still had to turn
+millions of individual rows into "baskets" (all the products one household
+bought in one week). The way this was done — building up Python
+dictionaries that grow with every batch — meant that by the time every
+batch had been read, those dictionaries held the **entire** basket
+population anyway, just spread across many small steps instead of one big
+one. Same problem, just hidden one layer deeper.
+
+**Fix:** This grouping step now happens inside a small, local, automatically-
+managed Postgres database instead of in Python. Postgres knows how to group
+huge tables into smaller ones without needing everything in memory at
+once (it spills to disk on its own when needed) — this is exactly what a
+database is built for, so instead of re-inventing that logic in Python, we
+just use it. The result is one basket-level table that lives in the
+database, not in a Python variable.
+
+---
+
+## Stage 1 — Building the co-purchase matrix (which products get bought together)
+
+**Problem:** This step originally tried to compute one giant matrix (every
+product × every product) in a single mathematical operation across every
+basket at once. At real data volumes this silently crashed with no error
+message — the process just died.
+
+**Fix:** Build the matrix in chunks — process, say, 500,000 baskets at a
+time, add each chunk's contribution to a running total, and save progress
+to disk after every chunk. If the process crashes or is stopped, restarting
+it picks up from the last completed chunk instead of starting over. This
+also protects against a subtler bug: if the leftover progress file is from
+a *different* dataset (a different data pull, or the basket definition
+changed), the code detects the mismatch and rebuilds from scratch instead
+of silently mixing old and new results together.
+
+There was also a **200GB threshold check** originally meant to catch this
+matrix getting too big and fall back to something smaller — but at real
+catalog sizes the matrix could exceed 150GB+ on its own, meaning the
+"safety net" wouldn't even trigger before running out of memory. The real
+fix wasn't a bigger threshold — it was realizing the full matrix never
+needed to exist at all (see the next section).
+
+---
+
+## Stage 1 — Building the graph for one basket at a time
+
+**Problem:** For the model to learn from a basket, each product in it needs
+to know how often it's bought together with the *other* products in that
+same basket. An earlier version of the code built one enormous table
+covering every product that showed up anywhere across the whole training
+sample — and because a large enough sample of baskets touches nearly the
+entire product catalog, this table ended up close to catalog-size ×
+catalog-size, i.e. well over 100GB, no matter how the sample was chosen.
+
+**Fix:** A basket only ever needs the relationship between the handful of
+products *inside that one basket* — never the whole catalog. So instead of
+one shared giant table, each basket gets its own tiny slice, computed on
+the fly and thrown away right after. The size of this slice depends only
+on how many products are in that one basket (usually a few dozen), never
+on how big the whole catalog is.
+
+---
+
+## Stage 1 — Picking which baskets to train on
+
+**Problem:** Before training, a sample of ~300,000 baskets gets picked out
+of the full population. The original code copied the *entire* basket table
+just to pick a random subset out of it — a wasteful full duplication just
+to extract a small piece.
+
+**Fix (first pass):** Sample using lightweight index lists instead of
+copying the whole table.
+
+**Fix (final):** Now that baskets live in the database, the sampling
+itself happens there too — one query asks the database for a random,
+representative subset, and only that small subset (not the full
+population) ever comes back into Python.
+
+---
+
+## Stage 1 — Holding all 300,000 training graphs in memory at once
+
+**Problem:** After picking the training sample, the code built a full graph
+object (nodes, edges, features) for every one of those 300,000 baskets and
+kept *all of them* in one Python list at the same time — because the
+training step needs to shuffle and re-visit them every epoch. At real
+basket sizes, this list alone was roughly 20-25GB.
+
+**Fix:** Build each graph once, and instead of keeping it in a Python list,
+save it into a small on-disk database built exactly for this
+("LMDB") — think of it as a lookup table on disk: "give me training
+example #4,213" and it hands it back instantly, without needing all
+300,000 examples loaded into memory at the same time. Training reads
+whichever examples it needs, when it needs them.
+
+---
+
+## Stage 1 — Embedding *every* basket after training (not just the sample)
+
+**Problem:** Once the model is trained, it needs to process **every**
+basket in the whole population (potentially tens of millions), not just
+the training sample — building a graph for each one and running it through
+the model. Doing this for the entire population all at once would need
+building millions of graph objects simultaneously — on the order of
+terabytes.
+
+**Fix:** Process baskets in bounded batches (e.g. 50,000 at a time): build
+graphs for one batch, run them through the model, save the results, throw
+the graphs away, move to the next batch. On top of that, this step is now
+**restartable** — the database keeps track of which batches are done,
+in-progress, or not-started-yet, so if the machine crashes 8 hours into a
+long run, restarting it picks up only the unfinished batches instead of
+starting the whole thing over.
+
+---
+
+## Stage 1 — A duplicate copy of the co-purchase matrix
+
+**Problem:** One line of code converted the entire co-purchase matrix
+(multiple billions of numbers) to a different numeric type, which required
+making a **second full copy** of it — right at the exact moment a real
+crash was observed. This copy served no real purpose, since the actual
+place that number gets used already converts a much smaller, per-basket
+slice to the right type anyway.
+
+**Fix:** Removed the unnecessary whole-matrix copy entirely — one line
+change, no downside, freed up roughly 17-34GB depending on data size.
+
+---
+
+## Stage 2 — Clustering all the basket embeddings into need-states
+
+**Problem:** The last step groups baskets into need-states by first finding
+each basket's nearest neighbors (in embedding space), then running a
+community-detection algorithm on that neighbor graph. Finding nearest
+neighbors the "obvious" way (compare every basket to every other basket)
+is computationally impossible at tens of millions of baskets — it doesn't
+just get slow, it effectively never finishes.
+
+**Fix:** Use an approximate-nearest-neighbor method (`pynndescent`) that's
+built for exactly this scale — confirmed installed and confirmed (via a
+printed log line) that it's actually the method being used, not a much
+slower fallback. Also added a print of how big the resulting neighbor
+graph is (how many connections, roughly how much memory) *before* handing
+it to the clustering step, so if this ever becomes the next bottleneck at
+truly enormous scale, it'll show up as a visible number in the logs rather
+than a silent crash.
+
+This is the one area flagged as "**watch, don't assume solved**" — it's
+handled for realistic scale today, but hasn't been stress-tested at the
+very largest end.
+
+---
+
+## Scoring new baskets later — checking what's already been scored
+
+**Problem:** When scoring a new batch of baskets, the code needs to skip
+any basket that's already been processed before. The original approach
+loaded *every previously-scored basket ID* into one big Python collection
+just to check for overlaps — at real scale, that's a collection with tens
+of millions of entries.
+
+**Fix:** Do the comparison inside the database instead — stream just the
+basket ID column (not the actual data) into a small temporary table, and
+let the database do the "which of these are duplicates" check directly.
+Nothing resembling the full list of IDs ever gets built as a Python object.
+
+---
+
+## The one-sentence summary
+
+Every fix here follows the same idea: **don't build the whole thing in
+Python memory just because you eventually need to look at all of it.**
+Stream it in pieces, store it somewhere disk-backed (Postgres, LMDB, plain
+files) that's built for handling more data than fits in RAM, and only ever
+pull a small, bounded piece into Python at any one time.
+
+---
+
+## Summary table
+
+| Section | Where the issue was | Main solution |
+|---|---|---|
+| Stage 0 | Loading the raw warehouse export in one shot (`pd.read_parquet()`) | Read in bounded batches instead of one giant load |
+| Stage 0/1 | Grouping raw rows into baskets (Python dict accumulators) | Do the grouping inside Postgres, not Python |
+| Stage 1 | Building the co-purchase matrix in one shot | Build it in checkpointed chunks, resumable on crash |
+| Stage 1 | Per-basket co-purchase lookup table (200GB threshold) | Slice a tiny per-basket table on the fly instead of one shared giant one |
+| Stage 1 | Picking the training sample (copied the whole basket table) | Sample via lightweight indexes, then via a database query |
+| Stage 1 | Holding all 300k training graphs in memory at once | Cache built graphs to disk (LMDB), read by index during training |
+| Stage 1 | Embedding every basket after training | Process in bounded, restartable chunks; save and discard per chunk |
+| Stage 1 | Duplicate full-size copy of the co-purchase matrix | Removed the redundant whole-matrix copy |
+| Stage 2 | Nearest-neighbor search across all basket embeddings | Use an approximate method (`pynndescent`), confirmed active; log graph size before clustering |
+| Scoring | Checking new baskets against every previously-scored basket ID | Compare inside the database (anti-join), never build a Python set of all IDs |
