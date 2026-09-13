@@ -10,23 +10,34 @@ Two kinds of check:
    original ban list.
 
 2. FUNCTIONAL — builds a tiny synthetic catalog (30 products, random
-   embeddings) and a handful of synthetic baskets, then actually runs:
+   embeddings) and a synthetic raw household x tpnb x week export, writes it
+   to a throwaway parquet folder, and actually runs the REAL pipeline against
+   a REAL local self-contained Postgres instance (via pg_manager.py):
      - prepare_globals() with NO product_theme argument (a call that would
        raise TypeError if that parameter still existed)
-     - build_training_graphs() (the training path)
-     - embed_all_baskets_fast() (the scoring path)
-   and asserts the two paths produce node feature tensors of identical
-   width, confirming training and scoring compute the same graph features.
-   It also runs a tiny untrained BasketGNN's full encode() (node_encoder ->
-   conv1 -> conv2 -> pool -> proj) on output from BOTH paths, confirming
-   scoring actually exercises the graph convolutions rather than skipping
-   them.
+     - basket_store.load_raw_export_to_postgres() + build_baskets_table()
+       (the same aggregation pipeline_main.py's Stage 0 uses)
+     - basket_store.sample_training_baskets() (the training-sample draw)
+     - lmdb_graph_cache.load_or_build_lmdb_cache() + LMDBGraphDataset (the
+       training-graph cache, including a cache-hit reload)
+     - GraphBuilder.run_inference() + merge_inference_output() (the scoring
+       path, restartable-chunk-queue included)
+   and asserts the training and inference paths produce node feature
+   tensors of identical width, confirming they compute the same graph
+   features. It also runs a tiny untrained BasketGNN's full encode()
+   (node_encoder -> conv1 -> conv2 -> pool -> proj) on output from BOTH
+   paths, confirming inference actually exercises the graph convolutions
+   rather than skipping them.
+
+   Requires `pgserver` installed (see requirements.txt) — this test starts
+   a real, throwaway local Postgres instance under ./test_pgdata/.
 
 Run from inside src/:  python test_theme_free_pipeline.py
 Exits non-zero on any failure, so it's CI-friendly.
 """
 
 import ast
+import shutil
 import sys
 from pathlib import Path
 
@@ -47,6 +58,9 @@ ACTIVE_FILES = [
     "build_product_embeddings.py",
     "parquet_loader.py",
     "cluster_basket_embeddings.py",
+    "pg_manager.py",
+    "basket_store.py",
+    "lmdb_graph_cache.py",
 ]
 
 
@@ -124,46 +138,76 @@ def build_synthetic_catalog(n_products=30, emb_dim=16, seed=0):
     return tpnbs, product_embedding, product_units_avg, product_id_to_index, copurchase_sparse
 
 
-def build_synthetic_baskets(tpnbs, n_baskets=25, seed=1):
+def build_synthetic_raw_export(tpnbs, n_baskets=25, seed=1) -> pd.DataFrame:
+    """
+    A synthetic RAW household x tpnb x week export — one row per
+    (household, tpnb, week), matching the real warehouse export's shape —
+    rather than pre-aggregated basket rows. Aggregation into baskets is now
+    Postgres's job (basket_store.build_baskets_table), so the test needs to
+    exercise that same path instead of handing it already-basket-shaped rows.
+    """
     rng = np.random.default_rng(seed)
     rows = []
     for b in range(n_baskets):
+        household_number = 1000 + b
+        year_number  = 2026
+        week_number  = 1 + (b % 10)
+        period_number = 1 + (week_number - 1) // 4
         size = int(rng.integers(2, 8))
         products = list(rng.choice(tpnbs, size=size, replace=False))
-        units = [float(rng.integers(1, 4)) for _ in products]
-        rows.append({"basket_id": f"B{b:03d}", "products": products, "units": units})
+        for p in products:
+            rows.append({
+                "household_number": household_number,
+                "tpnb": p,
+                "year_number": year_number,
+                "period_number": period_number,
+                "week_number": week_number,
+                "quantity": float(rng.integers(1, 4)),
+            })
     return pd.DataFrame(rows)
 
 
 def check_functional():
     print()
     print("=" * 60)
-    print("FUNCTIONAL CHECK: train/score consistency on synthetic data")
+    print("FUNCTIONAL CHECK: train/score consistency on synthetic data "
+          "(real Postgres + LMDB, throwaway)")
     print("=" * 60)
 
     import torch
-    from GraphBuilder import (
-        prepare_globals,
-        sample_baskets,
-        build_training_graphs,
-        save_training_graphs,
-        embed_all_baskets_fast,
-        SUBCL_K_CANDIDATES,
-    )
+    from GraphBuilder import prepare_globals, run_inference, merge_inference_output
     from GNN_Train import BasketGNN
-
     import GraphBuilder as gb
+    import pg_manager
+    import basket_store
+    import lmdb_graph_cache
+
     gb.SUBCL_K_CANDIDATES = [2, 3]          # tiny catalog needs a tiny K range
     gb.SUBCL_SIL_SAMPLE = 30
     gb.SUBCL_CACHE_PATH = "test_product_subclusters.pkl"
-    gb.GRAPH_CACHE_PATH = "test_training_graphs.pkl"
-    for p in (gb.SUBCL_CACHE_PATH, gb.GRAPH_CACHE_PATH,
-              gb.SUBCL_CACHE_PATH + ".tmp", gb.GRAPH_CACHE_PATH + ".tmp"):
-        Path(p).unlink(missing_ok=True)
+    Path(gb.SUBCL_CACHE_PATH).unlink(missing_ok=True)
+    Path(gb.SUBCL_CACHE_PATH + ".tmp").unlink(missing_ok=True)
+
+    dataset_tag = "pytest"
+    raw_export_dir = Path("test_raw_export_parquet")
+    lmdb_path = "test_training_graphs.lmdb"
+    manifest_path = "test_training_graphs.lmdb.manifest.json"
+    output_dir = "test_output"
+
+    def _cleanup():
+        shutil.rmtree(raw_export_dir, ignore_errors=True)
+        shutil.rmtree(lmdb_path, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        Path(manifest_path).unlink(missing_ok=True)
+        Path(gb.SUBCL_CACHE_PATH).unlink(missing_ok=True)
+
+    _cleanup()
 
     tpnbs, product_embedding, product_units_avg, product_id_to_index, copurchase_sparse = \
         build_synthetic_catalog()
-    baskets = build_synthetic_baskets(tpnbs)
+    raw_export = build_synthetic_raw_export(tpnbs)
+    raw_export_dir.mkdir()
+    raw_export.to_parquet(raw_export_dir / "part-0.parquet", index=False)
 
     # prepare_globals() called with NO product_theme argument — this line
     # itself would raise TypeError if that parameter still existed.
@@ -178,25 +222,49 @@ def check_functional():
     assert G["in_dim"] == emb_dim + 4, f"expected in_dim == emb_dim+4, got {G['in_dim']}"
     print(f"  prepare_globals(): in_dim={G['in_dim']} (emb_dim={emb_dim}+4), no theme_ids key — OK")
 
-    # sample_baskets() called with NO product_theme argument
-    sampled = sample_baskets(baskets, n_samples=len(baskets))
-    print(f"  sample_baskets(): {len(sampled)} baskets sampled, no product_theme arg — OK")
+    conn_uri = pg_manager.get_connection_uri()
+    # Drop any leftover Postgres state from a previous test run BEFORE
+    # touching local output files — otherwise a stale inference_chunks_pytest
+    # table (all rows already 'complete' from a prior run) would make
+    # run_inference below claim nothing, while _cleanup() has already wiped
+    # this run's local chunk-parquet output, leaving nothing for
+    # merge_inference_output to merge.
+    basket_store.drop_all(conn_uri, dataset_tag)
+    basket_store.load_raw_export_to_postgres(conn_uri, raw_export_dir, dataset_tag)
+    n_baskets_total, _units_avg_pg, _products_pg = basket_store.build_baskets_table(
+        conn_uri, dataset_tag, min_basket_products=2,
+    )
+    print(f"  basket_store.load_raw_export_to_postgres() + build_baskets_table(): "
+          f"{n_baskets_total} baskets built in Postgres — OK")
 
-    graphs = build_training_graphs(sampled, G)
-    assert len(graphs) == len(sampled)
-    for g in graphs:
-        assert g.x.shape[1] == G["in_dim"], (
-            f"training graph node feature width {g.x.shape[1]} != in_dim {G['in_dim']}"
-        )
-        if g.edge_attr.shape[0] > 0:
-            assert g.edge_attr.shape[1] == 2, "expected 2 edge features (log_cp, relative strength)"
-    print(f"  build_training_graphs(): {len(graphs)} graphs, node width == in_dim, "
+    sampled = basket_store.sample_training_baskets(
+        conn_uri, dataset_tag, n_samples=n_baskets_total, seed=42,
+    )
+    print(f"  basket_store.sample_training_baskets(): {len(sampled)} baskets sampled — OK")
+
+    lmdb_graph_cache.load_or_build_lmdb_cache(
+        sampled, G, lmdb_path, manifest_path,
+        seed=42, n_train_samples_requested=n_baskets_total,
+    )
+    train_dataset = lmdb_graph_cache.LMDBGraphDataset(lmdb_path)
+    assert len(train_dataset) == len(sampled), "LMDB cache length != sampled basket count"
+    g0 = train_dataset.get(0)
+    assert g0.x.shape[1] == G["in_dim"], (
+        f"training graph node feature width {g0.x.shape[1]} != in_dim {G['in_dim']}"
+    )
+    if g0.edge_attr.shape[0] > 0:
+        assert g0.edge_attr.shape[1] == 2, "expected 2 edge features (log_cp, relative strength)"
+    print(f"  lmdb_graph_cache: {len(train_dataset)} graphs cached, node width == in_dim, "
           f"edge_attr width == 2 — OK")
 
-    save_training_graphs(graphs)
-    reloaded = build_training_graphs(sampled, G)  # should hit cache
-    assert len(reloaded) == len(graphs), "cache round-trip returned a different graph count"
-    print(f"  save_training_graphs() + cache reload round-trip — OK")
+    # Cache-hit reload — manifest matches, should NOT rebuild.
+    lmdb_graph_cache.load_or_build_lmdb_cache(
+        sampled, G, lmdb_path, manifest_path,
+        seed=42, n_train_samples_requested=n_baskets_total,
+    )
+    reloaded_dataset = lmdb_graph_cache.LMDBGraphDataset(lmdb_path)
+    assert len(reloaded_dataset) == len(train_dataset), "cache round-trip returned a different graph count"
+    print(f"  lmdb_graph_cache cache-hit reload round-trip — OK")
 
     # Tiny untrained model — this test checks shapes and that both paths
     # exercise the same code, not embedding quality.
@@ -205,21 +273,29 @@ def check_functional():
     model.eval()
 
     with torch.no_grad():
-        z_train_path = model.encode(graphs[0].to(device))
+        z_train_path = model.encode(g0.to(device))
     assert z_train_path.shape == (1, 4), f"unexpected training-path encode() shape {z_train_path.shape}"
-    print(f"  model.encode() on a training graph: shape {tuple(z_train_path.shape)} — OK")
+    print(f"  model.encode() on an LMDB-cached training graph: shape {tuple(z_train_path.shape)} — OK")
 
-    basket_ids, all_z = embed_all_baskets_fast(baskets, G, model, device, batch_size=8)
-    assert all_z.shape == (len(baskets), 4), f"unexpected embed_all_baskets_fast shape {all_z.shape}"
-    assert len(basket_ids) == len(baskets)
-    print(f"  embed_all_baskets_fast(): shape {all_z.shape} for {len(baskets)} baskets — OK")
+    run_inference(
+        conn_uri, dataset_tag, G, model, device,
+        worker_id="pytest-worker", chunk_size=10, batch_size=8, output_dir=output_dir,
+    )
+    merged = merge_inference_output(dataset_tag, output_dir=output_dir)
+    assert len(merged) == n_baskets_total, (
+        f"run_inference embedded {len(merged)} baskets, expected {n_baskets_total}"
+    )
+    assert merged["gnn_embedding"].iloc[0].shape == (4,), "unexpected embedding width from run_inference"
+    print(f"  run_inference() + merge_inference_output(): {len(merged)} baskets embedded, "
+          f"restartable chunk queue — OK")
 
-    for p in (gb.SUBCL_CACHE_PATH, gb.GRAPH_CACHE_PATH):
-        Path(p).unlink(missing_ok=True)
+    basket_store.drop_all(conn_uri, dataset_tag)
+    _cleanup()
 
     print("PASSED — training and scoring paths run the same graph "
           "construction and the same full GNN encoding, at consistent "
-          "feature widths, with no theme/category input anywhere.")
+          "feature widths, with no theme/category input anywhere, sourced "
+          "from a real Postgres instance and an LMDB-backed training cache.")
     return True
 
 

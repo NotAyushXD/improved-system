@@ -11,12 +11,23 @@ loaded one; that file is no longer written by pipeline_main.py and is not
 needed here, because GraphBuilder.py's prepare_globals() no longer takes a
 product_theme argument at all (see REFACTOR_NOTES.md).
 
-Embeds new baskets via GraphBuilder.embed_all_baskets_fast(), which builds
-a REAL per-basket graph for every basket (using build_one_graph — the exact
-same function training uses) and runs it through the model's full encode()
+Basket storage and inference now go through the SAME shared code path
+pipeline_main.py uses (basket_store.py + GraphBuilder.run_inference), just
+tagged "score" instead of "train" — this is deliberate: an earlier version
+of this file had its own separate basket-building implementation, which is
+exactly the kind of train/score drift this pipeline has been bitten by
+before (see REFACTOR_NOTES.md's account of the old inference shortcut that
+computed a different feature than training did). One shared implementation
+means these two entry points can't silently diverge again.
+
+Embeds new baskets via GraphBuilder.run_inference(), which builds a REAL
+per-basket graph for every basket (using build_one_graph — the exact same
+function training uses) and runs it through the model's full encode()
 pipeline (node_encoder -> conv1 -> conv2 -> global_mean_pool -> proj) —
 guaranteeing this file can't compute different features, or use a
-different encoding path, than training did.
+different encoding path, than training did. Inference is restartable and
+never holds more than one chunk's worth of baskets in memory, same as
+training's inference pass.
 
 Assigns each new basket to a need-state using BOTH methods, since that's
 how need-states are decided here:
@@ -37,7 +48,7 @@ pipeline_main.py run:
     gmm_basket_model.pkl        (optional — GMM scoring skipped if absent)
 
 Usage:
-    python score_new_baskets.py --new-transactions data/new_basket_source.parquet
+    python score_new_baskets.py --new-transactions ../data/ns_household_tpnb_week_agg_score
 """
 
 import argparse
@@ -53,7 +64,9 @@ import torch
 from sklearn.preprocessing import normalize
 
 import parquet_loader
-from GraphBuilder import prepare_globals, embed_all_baskets_fast
+import pg_manager
+import basket_store
+from GraphBuilder import prepare_globals, run_inference, merge_inference_output
 from GNN_Train import BasketGNN
 from cluster_basket_embeddings import assign_new_baskets_to_clusters
 
@@ -88,6 +101,7 @@ MERGED_EMBEDDINGS_OUT = os.path.join(OUTPUT_DIR, "basket_gnn_embeddings_merged.p
 MERGED_CLUSTERS_OUT   = os.path.join(OUTPUT_DIR, "basket_need_state_clusters_merged.parquet")
 
 EMBED_BATCH_SIZE = 8192
+DATASET_TAG = "score"
 
 
 # ─────────────────────────────────────────────
@@ -148,33 +162,6 @@ def load_globals_and_model():
 
 
 # ─────────────────────────────────────────────
-# BUILD NEW WHOLE BASKETS (no category split, matching pipeline_main.py)
-# ─────────────────────────────────────────────
-
-def build_new_baskets(new_transactions_path: str) -> pd.DataFrame:
-    print(f"Loading new transaction data from {new_transactions_path}...")
-
-    # Same whole-basket construction as pipeline_main.py Stage 1 — basket
-    # grain is WEEK (household_number x year_week_number), not a true
-    # single-visit basket. See the "BASKET GRAIN" note at the top of
-    # pipeline_main.py and data/ns_household_tpnb_week_agg_train.sql.
-    #
-    # Streamed the same way pipeline_main.py's Stage 1 now is (see
-    # parquet_loader.stream_build_baskets_and_units_avg docstring) — a
-    # single pd.read_parquet() of a held-out scoring window can be just as
-    # large as the training export, so it needs the same bounded-batch
-    # treatment rather than loading the whole thing at once. The returned
-    # product_units_avg is discarded here — this script already has its own
-    # from training (PRODUCT_UNITS_PATH), and reusing that one (rather than
-    # a fresh one computed only from the new/held-out data) is what keeps
-    # product features consistent between train and score.
-    baskets, _ = parquet_loader.stream_build_baskets_and_units_avg(
-        new_transactions_path, min_basket_products=MIN_BASKET_PRODUCTS,
-    )
-    return baskets
-
-
-# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
@@ -184,26 +171,54 @@ def main():
         "--new-transactions", required=True,
         help="Parquet downloaded after running ns_household_tpnb_week_agg_score.sql on your warehouse",
     )
+    parser.add_argument(
+        "--worker-id", default=None,
+        help="Label for this process in the restartable inference chunk queue "
+             "(defaults to hostname-pid) — see pipeline_main.py's --worker-id for details.",
+    )
     args = parser.parse_args()
 
     G, model, device = load_globals_and_model()
-    new_baskets = build_new_baskets(args.new_transactions)
 
-    existing_ids = set(pd.read_parquet(EXISTING_EMBEDDINGS_PATH)["basket_id"])
-    before = len(new_baskets)
-    new_baskets = new_baskets[~new_baskets["basket_id"].isin(existing_ids)].reset_index(drop=True)
-    print(f"  Already embedded: {before - len(new_baskets):,}  |  Need embedding: {len(new_baskets):,}")
+    conn_uri = pg_manager.get_connection_uri()
 
-    if new_baskets.empty:
+    print(f"Loading new transaction data from {args.new_transactions}...")
+    # Same whole-basket construction pipeline_main.py's Stage 0 uses — basket
+    # grain is WEEK (household_number x year_week_number), not a true
+    # single-visit basket. See the "BASKET GRAIN" note at the top of
+    # pipeline_main.py and data/ns_household_tpnb_week_agg_train.sql.
+    basket_store.load_raw_export_to_postgres(conn_uri, args.new_transactions, DATASET_TAG)
+    # product_units_avg returned here is discarded — this script already has
+    # its own from training (PRODUCT_UNITS_PATH), and reusing that one
+    # (rather than a fresh one computed only from the new/held-out data) is
+    # what keeps product features consistent between train and score.
+    n_baskets_total, _discarded_units_avg, _discarded_products = basket_store.build_baskets_table(
+        conn_uri, DATASET_TAG, min_basket_products=MIN_BASKET_PRODUCTS,
+    )
+    print(f"  {n_baskets_total:,} new baskets built (before already-embedded exclusion)")
+
+    # Same exclusion the old in-memory version did (`~isin(existing_ids)`),
+    # but done as a SQL anti-join against a streamed basket_id-only table —
+    # `existing_ids` at real scale is the entire training basket population
+    # (tens of millions of rows), which is exactly the kind of object this
+    # whole redesign exists to avoid materializing as a Python set.
+    basket_store.exclude_existing_basket_ids(conn_uri, DATASET_TAG, EXISTING_EMBEDDINGS_PATH)
+    n_to_score = basket_store.count_baskets(conn_uri, DATASET_TAG)
+    print(f"  Need embedding: {n_to_score:,}")
+
+    if n_to_score == 0:
         print("All baskets already embedded — nothing to score.")
         return
 
-    print(f"\nEmbedding {len(new_baskets):,} baskets via full GNN encoding...")
-    basket_ids, all_z = embed_all_baskets_fast(
-        new_baskets, G, model, device, batch_size=EMBED_BATCH_SIZE
+    print(f"\nEmbedding {n_to_score:,} baskets via full GNN encoding "
+          f"(restartable, chunked from Postgres)...")
+    run_inference(
+        conn_uri, DATASET_TAG, G, model, device,
+        worker_id=args.worker_id, batch_size=EMBED_BATCH_SIZE,
     )
-    new_embeddings = pd.DataFrame({"basket_id": basket_ids, "gnn_embedding": list(all_z)})
-    new_embeddings.to_parquet(NEW_EMBEDDINGS_OUT, index=False)
+    new_embeddings = merge_inference_output(
+        DATASET_TAG, output_dir=OUTPUT_DIR, final_path=NEW_EMBEDDINGS_OUT,
+    )
     print(f"Saved {NEW_EMBEDDINGS_OUT} ({len(new_embeddings):,} rows)")
 
     print("\nAssigning new baskets to existing need-state clusters (Leiden, k-NN vote)...")

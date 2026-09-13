@@ -4,13 +4,22 @@ GNN_Train.py — Sample + Inductive GNN
 Theme-free: no theme/category input feeds training or scoring anywhere in
 this file. Node features come from product embeddings, co-purchase
 structure, and GLOBAL product sub-clustering (see GraphBuilder.py). Scoring
-(embed_all_baskets_fast, in GraphBuilder.py) builds real per-basket graphs
-and runs the full encode() pipeline below — the same one training uses —
-so training and scoring can't drift apart in either features or encoding.
-See REFACTOR_NOTES.md for the full account of what changed and why.
+(GraphBuilder.run_inference / _embed_basket_chunk) builds real per-basket
+graphs and runs the full encode() pipeline below — the same one training
+uses — so training and scoring can't drift apart in either features or
+encoding. See REFACTOR_NOTES.md for the full account of what changed and why.
+
+Basket storage: `baskets` is never passed into this file as one in-memory
+object anymore — it lives in Postgres (basket_store.py), addressed by
+`conn_uri` + `dataset_tag`. The training sample is drawn there (bounded,
+~N_TRAIN_SAMPLES rows), cached once to LMDB (lmdb_graph_cache.py) so
+DataLoader can randomly access it across epochs without holding all built
+graphs in RAM, and inference streams the full population from Postgres in
+restartable chunks (GraphBuilder.run_inference).
 """
 
 import os
+import socket
 import numpy as np
 import pandas as pd
 import torch
@@ -22,13 +31,9 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import joblib
 
-from GraphBuilder import (
-    prepare_globals,
-    sample_baskets,
-    build_training_graphs,
-    save_training_graphs,
-    embed_all_baskets_fast,
-)
+from GraphBuilder import prepare_globals, run_inference, merge_inference_output
+import basket_store
+import lmdb_graph_cache
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -43,14 +48,28 @@ EPOCHS          = 20
 LR              = 1e-4   # reduced from 1e-3 — prevents divergence with new features
 WEIGHT_DECAY    = 1e-5
 N_TRAIN_SAMPLES = 300_000  # was 1_000_000 — reduced as an extra memory safety
-                            # margin on a shared machine. 300k graphs is still
-                            # plenty for training; raise it back up once a run
-                            # succeeds cleanly and you've confirmed headroom.
-NUM_WORKERS     = 0 if os.name == "nt" else 4
+                            # margin on a shared machine. With the LMDB-backed
+                            # dataset (build once, random-access during
+                            # training, never all resident in RAM) this is no
+                            # longer a hard memory constraint — raise it back
+                            # up if more training data is wanted, independent
+                            # of RAM.
+NUM_WORKERS     = 0 if os.name == "nt" else 4   # see the __main__ guard note
+                            # in pipeline_main.py — nonzero DataLoader workers
+                            # on Windows require that guard to be in place,
+                            # since `spawn` re-imports/re-executes the
+                            # launching module in every worker process.
 
 # All pipeline-produced artifacts land here, not the working directory.
 OUTPUT_DIR      = "../data/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+LMDB_TRAINING_GRAPHS_PATH = os.path.join(OUTPUT_DIR, "training_graphs.lmdb")
+LMDB_MANIFEST_PATH        = os.path.join(OUTPUT_DIR, "training_graphs.lmdb.manifest.json")
+
+
+def _default_worker_id() -> str:
+    return f"{socket.gethostname()}-{os.getpid()}"
 
 
 # ─────────────────────────────────────────────
@@ -114,12 +133,15 @@ def batch_graph_targets(data):
 # ─────────────────────────────────────────────
 
 def train_and_embed(
-    baskets,
+    conn_uri,
+    dataset_tag,
     product_embedding,
     product_id_to_index,
     copurchase_sparse,
     product_units_avg,
+    worker_id=None,
 ):
+    worker_id = worker_id or _default_worker_id()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
@@ -134,24 +156,28 @@ def train_and_embed(
     in_dim = G["in_dim"]   # emb_dim + 4
     print(f"  Node feature dim: {in_dim}  (emb_dim={G['emb_dim']} + 4 extra features)")
 
-    # ── Step 2: Sample baskets ──
+    # ── Step 2: Sample training baskets (from Postgres, bounded result size) ──
     print("\n[ 2 / 4 ] Sampling training baskets...")
-    sampled = sample_baskets(baskets, n_samples=N_TRAIN_SAMPLES)
+    sampled = basket_store.sample_training_baskets(
+        conn_uri, dataset_tag, n_samples=N_TRAIN_SAMPLES, seed=42,
+    )
 
-    # ── Step 3: Build training graphs ──
+    # ── Step 3: Build (or reuse) the LMDB training-graph cache ──
     # Each basket's co-purchase submatrix is built on the fly, scoped to just
     # that basket's own products — see GraphBuilder._basket_dense_cp_submatrix
     # — so there's no whole-sample dense matrix to build (or free) here.
-    print("\n[ 3 / 4 ] Building training graphs...")
-    graph_list = build_training_graphs(sampled, G)
-    print(f"  Training graphs ready: {len(graph_list):,}")
-
-    save_training_graphs(graph_list)
+    print("\n[ 3 / 4 ] Building (or reusing) LMDB training-graph cache...")
+    lmdb_graph_cache.load_or_build_lmdb_cache(
+        sampled, G, LMDB_TRAINING_GRAPHS_PATH, LMDB_MANIFEST_PATH,
+        seed=42, n_train_samples_requested=N_TRAIN_SAMPLES,
+    )
+    train_dataset = lmdb_graph_cache.LMDBGraphDataset(LMDB_TRAINING_GRAPHS_PATH)
+    print(f"  Training graphs ready: {len(train_dataset):,} (LMDB-backed, lazy random access)")
 
     # ── Step 4: Train ──
     print(f"\n[ 4 / 4 ] Training GNN for {EPOCHS} epochs...")
     train_loader = DataLoader(
-        graph_list, batch_size=TRAIN_BATCH,
+        train_dataset, batch_size=TRAIN_BATCH,
         shuffle=True, num_workers=NUM_WORKERS,
     )
 
@@ -206,30 +232,28 @@ def train_and_embed(
         if nan_batches > 0:
             print(f"  Warning: {nan_batches} NaN batches skipped in epoch {epoch+1}")
 
-        avg_loss = total_loss / len(train_loader)
-        epoch_bar.set_postfix(avg_loss=f"{avg_loss:.6f}")
-
-    # ── Inductive inference ──
-    # Builds a real graph per basket and runs the SAME model.encode() path
-    # used during training (node_encoder -> conv1 -> conv2 -> pool -> proj) —
-    # not a hand-rolled pooling shortcut. See GraphBuilder.embed_all_baskets_fast.
-    print("\n[ Inference ] Embedding all baskets via full GNN encoding...")
-    basket_ids, all_z = embed_all_baskets_fast(
-        baskets, G, model, device, batch_size=8192
+    # ── Inference (restartable, bounded-memory, one chunk at a time) ──
+    # Streams the FULL basket population from Postgres in claimed chunks,
+    # builds a real graph per chunk, runs it through the SAME model.encode()
+    # path used during training, and writes each chunk's embeddings straight
+    # to disk — see GraphBuilder.run_inference. A crash partway through
+    # resumes from whatever chunks are still pending/stale rather than
+    # starting over.
+    print("\n[ Inference ] Embedding all baskets via full GNN encoding "
+          "(restartable, chunked from Postgres)...")
+    run_inference(
+        conn_uri, dataset_tag, G, model, device,
+        worker_id=worker_id, batch_size=8192,
     )
+    basket_gnn_embeddings = merge_inference_output(dataset_tag, output_dir=OUTPUT_DIR)
 
-    # ── Save ──
-    basket_gnn_embeddings = pd.DataFrame({
-        "basket_id":     basket_ids,
-        "gnn_embedding": list(all_z),
-    })
-    embeddings_path = os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet")
-    model_path      = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
-    basket_gnn_embeddings.to_parquet(embeddings_path, index=False)
+    # ── Save model ──
+    model_path = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
     torch.save(model.state_dict(), model_path)
 
     print("\nDone. Saved:")
-    print(f"  {embeddings_path}  ({len(basket_gnn_embeddings):,} rows)")
+    print(f"  {os.path.join(OUTPUT_DIR, 'basket_gnn_embeddings.parquet')}  "
+          f"({len(basket_gnn_embeddings):,} rows)")
     print(f"  {model_path}")
 
     return basket_gnn_embeddings

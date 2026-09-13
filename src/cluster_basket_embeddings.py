@@ -101,9 +101,24 @@ def build_basket_knn_graph(
     X = normalize(np.stack(basket_gnn_embeddings["gnn_embedding"].values))
 
     if HAVE_PYNNDESCENT:
+        print(f"  kNN method: pynndescent (approximate) — k={k}, n={n:,} baskets")
         index = NNDescent(X, n_neighbors=k + 1, metric="cosine", random_state=SAMPLE_SEED)
         indices, distances = index.neighbor_graph
     else:
+        fallback_msg = (
+            f"kNN method: sklearn NearestNeighbors (EXACT/brute-force under cosine metric) — "
+            f"k={k}, n={n:,} baskets. pynndescent not installed — at real data scale (millions "
+            f"of baskets) this is computationally infeasible, not just slow. Install pynndescent "
+            f"(`pip install pynndescent`) before running this at full scale."
+        )
+        if n > 100_000:
+            print("=" * 70)
+            print(f"  !!! WARNING !!!  {fallback_msg}")
+            print(f"  n={n:,} is large enough that this will likely never finish in "
+                  f"practical time — this is not a slow-but-safe fallback at this scale.")
+            print("=" * 70)
+        else:
+            print(f"  kNN method: {fallback_msg}")
         nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
         nn.fit(X)
         distances, indices = nn.kneighbors(X)
@@ -157,8 +172,14 @@ def build_basket_knn_graph(
     }).drop_duplicates(subset=["basket_a", "basket_b"])
     edges["weight"] = minmax_scale(edges["similarity"])
 
+    # Visible before _build_igraph/Leiden ever touch this — the kNN graph
+    # itself (not just building it) is the next likely memory bottleneck at
+    # full basket-population scale (potentially 1B+ edges), flagged here
+    # rather than silently discovered when igraph/leidenalg choke on it.
+    est_mb = edges.memory_usage(deep=True).sum() / 1e6
     print(f"Basket kNN graph ({'mutual' if use_mutual else 'one-directional'}): "
-          f"{len(edges)} edges over {n} baskets")
+          f"{len(edges):,} edges over {n:,} baskets "
+          f"(~{est_mb:,.0f} MB as a DataFrame, before igraph's own edge-list overhead)")
     return edges[["basket_a", "basket_b", "weight"]]
 
 

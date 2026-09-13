@@ -3,8 +3,10 @@ pipeline_main.py
 
 End-to-end pipeline:  your warehouse (manual export)  ->  GNN basket embeddings  ->  need-state clustering
 
-    Stage 0   Read the two parquet files exported from your workspace  (parquet_loader.py)
-    Stage 1   Build baskets (whole basket, no category split), train the GNN
+    Stage 0   Read the two parquet files exported from your workspace, load the
+              household x tpnb x week export into Postgres (parquet_loader.py
+              for product embeddings, pg_manager.py + basket_store.py for baskets)
+    Stage 1   Build the co-purchase matrix, train the GNN, embed every basket
     Stage 2   Cluster the resulting basket embeddings — BOTH Leiden and GMM    (cluster_basket_embeddings.py)
     Stage 3   Save need-state output as parquet for manual reload into your warehouse
 
@@ -31,37 +33,52 @@ finest grain the data supports. See the comment at the top of
 data/ns_household_tpnb_week_agg_train.sql for the full reasoning, and
 data/TABLE_REFERENCE.md for what each source table actually contains.
 
+BASKET STORAGE — POSTGRES, NOT A PYTHON DATAFRAME: `baskets` used to be
+held as one Python object for this entire script's run, which at real
+week-grain scale (tens of millions of baskets) is bigger than available
+RAM. Basket storage now lives in a self-contained, locally-managed
+Postgres instance (pg_manager.py starts it — no manual install/config
+needed; basket_store.py owns the load/aggregate/stream/sample functions).
+Nothing in this file ever holds the full basket population in memory —
+Stage 1's co-purchase loop streams bounded chunks, the training sample is a
+small SQL-drawn subset, and inference streams the full population from
+Postgres in restartable chunks (see GraphBuilder.run_inference).
+
 BREAKING CHANGE — cached artifact schema: GraphBuilder.py's node feature
 layout changed (in_dim = emb_dim + 4, was + 5) and its sub-clustering
 algorithm changed (global MiniBatchKMeans, was per-theme KMeans). The basket
-grain also changed (household x WEEK, was household x PERIOD — see above),
-which invalidates everything derived from basket composition. Delete these
-under data/output/ before running this version against any changed data or
-basket definition:
-    training_graphs.pkl, basket_gnn_model.pt, copurchase_sparse.npz,
+grain also changed (household x WEEK, was household x PERIOD), which
+invalidates everything derived from basket composition. Delete these under
+data/output/ before running this version against any changed data or basket
+definition:
+    basket_gnn_model.pt, copurchase_sparse.npz,
     product_id_to_index.pkl, product_units_avg.pkl,
     basket_gnn_embeddings.parquet, gmm_basket_model.pkl,
-    basket_need_state_clusters.parquet
+    basket_need_state_clusters.parquet, embeddings_chunk_*.parquet,
+    training_graphs.lmdb/ (and its .manifest.json)
 product_subclusters.pkl and product_embeddings.parquet do NOT need deleting
 for a basket-grain change — both are derived purely from product text
-attributes, never from basket/purchase data.
-The co-purchase-matrix build's own checkpoint (copurchase_sparse.checkpoint.npz
-+ .progress.txt) is self-protecting: it fingerprints the basket/product
-counts it was built from and rebuilds from scratch automatically if they
-don't match the current run, rather than silently resuming into stale data —
-but the files above are NOT fingerprinted, so they must be deleted manually.
+attributes, never from basket/purchase data. The co-purchase-matrix build's
+own checkpoint (copurchase_sparse.checkpoint.npz + .progress.txt) and the
+LMDB training-graph cache are both self-protecting: they fingerprint what
+they were built from and rebuild automatically on mismatch, rather than
+silently resuming into stale data. The Postgres `baskets_train` table and
+`inference_chunks_train` chunk-plan table are NOT fingerprinted — if you
+change the source export or basket definition, drop them manually (they
+live in the local Postgres instance under data/pgdata/) or just delete
+data/pgdata/ entirely to start clean.
 There is no product_theme.pkl to delete — that file is never written by
 this version, and never read by score_new_baskets.py either.
 
-There's no live database connection anywhere in this file. Before running
-this, you need to have already run build_product_embeddings.py (product
-embeddings don't exist yet, so that script builds them from scratch — see
-its own docstring).
+There's no live database connection to your WAREHOUSE anywhere in this file
+(the Postgres instance it does use is a private, local, self-contained one
+managed by pg_manager.py — not your company's data warehouse). Before
+running this, you need to have already run build_product_embeddings.py
+(product embeddings don't exist yet, so that script builds them from
+scratch — see its own docstring).
 
 Run this from inside the src/ folder, with a sibling data/ folder holding
-your downloaded tables (see the folder layout each script's path constants
-assume — PRODUCT_EMBEDDINGS_PARQUET / HOUSEHOLD_TPNB_WEEK_PARQUET below
-use "../data/..." on that assumption):
+your downloaded tables:
 
     project/
     ├── data/
@@ -69,6 +86,7 @@ use "../data/..." on that assumption):
     │   ├── ns_tpnb_to_tpna_mapping/                (folder)
     │   ├── ns_household_tpnb_week_agg_train/       (folder)
     │   ├── ns_household_tpnb_week_agg_score/       (folder — used later by score_new_baskets.py)
+    │   ├── pgdata/                                 (the local Postgres instance's data directory)
     │   └── output/                                 (everything this pipeline WRITES lands here —
     │                                                 product_embeddings.parquet, caches, the
     │                                                 trained model, embeddings, need-state output)
@@ -88,9 +106,10 @@ for your team's real best-K selection once that logic is available; in the
 meantime cluster_basket_embeddings.select_k_via_bic() gives a reasonable BIC
 sweep to eyeball.
 
-Run:  python pipeline_main.py
+Run:  python pipeline_main.py [--worker-id NAME]
 """
 
+import argparse
 import os
 import pickle
 import gc
@@ -101,6 +120,8 @@ import scipy.sparse as sp
 from scipy.sparse import csr_matrix
 
 import parquet_loader
+import pg_manager
+import basket_store
 from GNN_Train import train_and_embed
 from cluster_basket_embeddings import (
     cluster_basket_embeddings,
@@ -121,11 +142,16 @@ GMM_N_COMPONENTS = 30
 # bounds peak memory during that step and survives a crash/restart without
 # losing already-completed work — it does NOT change the result: X.T @ X is
 # exactly additive over row-disjoint chunks of X (a basket only contributes
-# co-purchase pairs to itself, never across baskets, and `baskets` is
-# already one row per basket, so no basket ever straddles two chunks).
+# co-purchase pairs to itself, never across baskets, and each chunk is a
+# disjoint basket_seq range from the Postgres baskets table).
 # Lower this if you still see memory pressure; raise it for fewer, faster
 # chunks once you've confirmed headroom.
 COPURCHASE_CHUNK_BASKETS = 500_000
+
+# Chunk size for the restartable inference pass over the full basket
+# population (see GraphBuilder.run_inference) — independent of the
+# co-purchase chunk size above.
+INFERENCE_CHUNK_BASKETS = 50_000
 
 # All pipeline-produced artifacts (caches, models, embeddings, cluster
 # output) live under this one folder — nothing gets written to the working
@@ -134,255 +160,228 @@ COPURCHASE_CHUNK_BASKETS = 500_000
 OUTPUT_DIR = "../data/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ─────────────────────────────────────────────
-# Cache-staleness guard
-# ─────────────────────────────────────────────
-# GraphBuilder.py caches two intermediates to FIXED filenames, reused as-is
-# on any future run regardless of whether the underlying data OR CODE
-# changed. If you're running this for the first time after the theme-free
-# refactor and either of these files exists from before, IT WILL BE LOADED
-# AS-IS — and being from before means it was built with a different node
-# feature schema (in_dim = emb_dim + 5, per-theme sub-clustering), which
-# will silently corrupt this run rather than error loudly. Delete both
-# before your first run against this version.
-for _stale_cache in (os.path.join(OUTPUT_DIR, "product_subclusters.pkl"),
-                     os.path.join(OUTPUT_DIR, "training_graphs.pkl")):
-    if os.path.exists(_stale_cache):
-        print(f"WARNING: {_stale_cache} exists and will be REUSED AS-IS by GraphBuilder "
-              f"(cached by fixed filename, not by data or code fingerprint). If this is "
-              f"left over from before the theme-free refactor, or from a different "
-              f"warehouse export, DELETE IT before continuing — the node feature schema "
-              f"changed (in_dim = emb_dim + 4, was + 5) and a stale cache here will not "
-              f"error, it will just silently produce embeddings that don't mean what you "
-              f"think they mean.")
-
-# ─────────────────────────────────────────────
-# Stage 0: read the manually-downloaded warehouse exports
-# ─────────────────────────────────────────────
-# Point these at wherever you saved the two downloads, or edit the defaults
-# in parquet_loader.py directly.
-
-# Databricks/Spark exports a table as a FOLDER of part-files, not one single
-# .parquet file — pandas reads that folder directly, so these point straight
-# at the folder names as downloaded. Paths are relative to running this
-# script from inside src/ (see the note at the top of this file).
 PRODUCT_EMBEDDINGS_PARQUET  = os.path.join(OUTPUT_DIR, "product_embeddings.parquet")
 HOUSEHOLD_TPNB_WEEK_PARQUET = "../data/ns_household_tpnb_week_agg_train"
 
-print("[Stage 0] Reading warehouse exports...")
-product_df_2 = parquet_loader.load_product_embeddings(PRODUCT_EMBEDDINGS_PARQUET)
 
-# ─────────────────────────────────────────────
-# Stage 1: build whole baskets (no category split), train the GNN
-# ─────────────────────────────────────────────
-
-print("\n[Stage 1] Building features...")
-# Basket grain is WEEK, not a true single-visit basket — see the
-# "BASKET GRAIN" note at the top of this file for why.
-#
-# The household x tpnb x week export is streamed in bounded batches (never
-# loaded as one flat table) straight into the aggregated `baskets` table and
-# `product_units_avg` — see parquet_loader.stream_build_baskets_and_units_avg()
-# and its docstring for why: at week grain this export routinely runs into
-# billions of rows (no longer collapsed across weeks the way period grain
-# was), large enough that a single pd.read_parquet() can fail outright on a
-# single pyarrow allocation even with plenty of total RAM free.
-print("Building baskets (whole basket — every product a household bought in "
-      "the week, no category/theme split) — streamed in bounded batches...")
-baskets, product_units_avg = parquet_loader.stream_build_baskets_and_units_avg(
-    HOUSEHOLD_TPNB_WEEK_PARQUET, min_basket_products=MIN_BASKET_PRODUCTS,
-)
-
-# This DataFrame is held in memory for the ENTIRE rest of this script — it's
-# needed both as GNN training input and, afterward, to embed every single
-# basket. Its size doesn't shrink at any later point. A rough estimate: at
-# ~30 products/basket, roughly 3-4KB per row once you account for real
-# per-object Python overhead in the products/units list cells — 20 million+
-# baskets is on the order of 50-100GB for this one object alone, before
-# anything else the rest of the script needs. Note baskets are now WEEK grain
-# (~4x more baskets than the old PERIOD grain, for the same household
-# population), so this threshold trips more easily than before — that's
-# expected, not a regression. If you're not intentionally running the full,
-# un-sampled population, check ns_household_tpnb_week_agg_train.sql's
-# MOD(household_number, N) = 0 filter is actually being applied — this
-# number should look dramatically smaller than your household count.
-BASKET_COUNT_WARN_THRESHOLD = 2_000_000
-if len(baskets) > BASKET_COUNT_WARN_THRESHOLD:
-    est_gb = len(baskets) * 3500 / 1e9
-    print(f"  WARNING: {len(baskets):,} baskets is large enough to plausibly run this "
-          f"machine out of memory later in the run (rough estimate: ~{est_gb:.0f}GB just "
-          f"for this DataFrame, held for the rest of the script). If this wasn't "
-          f"intentional, stop now (Ctrl+C) and check sql/04's household-sampling filter "
-          f"is actually being applied to the data you downloaded.")
-
-print("Building co-purchase matrix "
-      f"(chunked {COPURCHASE_CHUNK_BASKETS:,} baskets at a time, checkpointed to disk)...")
-
-# Global product vocabulary — bounded by the number of DISTINCT products
-# (tens/hundreds of thousands), not the ~1 billion basket-product rows. Built
-# by scanning the already-in-memory `products` lists once; no explode of the
-# full basket table needed just to find this.
-product_set = set()
-for products in baskets["products"]:
-    product_set.update(products)
-product_uniques     = np.array(sorted(product_set))
-product_id_to_index = {pid: idx for idx, pid in enumerate(product_uniques)}
-n_products_cp        = len(product_uniques)
-print(f"  {n_products_cp:,} distinct products across all baskets")
-
-# Checkpoint files for this step only — deleted once the matrix is complete.
-# If this crashes partway, re-running the script picks up from the last
-# completed chunk instead of starting the whole matrix over — but ONLY if
-# the checkpoint was built from the SAME baskets. The progress file stores a
-# fingerprint (n_baskets_total, n_products_cp) alongside the chunk index
-# precisely so a checkpoint left over from a different run (different data,
-# different basket grain, etc.) gets rejected and rebuilt from scratch
-# instead of being silently resumed into — same class of risk as the
-# product_subclusters.pkl / training_graphs.pkl staleness guard above, just
-# for a fixed-filename cache added later.
-_CP_CHECKPOINT = os.path.join(OUTPUT_DIR, "copurchase_sparse.checkpoint.npz")
-_CP_PROGRESS   = os.path.join(OUTPUT_DIR, "copurchase_sparse.progress.txt")
-
-n_baskets_total = len(baskets)
-n_chunks = (n_baskets_total + COPURCHASE_CHUNK_BASKETS - 1) // COPURCHASE_CHUNK_BASKETS
-
-start_chunk = 0
-if os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
-    try:
-        _progress_fields = open(_CP_PROGRESS).read().split(",")
-        _ckpt_chunk = int(_progress_fields[0])
-        _ckpt_fingerprint = tuple(_progress_fields[1:3]) if len(_progress_fields) >= 3 else None
-    except (ValueError, IndexError):
-        # Malformed/empty progress file (e.g. a crash mid-write, before the
-        # atomic rename below existed, or any other corruption) — treat
-        # exactly like a fingerprint mismatch: rebuild from scratch rather
-        # than crash on a cache file that was never meant to be load-bearing.
-        _ckpt_chunk = 0
-        _ckpt_fingerprint = None
-    _current_fingerprint = (str(n_baskets_total), str(n_products_cp))
-
-    if _ckpt_fingerprint != _current_fingerprint:
-        print(f"  IGNORING stale checkpoint at {_CP_CHECKPOINT}: it was built for "
-              f"n_baskets={_ckpt_fingerprint[0] if _ckpt_fingerprint else '?'}, "
-              f"n_products={_ckpt_fingerprint[1] if _ckpt_fingerprint else '?'}, but this run has "
-              f"n_baskets={n_baskets_total:,}, n_products={n_products_cp:,} — almost certainly "
-              f"a different dataset or basket grain. Rebuilding from scratch rather than risking "
-              f"silently blending stale partial results into this run.")
-        copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
-    else:
-        copurchase_sparse = sp.load_npz(_CP_CHECKPOINT).tocsr()
-        start_chunk = _ckpt_chunk
-        print(f"  Resuming from checkpoint: {start_chunk}/{n_chunks} chunks already done "
-              f"(nnz so far={copurchase_sparse.nnz:,}) — delete {_CP_CHECKPOINT} and "
-              f"{_CP_PROGRESS} if you want this step to start over from scratch instead.")
-else:
-    copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
-
-for chunk_i in range(start_chunk, n_chunks):
-    lo = chunk_i * COPURCHASE_CHUNK_BASKETS
-    hi = min(lo + COPURCHASE_CHUNK_BASKETS, n_baskets_total)
-
-    # Explode only this chunk's "products" column (not the whole row, which
-    # would needlessly duplicate every other column — units, household_number,
-    # etc. — across every exploded row, the way the old single-shot version did).
-    chunk_items = baskets["products"].iloc[lo:hi].explode()
-    if len(chunk_items) == 0:
-        continue
-    local_basket_codes, _ = pd.factorize(chunk_items.index, sort=False)
-    product_idx = chunk_items.map(product_id_to_index).to_numpy()
-
-    X_chunk = csr_matrix(
-        (np.ones(len(chunk_items), dtype=np.int32), (local_basket_codes, product_idx)),
-        shape=(local_basket_codes.max() + 1, n_products_cp),
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--worker-id", default=None,
+        help="Label for this process in the restartable inference chunk queue "
+             "(defaults to hostname-pid). Only matters if you're running more "
+             "than one process against the same Postgres instance at once — "
+             "single-machine runs can ignore this.",
     )
-    copurchase_sparse = (copurchase_sparse + (X_chunk.T @ X_chunk)).tocsr()
-    del chunk_items, local_basket_codes, product_idx, X_chunk
-    gc.collect()
+    args = parser.parse_args()
 
-    tmp_ckpt = _CP_CHECKPOINT + ".writing.npz"
-    sp.save_npz(tmp_ckpt, copurchase_sparse)
-    os.replace(tmp_ckpt, _CP_CHECKPOINT)   # atomic — never leaves a truncated checkpoint
+    # ─────────────────────────────────────────────
+    # Cache-staleness guard
+    # ─────────────────────────────────────────────
+    # GraphBuilder.py caches product sub-clusters to a FIXED filename, reused
+    # as-is on any future run regardless of whether the underlying data OR
+    # CODE changed. If you're running this for the first time after a
+    # feature-layout change and this file exists from before, IT WILL BE
+    # LOADED AS-IS. The LMDB training-graph cache doesn't have this problem —
+    # it checks a manifest (graph builder version, seed, sample size, in_dim)
+    # and rebuilds automatically on mismatch, see lmdb_graph_cache.py.
+    stale_cache = os.path.join(OUTPUT_DIR, "product_subclusters.pkl")
+    if os.path.exists(stale_cache):
+        print(f"WARNING: {stale_cache} exists and will be REUSED AS-IS by GraphBuilder "
+              f"(cached by fixed filename, not by data or code fingerprint). If this is "
+              f"left over from before a feature-layout change, or from a different "
+              f"warehouse export, DELETE IT before continuing.")
 
-    tmp_progress = _CP_PROGRESS + ".tmp"
-    with open(tmp_progress, "w") as f:
-        f.write(f"{chunk_i + 1},{n_baskets_total},{n_products_cp}")
-    os.replace(tmp_progress, _CP_PROGRESS)   # atomic — never leaves an empty/truncated progress file
+    # ─────────────────────────────────────────────
+    # Stage 0: read the manually-downloaded warehouse exports, load baskets
+    # into the local self-contained Postgres instance
+    # ─────────────────────────────────────────────
+    print("[Stage 0] Reading warehouse exports...")
+    product_df_2 = parquet_loader.load_product_embeddings(PRODUCT_EMBEDDINGS_PARQUET)
 
-    print(f"  chunk {chunk_i + 1}/{n_chunks}  ({hi:,}/{n_baskets_total:,} baskets)  "
-          f"running nnz={copurchase_sparse.nnz:,}")
+    conn_uri = pg_manager.get_connection_uri()
+    print("Loading household x tpnb x week export into Postgres "
+          "(streamed in bounded batches via COPY — never held as one object)...")
+    basket_store.load_raw_export_to_postgres(conn_uri, HOUSEHOLD_TPNB_WEEK_PARQUET, "train")
 
-if os.path.exists(_CP_CHECKPOINT):
-    os.remove(_CP_CHECKPOINT)
-if os.path.exists(_CP_PROGRESS):
-    os.remove(_CP_PROGRESS)
-print(f"  Co-purchase matrix complete: {n_products_cp:,} x {n_products_cp:,}, "
-      f"nnz={copurchase_sparse.nnz:,}")
+    print("Building the per-basket table in Postgres (one SQL pass, "
+          "disk-spilling aggregate — replaces the old Python dict accumulator)...")
+    n_baskets_total, product_units_avg, product_uniques = basket_store.build_baskets_table(
+        conn_uri, "train", min_basket_products=MIN_BASKET_PRODUCTS,
+    )
 
-product_embedding = dict(zip(product_df_2["tpnb"], product_df_2["embedding"]))
-# product_units_avg was already computed by stream_build_baskets_and_units_avg()
-# above, alongside `baskets` — there's no separate raw tpnb_x_hh table to
-# compute it from (or delete afterward) anymore.
+    BASKET_COUNT_WARN_THRESHOLD = 2_000_000
+    if n_baskets_total > BASKET_COUNT_WARN_THRESHOLD:
+        print(f"  NOTE: {n_baskets_total:,} baskets — this now lives in Postgres, not Python "
+              f"memory, so basket count alone no longer risks an OOM crash the way it used "
+              f"to. If this looks unexpectedly large, check "
+              f"ns_household_tpnb_week_agg_train.sql's MOD(household_number, N) = 0 filter is "
+              f"actually being applied to the data you downloaded.")
 
-# train_and_embed() only saves the model + training embeddings — it does NOT
-# persist these three inputs, but score_new_baskets.py (scoring new baskets
-# against the trained model later) needs exactly these three files on disk
-# under exactly these names. Save them now while they're in scope. No
-# product_theme to save — that concept doesn't exist in this pipeline.
-print("Saving inference-time artifacts (needed later to score new baskets)...")
-sp.save_npz(os.path.join(OUTPUT_DIR, "copurchase_sparse.npz"), copurchase_sparse.tocsr())
-with open(os.path.join(OUTPUT_DIR, "product_id_to_index.pkl"), "wb") as f:
-    pickle.dump(product_id_to_index, f)
-with open(os.path.join(OUTPUT_DIR, "product_units_avg.pkl"), "wb") as f:
-    pickle.dump(product_units_avg, f)
-print(f"  Saved copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl to {OUTPUT_DIR}")
+    product_id_to_index = {pid: idx for idx, pid in enumerate(product_uniques)}
+    n_products_cp = len(product_uniques)
+    print(f"  {n_products_cp:,} distinct products across all baskets")
 
-print("\n[Stage 1] Training GNN + embedding baskets...")
-basket_gnn_embeddings = train_and_embed(
-    baskets              = baskets,
-    product_embedding    = product_embedding,
-    product_id_to_index  = product_id_to_index,
-    copurchase_sparse    = copurchase_sparse,
-    product_units_avg    = product_units_avg,
-)
+    # ─────────────────────────────────────────────
+    # Stage 1a: co-purchase matrix — chunked + checkpointed, streamed from
+    # Postgres in row-disjoint basket_seq ranges
+    # ─────────────────────────────────────────────
+    print("\n[Stage 1] Building co-purchase matrix "
+          f"(chunked {COPURCHASE_CHUNK_BASKETS:,} baskets at a time, checkpointed to disk)...")
 
-# ─────────────────────────────────────────────
-# Stage 2: cluster the basket embeddings into need-states — Leiden AND GMM
-# ─────────────────────────────────────────────
+    _CP_CHECKPOINT = os.path.join(OUTPUT_DIR, "copurchase_sparse.checkpoint.npz")
+    _CP_PROGRESS   = os.path.join(OUTPUT_DIR, "copurchase_sparse.progress.txt")
 
-print("\n[Stage 2a] Leiden clustering...")
-leiden_clusters = cluster_basket_embeddings(basket_gnn_embeddings)
+    n_chunks = (n_baskets_total + COPURCHASE_CHUNK_BASKETS - 1) // COPURCHASE_CHUNK_BASKETS
 
-print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
-gmm_clusters = cluster_basket_embeddings_gmm(basket_gnn_embeddings, n_components=GMM_N_COMPONENTS)
+    start_chunk = 0
+    if os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
+        try:
+            _progress_fields = open(_CP_PROGRESS).read().split(",")
+            _ckpt_chunk = int(_progress_fields[0])
+            _ckpt_fingerprint = tuple(_progress_fields[1:3]) if len(_progress_fields) >= 3 else None
+        except (ValueError, IndexError):
+            _ckpt_chunk = 0
+            _ckpt_fingerprint = None
+        _current_fingerprint = (str(n_baskets_total), str(n_products_cp))
 
-print("\n[Stage 2c] Comparing the two methods...")
-compare_leiden_gmm(leiden_clusters, gmm_clusters)
+        if _ckpt_fingerprint != _current_fingerprint:
+            print(f"  IGNORING stale checkpoint at {_CP_CHECKPOINT}: it was built for "
+                  f"n_baskets={_ckpt_fingerprint[0] if _ckpt_fingerprint else '?'}, "
+                  f"n_products={_ckpt_fingerprint[1] if _ckpt_fingerprint else '?'}, but this run has "
+                  f"n_baskets={n_baskets_total:,}, n_products={n_products_cp:,} — almost certainly "
+                  f"a different dataset or basket grain. Rebuilding from scratch rather than risking "
+                  f"silently blending stale partial results into this run.")
+            copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
+        else:
+            copurchase_sparse = sp.load_npz(_CP_CHECKPOINT).tocsr()
+            start_chunk = _ckpt_chunk
+            print(f"  Resuming from checkpoint: {start_chunk}/{n_chunks} chunks already done "
+                  f"(nnz so far={copurchase_sparse.nnz:,}) — delete {_CP_CHECKPOINT} and "
+                  f"{_CP_PROGRESS} if you want this step to start over from scratch instead.")
+    else:
+        copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
 
-# Both label sets kept side by side — need_state_cluster (Leiden) and
-# need_state_cluster_gmm (GMM) — rather than collapsing to one, since the
-# real decision (compare vs. combine, and how) isn't settled yet.
-need_state_clusters = leiden_clusters.merge(gmm_clusters, on="basket_id", how="outer")
-need_state_clusters_path = os.path.join(OUTPUT_DIR, "basket_need_state_clusters.parquet")
-need_state_clusters.to_parquet(need_state_clusters_path, index=False)
-print(f"  Saved {need_state_clusters_path} ({len(need_state_clusters):,} rows, "
-      f"columns: need_state_cluster [Leiden], need_state_cluster_gmm [GMM])")
+    chunk_stream = basket_store.stream_basket_chunks(
+        conn_uri, "train", COPURCHASE_CHUNK_BASKETS,
+        start_seq=start_chunk * COPURCHASE_CHUNK_BASKETS + 1,
+    )
+    for chunk_i, chunk_df in zip(range(start_chunk, n_chunks), chunk_stream):
+        hi = min((chunk_i + 1) * COPURCHASE_CHUNK_BASKETS, n_baskets_total)
 
-# ─────────────────────────────────────────────
-# Stage 3: reload into your warehouse (manual)
-# ─────────────────────────────────────────────
-# No live write-back connection here, same as Stage 0. Two options:
-#   1. Run sql/06_write_back_need_states.sql once to create the landing table,
-#      then upload data/output/basket_need_state_clusters.parquet through your
-#      workspace web tool's import feature.
-#   2. If your web tool doesn't support parquet import, re-save as CSV first:
-#        need_state_clusters.to_csv(os.path.join(OUTPUT_DIR, "basket_need_state_clusters.csv"), index=False)
+        # Explode only this chunk's "products" column (not the whole row, which
+        # would needlessly duplicate every other column — units, household_number,
+        # etc. — across every exploded row, the way the old single-shot version did).
+        chunk_items = chunk_df["products"].explode()
+        if len(chunk_items) == 0:
+            continue
+        local_basket_codes, _ = pd.factorize(chunk_items.index, sort=False)
+        product_idx = chunk_items.map(product_id_to_index).to_numpy()
 
-print(f"\n[Stage 3] Skipped — reload {need_state_clusters_path} into "
-      "your warehouse manually (see sql/06_write_back_need_states.sql).")
+        X_chunk = csr_matrix(
+            (np.ones(len(chunk_items), dtype=np.int32), (local_basket_codes, product_idx)),
+            shape=(local_basket_codes.max() + 1, n_products_cp),
+        )
+        copurchase_sparse = (copurchase_sparse + (X_chunk.T @ X_chunk)).tocsr()
+        del chunk_df, chunk_items, local_basket_codes, product_idx, X_chunk
+        gc.collect()
 
-print("\nPipeline complete.")
+        tmp_ckpt = _CP_CHECKPOINT + ".writing.npz"
+        sp.save_npz(tmp_ckpt, copurchase_sparse)
+        os.replace(tmp_ckpt, _CP_CHECKPOINT)   # atomic — never leaves a truncated checkpoint
 
-# Themes, if wanted at all, are formed AFTER this point — by profiling the
-# need-states this run produced (e.g. summarizing each need_state_cluster's
-# dominant products/hierarchy) — never fed back in as an input. That
-# profiling step isn't implemented in this repository yet.
+        tmp_progress = _CP_PROGRESS + ".tmp"
+        with open(tmp_progress, "w") as f:
+            f.write(f"{chunk_i + 1},{n_baskets_total},{n_products_cp}")
+        os.replace(tmp_progress, _CP_PROGRESS)   # atomic — never leaves an empty/truncated progress file
+
+        print(f"  chunk {chunk_i + 1}/{n_chunks}  ({hi:,}/{n_baskets_total:,} baskets)  "
+              f"running nnz={copurchase_sparse.nnz:,}")
+
+    if os.path.exists(_CP_CHECKPOINT):
+        os.remove(_CP_CHECKPOINT)
+    if os.path.exists(_CP_PROGRESS):
+        os.remove(_CP_PROGRESS)
+    print(f"  Co-purchase matrix complete: {n_products_cp:,} x {n_products_cp:,}, "
+          f"nnz={copurchase_sparse.nnz:,}")
+
+    product_embedding = dict(zip(product_df_2["tpnb"], product_df_2["embedding"]))
+
+    # train_and_embed() only saves the model — it does NOT persist these
+    # inputs, but score_new_baskets.py (scoring new baskets against the
+    # trained model later) needs exactly these files on disk under exactly
+    # these names. Save them now while they're in scope. No product_theme to
+    # save — that concept doesn't exist in this pipeline.
+    print("Saving inference-time artifacts (needed later to score new baskets)...")
+    sp.save_npz(os.path.join(OUTPUT_DIR, "copurchase_sparse.npz"), copurchase_sparse.tocsr())
+    with open(os.path.join(OUTPUT_DIR, "product_id_to_index.pkl"), "wb") as f:
+        pickle.dump(product_id_to_index, f)
+    with open(os.path.join(OUTPUT_DIR, "product_units_avg.pkl"), "wb") as f:
+        pickle.dump(product_units_avg, f)
+    print(f"  Saved copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl to {OUTPUT_DIR}")
+
+    # ─────────────────────────────────────────────
+    # Stage 1b: train the GNN, embed every basket (restartable, chunked
+    # inference — see GraphBuilder.run_inference)
+    # ─────────────────────────────────────────────
+    print("\n[Stage 1] Training GNN + embedding baskets...")
+    basket_gnn_embeddings = train_and_embed(
+        conn_uri             = conn_uri,
+        dataset_tag          = "train",
+        product_embedding    = product_embedding,
+        product_id_to_index  = product_id_to_index,
+        copurchase_sparse    = copurchase_sparse,
+        product_units_avg    = product_units_avg,
+        worker_id            = args.worker_id,
+    )
+
+    # ─────────────────────────────────────────────
+    # Stage 2: cluster the basket embeddings into need-states — Leiden AND GMM
+    # ─────────────────────────────────────────────
+
+    print("\n[Stage 2a] Leiden clustering...")
+    leiden_clusters = cluster_basket_embeddings(basket_gnn_embeddings)
+
+    print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
+    gmm_clusters = cluster_basket_embeddings_gmm(basket_gnn_embeddings, n_components=GMM_N_COMPONENTS)
+
+    print("\n[Stage 2c] Comparing the two methods...")
+    compare_leiden_gmm(leiden_clusters, gmm_clusters)
+
+    # Both label sets kept side by side — need_state_cluster (Leiden) and
+    # need_state_cluster_gmm (GMM) — rather than collapsing to one, since the
+    # real decision (compare vs. combine, and how) isn't settled yet.
+    need_state_clusters = leiden_clusters.merge(gmm_clusters, on="basket_id", how="outer")
+    need_state_clusters_path = os.path.join(OUTPUT_DIR, "basket_need_state_clusters.parquet")
+    need_state_clusters.to_parquet(need_state_clusters_path, index=False)
+    print(f"  Saved {need_state_clusters_path} ({len(need_state_clusters):,} rows, "
+          f"columns: need_state_cluster [Leiden], need_state_cluster_gmm [GMM])")
+
+    # ─────────────────────────────────────────────
+    # Stage 3: reload into your warehouse (manual)
+    # ─────────────────────────────────────────────
+    # No live write-back connection here, same as Stage 0. Two options:
+    #   1. Run sql/06_write_back_need_states.sql once to create the landing table,
+    #      then upload data/output/basket_need_state_clusters.parquet through your
+    #      workspace web tool's import feature.
+    #   2. If your web tool doesn't support parquet import, re-save as CSV first:
+    #        need_state_clusters.to_csv(os.path.join(OUTPUT_DIR, "basket_need_state_clusters.csv"), index=False)
+
+    print(f"\n[Stage 3] Skipped — reload {need_state_clusters_path} into "
+          "your warehouse manually (see sql/06_write_back_need_states.sql).")
+
+    print("\nPipeline complete.")
+
+    # Themes, if wanted at all, are formed AFTER this point — by profiling the
+    # need-states this run produced (e.g. summarizing each need_state_cluster's
+    # dominant products/hierarchy) — never fed back in as an input. That
+    # profiling step isn't implemented in this repository yet.
+
+
+if __name__ == "__main__":
+    # Windows `spawn` re-imports and re-executes the launching module in
+    # every DataLoader worker process — without this guard, enabling
+    # GNN_Train.py's NUM_WORKERS > 0 on Windows would re-run this entire
+    # script (Stage 0, the co-purchase matrix build, everything) inside every
+    # worker. This guard is what makes it safe to turn workers on.
+    main()

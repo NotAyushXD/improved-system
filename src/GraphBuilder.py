@@ -14,7 +14,9 @@ Summary of the theme-free architecture:
     clustering, and an intermediate iteration used arbitrary fixed-size
     product chunks as a stand-in for themes — both are gone. Clustering
     here sees the entire catalog as one population.
-  - Basket sampling is stratified by basket SIZE only.
+  - Basket sampling is stratified by basket SIZE only — now computed in SQL
+    against the Postgres baskets table (basket_store.sample_training_baskets),
+    not in-memory in this file; see that module.
   - Edge features are derived purely from co-purchase strength — the old
     same_theme edge flag is replaced by each edge's strength relative to
     its source node's own strongest co-purchase link, which is itself a
@@ -24,23 +26,30 @@ Summary of the theme-free architecture:
   - Node feature layout is now: [product_embedding] + [cp_score] +
     [sub_cluster_id] + [distinctiveness] + [log_units]  ->  in_dim = D + 4
     (previously D + 5, with the removed dimension being theme_score).
-  - embed_all_baskets_fast() now builds a REAL per-basket graph for every
-    basket (reusing build_one_graph — the exact same function training
-    uses) and runs it through the model's full encode() pipeline
-    (node_encoder -> conv1 -> conv2 -> global_mean_pool -> proj). The
-    previous version skipped both graph convolutions and used a different
-    meaning for one feature slot than training did — a real train/score
-    mismatch, independent of themes, fixed here as part of the same
-    consistency requirement.
+  - Training-graph construction (build once) lives in lmdb_graph_cache.py,
+    caching to LMDB rather than one big in-memory list. Inference
+    (run_inference / _embed_basket_chunk, below) builds a REAL per-basket
+    graph for every basket — reusing build_one_graph, the exact same
+    function training's LMDB cache uses — and runs it through the model's
+    full encode() pipeline (node_encoder -> conv1 -> conv2 ->
+    global_mean_pool -> proj). An earlier version of this function skipped
+    both graph convolutions and used a different meaning for one feature
+    slot than training did — a real train/score mismatch, independent of
+    themes, fixed by construction: there is only one graph-building
+    function, used everywhere.
 
 IMPORTANT — this is a breaking change to cached artifacts. in_dim changed
 (D+5 -> D+4) and the sub-clustering algorithm changed (per-theme KMeans ->
 global MiniBatchKMeans), so every previously-cached file is stale and
 incompatible:
-    product_subclusters.pkl, training_graphs.pkl, basket_gnn_model.pt,
-    copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl
-Delete all of these before running anything against this version. There is
-no product_theme.pkl anymore — that concept no longer exists.
+    product_subclusters.pkl, basket_gnn_model.pt, copurchase_sparse.npz,
+    product_id_to_index.pkl, product_units_avg.pkl
+Delete these, and any LMDB training-graph cache directory, before running
+anything against this version (the LMDB cache also self-checks a manifest
+and rebuilds automatically on mismatch — see lmdb_graph_cache.py). There is
+no product_theme.pkl anymore — that concept no longer exists. There is no
+training_graphs.pkl anymore either — that was joblib-dumped Python list is
+replaced by the LMDB cache.
 """
 
 import os
@@ -62,16 +71,20 @@ from sklearn.preprocessing import normalize
 # ─────────────────────────────────────────────
 
 TOP_K               = 10
-N_TRAIN_SAMPLES      = 1_000_000
 SEED                 = 42
+
+# Bumped any time build_one_graph()'s feature/edge layout changes (the same
+# class of change that moved in_dim from D+5 to D+4). Compared against a
+# saved manifest by lmdb_graph_cache.load_or_build_lmdb_cache() so a cached
+# LMDB training-graph set built under a different feature layout is never
+# silently reused.
+GRAPH_BUILDER_VERSION = 2
 
 # All pipeline-produced artifacts (caches, models, embeddings) live under
 # this folder rather than scattered in the working directory. Created here
 # so any of this module's write sites can assume it already exists.
 OUTPUT_DIR           = "../data/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-GRAPH_CACHE_PATH     = os.path.join(OUTPUT_DIR, "training_graphs.pkl")
 
 # Global product sub-clustering (whole catalog, no theme/category
 # pre-grouping of any kind). K is selected from these candidates via
@@ -341,8 +354,15 @@ def prepare_globals(product_embedding, product_id_to_index,
         distinctiveness_arr[idx] = product_distinctiveness.get(product, 0.5)
         avg_units_arr[idx]       = product_units_avg.get(product, 1.0)
 
-    print("  Converting sparse matrix to CSR float32...")
-    csr = copurchase_sparse.tocsr().astype(np.float32)
+    # No whole-matrix dtype cast here on purpose: .astype(np.float32) on a
+    # different dtype always allocates a brand-new copy of the ENTIRE
+    # matrix (at real scale, tens of GB) held alongside the original —
+    # and it's unnecessary, since _basket_dense_cp_submatrix() already
+    # casts to float32 on its own tiny per-basket slice. .tocsr() alone is
+    # a no-op (returns self, no copy) when the matrix is already CSR, which
+    # it is here.
+    print("  Using co-purchase matrix as CSR (no whole-matrix dtype copy)...")
+    csr = copurchase_sparse.tocsr()
 
     return dict(
         emb_matrix          = emb_matrix,
@@ -357,49 +377,13 @@ def prepare_globals(product_embedding, product_id_to_index,
 
 
 # ─────────────────────────────────────────────
-# SAMPLE BASKETS — stratified by basket SIZE only
+# Stratified-by-size basket sampling now lives in basket_store.py
+# (sample_training_baskets) — computed via SQL against the Postgres baskets
+# table instead of in-memory pd.cut over a full `baskets` DataFrame, since
+# that DataFrame no longer exists as one in-memory object anywhere in this
+# pipeline. See basket_store.sample_training_baskets for the equivalent
+# logic (same stratification bins, same intent).
 # ─────────────────────────────────────────────
-
-def sample_baskets(baskets, n_samples=N_TRAIN_SAMPLES, seed=SEED):
-    """
-    Stratified sampling by basket size only — no theme/category dimension
-    anywhere in this function.
-
-    Works with size/index arrays rather than copying `baskets` itself:
-    `baskets` holds list-typed products/units columns that can run into tens
-    of GB at real data scale, and the previous version's `baskets.copy()`
-    plus five per-stratum boolean-filtered subsets duplicated a meaningful
-    fraction of that just to add two small helper columns. Only the FINAL
-    sampled rows (n_samples, not the full population) are ever materialized
-    out of `baskets`.
-    """
-    import pandas as pd
-
-    sizes = baskets["products"].apply(len)
-    bins   = [0, 1, 5, 15, 50, 10_000]
-    labels = ["1", "2-5", "6-15", "16-50", "50+"]
-    size_bin = pd.cut(sizes, bins=bins, labels=labels)
-
-    stratum_counts = size_bin.value_counts()
-    total          = len(baskets)
-    rng            = np.random.default_rng(seed)
-
-    sampled_idx_parts = []
-    for stratum, count in stratum_counts.items():
-        quota       = max(1, round(n_samples * count / total))
-        stratum_idx = size_bin.index[size_bin == stratum].to_numpy()
-        take        = min(len(stratum_idx), quota)
-        sampled_idx_parts.append(rng.choice(stratum_idx, size=take, replace=False))
-
-    sampled_idx = np.concatenate(sampled_idx_parts)
-    if len(sampled_idx) > n_samples:
-        sampled_idx = rng.choice(sampled_idx, size=n_samples, replace=False)
-
-    sampled  = baskets.loc[sampled_idx].reset_index(drop=True)
-    n_strata = size_bin.loc[sampled_idx].nunique()
-    print(f"  Sampled {len(sampled):,} baskets across {n_strata} basket-size strata")
-    return sampled
-
 
 # ─────────────────────────────────────────────
 # PER-BASKET DENSE CO-PURCHASE SUBMATRIX
@@ -419,8 +403,8 @@ def sample_baskets(baskets, n_samples=N_TRAIN_SAMPLES, seed=SEED):
 # each basket gets its own small submatrix, sliced from the sparse GLOBAL
 # co-purchase matrix on the fly. Its size is bounded by that one basket's
 # product count squared — independent of catalog size — and is used
-# identically by both build_training_graphs() (training) and
-# embed_all_baskets_fast() (inference/scoring), so both remain guaranteed to
+# identically by both lmdb_graph_cache.build_lmdb_cache() (training) and
+# _embed_basket_chunk() (inference/scoring), so both remain guaranteed to
 # compute this the same way.
 # ─────────────────────────────────────────────
 
@@ -439,9 +423,9 @@ def _basket_dense_cp_submatrix(products, csr, pid2idx):
 
 # ─────────────────────────────────────────────
 # BUILD ONE GRAPH  (volume-weighted, sub-cluster + distinctiveness features)
-# Used identically by both training-graph construction and inference —
-# see embed_all_baskets_fast(), which calls this same function so training
-# and scoring can never drift apart in what features they compute.
+# Used identically by both training-graph construction (lmdb_graph_cache.py)
+# and inference (_embed_basket_chunk below), so training and scoring can
+# never drift apart in what features they compute.
 # ─────────────────────────────────────────────
 
 def _minmax(arr):
@@ -554,176 +538,168 @@ def build_one_graph(
 
 
 # ─────────────────────────────────────────────
-# BUILD ALL TRAINING GRAPHS
+# Training-graph construction (build once, cache to LMDB) now lives in
+# lmdb_graph_cache.py (build_lmdb_cache / load_or_build_lmdb_cache) — it
+# calls _basket_dense_cp_submatrix + build_one_graph above, exactly as this
+# module's old build_training_graphs() did, but writes each graph straight
+# to LMDB instead of accumulating a Python list (~20-25GB at real sample
+# sizes) that then got joblib-dumped to disk. See that module's docstring.
 # ─────────────────────────────────────────────
 
-def build_training_graphs(sampled_baskets, G):
+
+# ─────────────────────────────────────────────
+# INDUCTIVE INFERENCE — restartable, bounded-memory, one chunk at a time
+#
+# _embed_basket_chunk builds a REAL per-basket graph for every basket in ONE
+# chunk — reusing build_one_graph, the exact same function training's LMDB
+# cache uses — and runs it through the model's full encode() pipeline
+# (node_encoder -> conv1 -> conv2 -> global_mean_pool -> proj). This is the
+# same graph-then-encode logic the old single-shot embed_all_baskets_fast()
+# used, just scoped to whatever one chunk run_inference() hands it.
+#
+# run_inference is the new outer driver: it claims chunks one at a time from
+# a Postgres work queue (basket_store.claim_next_chunk), so a run that
+# crashes partway through (a machine going down 8 hours into a long
+# inference job) resumes from whatever's left pending/stale rather than
+# starting over. Each chunk's embeddings are written straight to their own
+# parquet file and the chunk is marked complete immediately after — nothing
+# here ever holds more than one chunk's worth of baskets, graphs, or
+# embeddings in memory at once, regardless of how many baskets exist in
+# total.
+# ─────────────────────────────────────────────
+
+def _embed_basket_chunk(chunk_df, G, model, device, batch_size=4096):
     """
-    Builds the in-memory graph list. Does NOT save/cache to disk — see
-    save_training_graphs() for that.
-
-    Each basket gets its own small, basket-scoped dense co-purchase
-    submatrix (_basket_dense_cp_submatrix — the same one
-    embed_all_baskets_fast() uses at inference), built on the fly from a
-    sparse slice of G["csr"]. See the comment above
-    _basket_dense_cp_submatrix for why there is no shared, whole-sample
-    dense matrix here.
+    Builds and encodes graphs for exactly the baskets in `chunk_df` — no
+    accumulation across chunks happens here, that's run_inference()'s job.
+    Returns (basket_ids, z_array) for this one chunk only.
     """
-    if os.path.exists(GRAPH_CACHE_PATH):
-        print(f"Loading cached training graphs from {GRAPH_CACHE_PATH}...")
-        try:
-            return joblib.load(GRAPH_CACHE_PATH)
-        except Exception as e:
-            print(f"  Cached file exists but failed to load ({type(e).__name__}: {e}) — "
-                  f"treating it as stale and rebuilding from scratch.")
+    from torch_geometric.loader import DataLoader as PyGDataLoader
 
-    print("Warming up numba...")
-    _warmup_numba()
-
-    has_units    = "units" in sampled_baskets.columns
+    has_units    = "units" in chunk_df.columns
+    all_products = chunk_df["products"].tolist()
+    all_units    = chunk_df["units"].tolist() if has_units else None
     basket_ids   = (
-        sampled_baskets["basket_id"].tolist()
-        if "basket_id" in sampled_baskets.columns
-        else list(range(len(sampled_baskets)))
+        chunk_df["basket_id"].tolist()
+        if "basket_id" in chunk_df.columns
+        else list(range(len(chunk_df)))
     )
-    all_products = sampled_baskets["products"].tolist()
-    all_units    = sampled_baskets["units"].tolist() if has_units else None
 
     csr     = G["csr"]
     pid2idx = G["product_id_to_index"]
 
     graphs = []
-    for i in tqdm(range(len(sampled_baskets)), desc="Building training graphs"):
+    for i in range(len(chunk_df)):
         products = all_products[i]
         units    = all_units[i] if all_units is not None else [1.0] * len(products)
         local_idx_map, basket_dense_cp = _basket_dense_cp_submatrix(products, csr, pid2idx)
         g = build_one_graph(
-            products            = products,
-            units               = units,
-            basket_id           = basket_ids[i],
-            emb_matrix          = G["emb_matrix"],
-            emb_dim             = G["emb_dim"],
-            subcluster_arr      = G["subcluster_arr"],
-            distinctiveness_arr = G["distinctiveness_arr"],
-            dense_cp            = basket_dense_cp,
-            local_idx           = local_idx_map,
-            product_id_to_index = pid2idx,
+            products             = products,
+            units                = units,
+            basket_id            = basket_ids[i],
+            emb_matrix           = G["emb_matrix"],
+            emb_dim              = G["emb_dim"],
+            subcluster_arr       = G["subcluster_arr"],
+            distinctiveness_arr  = G["distinctiveness_arr"],
+            dense_cp             = basket_dense_cp,
+            local_idx            = local_idx_map,
+            product_id_to_index  = pid2idx,
         )
         graphs.append(g)
 
-    return graphs
+    if not graphs:
+        return [], np.empty((0, 0), dtype=np.float32)
 
-
-def save_training_graphs(graphs):
-    """
-    Separated from build_training_graphs() as its own step so a caller can
-    free anything else it no longer needs before this disk write, since a
-    write of this size is exactly when peak memory tends to be highest.
-
-    Writes to a temp file and atomically renames it into place only once the
-    write fully succeeds — if this crashes partway (MemoryError, killed
-    process, disk full, anything), GRAPH_CACHE_PATH itself is left as either
-    the untouched previous version or nothing at all, never a truncated file
-    that a later run would try to load and get an EOFError from.
-    """
-    print(f"Saving {len(graphs):,} training graphs to {GRAPH_CACHE_PATH}...")
-    tmp_path = GRAPH_CACHE_PATH + ".tmp"
-    try:
-        joblib.dump(graphs, tmp_path, compress=0)
-        os.replace(tmp_path, GRAPH_CACHE_PATH)   # atomic on Windows and POSIX
-    except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        raise
-
-
-# ─────────────────────────────────────────────
-# INDUCTIVE INFERENCE
-#
-# Builds a REAL per-basket graph for every basket — reusing build_one_graph,
-# the exact same function training uses — and runs it through the model's
-# full encode() pipeline (node_encoder -> conv1 -> conv2 -> global_mean_pool
-# -> proj). The previous version of this function hand-rolled a
-# volume-weighted mean-pooling shortcut that skipped both graph
-# convolutions entirely and used a different meaning for one feature slot
-# than training did (a coverage ratio, vs. training's real co-purchase
-# score, in the same feature position) — a genuine train/score mismatch,
-# independent of themes, that "same graph features, same GNN encoding"
-# rules out. Fixed by construction here: there is only one graph-building
-# function, used both times.
-# ─────────────────────────────────────────────
-
-def embed_all_baskets_fast(baskets, G, model, device, batch_size=4096, graph_chunk_size=50_000):
-    """
-    Builds a REAL per-basket graph for every basket — reusing build_one_graph
-    and _basket_dense_cp_submatrix, the exact same per-basket construction
-    build_training_graphs() uses — and runs it through the model's full
-    encode() pipeline.
-
-    Graphs are built and encoded in chunks of `graph_chunk_size` baskets,
-    never all at once: at real data scale (tens of millions of baskets),
-    holding every basket's graph object in memory simultaneously before
-    running any of them through the model needs on the order of terabytes.
-    Only the final embeddings (n_baskets x out_dim floats — a few GB even at
-    20M+ baskets) are accumulated across chunks; each chunk's graphs are
-    discarded once encoded.
-    """
-    from torch_geometric.loader import DataLoader as PyGDataLoader
-
-    has_units    = "units" in baskets.columns
-    all_products = baskets["products"].tolist()
-    all_units    = baskets["units"].tolist() if has_units else None
-    basket_ids   = (
-        baskets["basket_id"].tolist()
-        if "basket_id" in baskets.columns
-        else list(range(len(baskets)))
-    )
-
-    csr     = G["csr"]
-    pid2idx = G["product_id_to_index"]
-    n_total = len(all_products)
-
-    print(f"Embedding {n_total:,} baskets in chunks of {graph_chunk_size:,} baskets "
-          f"(built and encoded per chunk — graphs for the whole population are "
-          f"never held in memory at once)...")
     model.eval()
+    z_parts = []
+    loader = PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            z = model.encode(batch)
+            z_parts.append(z.detach().cpu().numpy().astype(np.float32))
 
-    all_z_parts = []
-    for chunk_start in tqdm(range(0, n_total, graph_chunk_size), desc="Basket chunks"):
-        chunk_end = min(chunk_start + graph_chunk_size, n_total)
+    del graphs, loader
+    gc.collect()
 
-        graphs = []
-        for i in range(chunk_start, chunk_end):
-            products = all_products[i]
-            units    = all_units[i] if all_units is not None else [1.0] * len(products)
-            local_idx_map, basket_dense_cp = _basket_dense_cp_submatrix(products, csr, pid2idx)
-            g = build_one_graph(
-                products             = products,
-                units                = units,
-                basket_id            = basket_ids[i],
-                emb_matrix           = G["emb_matrix"],
-                emb_dim              = G["emb_dim"],
-                subcluster_arr       = G["subcluster_arr"],
-                distinctiveness_arr  = G["distinctiveness_arr"],
-                dense_cp             = basket_dense_cp,
-                local_idx            = local_idx_map,
-                product_id_to_index  = pid2idx,
-            )
-            graphs.append(g)
+    return basket_ids, np.vstack(z_parts)
 
-        loader = PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
-        with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(device)
-                z = model.encode(batch)
-                all_z_parts.append(z.detach().cpu().numpy().astype(np.float32))
 
-        del graphs, loader
+def run_inference(conn_uri, dataset_tag, G, model, device, worker_id=None,
+                    chunk_size=50_000, batch_size=4096, output_dir=None,
+                    stale_after_seconds=3600):
+    """
+    Claims one chunk at a time from the Postgres inference-chunk queue
+    (basket_store.ensure_inference_chunk_plan / claim_next_chunk),
+    embeds it via _embed_basket_chunk, writes that chunk's embeddings to
+    its own parquet file under output_dir, marks the chunk complete, and
+    repeats until nothing is claimable. Call merge_inference_output() once
+    every chunk shows 'complete' to produce the final combined embeddings
+    file.
+
+    This is the item-5 "ready for independent machines later" hook: any
+    number of processes calling run_inference against the same Postgres
+    instance with different `worker_id` values would naturally load-balance
+    via FOR UPDATE SKIP LOCKED, with no static partitioning needed — today
+    it just runs as one process/worker.
+    """
+    import socket
+    import pandas as pd
+    import basket_store
+
+    worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
+    output_dir = output_dir or OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    basket_store.ensure_inference_chunk_plan(conn_uri, dataset_tag, chunk_size)
+
+    n_done = 0
+    while True:
+        claimed = basket_store.claim_next_chunk(conn_uri, dataset_tag, worker_id, stale_after_seconds)
+        if claimed is None:
+            break
+
+        chunk_df = basket_store.get_basket_range(conn_uri, dataset_tag, claimed["seq_lo"], claimed["seq_hi"])
+        basket_ids, z_array = _embed_basket_chunk(chunk_df, G, model, device, batch_size=batch_size)
+
+        # Namespaced by dataset_tag — training ("train") and scoring
+        # ("score") runs share this same output_dir, and without the tag in
+        # the filename their chunk_id numbering would collide and corrupt
+        # each other's merge.
+        chunk_path = os.path.join(output_dir, f"embeddings_chunk_{dataset_tag}_{claimed['chunk_id']}.parquet")
+        pd.DataFrame({"basket_id": basket_ids, "gnn_embedding": list(z_array)}).to_parquet(chunk_path, index=False)
+
+        basket_store.mark_chunk_complete(conn_uri, dataset_tag, claimed["chunk_id"])
+        n_done += 1
+        print(f"  chunk {claimed['chunk_id']} complete ({len(chunk_df):,} baskets) "
+              f"— {n_done} chunks finished by worker {worker_id!r} this run")
+
+        del chunk_df, basket_ids, z_array
         gc.collect()
 
-    all_z = np.vstack(all_z_parts)
-    print(f"Final embedding shape: {all_z.shape}")
-    return basket_ids, all_z
+    print(f"run_inference: no more claimable chunks for dataset_tag={dataset_tag!r} "
+          f"(worker {worker_id!r} finished this run — {n_done} chunks completed by it)")
+
+
+def merge_inference_output(dataset_tag, output_dir=None, final_path=None):
+    """
+    Concatenates every embeddings_chunk_{dataset_tag}_*.parquet file in
+    output_dir into one final embeddings parquet, once every chunk shows
+    'complete'. The final result (n_baskets x out_dim floats — a few GB even
+    at 20M+ baskets) is small enough to hold as one DataFrame; only the much
+    larger per-basket GRAPH objects were ever the thing that had to stay
+    chunked.
+    """
+    import glob
+    import pandas as pd
+
+    output_dir = output_dir or OUTPUT_DIR
+    final_path = final_path or os.path.join(output_dir, "basket_gnn_embeddings.parquet")
+    chunk_paths = sorted(glob.glob(os.path.join(output_dir, f"embeddings_chunk_{dataset_tag}_*.parquet")))
+    if not chunk_paths:
+        raise FileNotFoundError(f"No embeddings_chunk_{dataset_tag}_*.parquet files found under "
+                                 f"{output_dir} to merge.")
+
+    merged = pd.concat([pd.read_parquet(p) for p in chunk_paths], ignore_index=True)
+    merged.to_parquet(final_path, index=False)
+    print(f"Merged {len(chunk_paths)} chunk files ({len(merged):,} baskets total) into {final_path}")
+    return merged
