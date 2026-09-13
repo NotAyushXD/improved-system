@@ -15,7 +15,7 @@ Summary of the theme-free architecture:
     product chunks as a stand-in for themes — both are gone. Clustering
     here sees the entire catalog as one population.
   - Basket sampling is stratified by basket SIZE only — now computed in SQL
-    against the Postgres baskets table (basket_store.sample_training_baskets),
+    against the DuckDB baskets table (basket_store.sample_training_baskets),
     not in-memory in this file; see that module.
   - Edge features are derived purely from co-purchase strength — the old
     same_theme edge flag is replaced by each edge's strength relative to
@@ -378,7 +378,7 @@ def prepare_globals(product_embedding, product_id_to_index,
 
 # ─────────────────────────────────────────────
 # Stratified-by-size basket sampling now lives in basket_store.py
-# (sample_training_baskets) — computed via SQL against the Postgres baskets
+# (sample_training_baskets) — computed via SQL against the DuckDB baskets
 # table instead of in-memory pd.cut over a full `baskets` DataFrame, since
 # that DataFrame no longer exists as one in-memory object anywhere in this
 # pipeline. See basket_store.sample_training_baskets for the equivalent
@@ -558,7 +558,7 @@ def build_one_graph(
 # used, just scoped to whatever one chunk run_inference() hands it.
 #
 # run_inference is the new outer driver: it claims chunks one at a time from
-# a Postgres work queue (basket_store.claim_next_chunk), so a run that
+# a DuckDB work queue (basket_store.claim_next_chunk), so a run that
 # crashes partway through (a machine going down 8 hours into a long
 # inference job) resumes from whatever's left pending/stale rather than
 # starting over. Each chunk's embeddings are written straight to their own
@@ -625,11 +625,11 @@ def _embed_basket_chunk(chunk_df, G, model, device, batch_size=4096):
     return basket_ids, np.vstack(z_parts)
 
 
-def run_inference(conn_uri, dataset_tag, G, model, device, worker_id=None,
+def run_inference(con, dataset_tag, G, model, device, worker_id=None,
                     chunk_size=50_000, batch_size=4096, output_dir=None,
                     stale_after_seconds=3600):
     """
-    Claims one chunk at a time from the Postgres inference-chunk queue
+    Claims one chunk at a time from the DuckDB inference-chunk queue
     (basket_store.ensure_inference_chunk_plan / claim_next_chunk),
     embeds it via _embed_basket_chunk, writes that chunk's embeddings to
     its own parquet file under output_dir, marks the chunk complete, and
@@ -637,11 +637,10 @@ def run_inference(conn_uri, dataset_tag, G, model, device, worker_id=None,
     every chunk shows 'complete' to produce the final combined embeddings
     file.
 
-    This is the item-5 "ready for independent machines later" hook: any
-    number of processes calling run_inference against the same Postgres
-    instance with different `worker_id` values would naturally load-balance
-    via FOR UPDATE SKIP LOCKED, with no static partitioning needed — today
-    it just runs as one process/worker.
+    NOTE: this claim loop is only safe for a single process claiming chunks
+    sequentially — DuckDB has no row-level locking equivalent to Postgres's
+    FOR UPDATE SKIP LOCKED, so concurrent callers could race on the same
+    chunk. See the note in basket_store.py's claim_next_chunk().
     """
     import socket
     import pandas as pd
@@ -650,15 +649,15 @@ def run_inference(conn_uri, dataset_tag, G, model, device, worker_id=None,
     worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
     output_dir = output_dir or OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
-    basket_store.ensure_inference_chunk_plan(conn_uri, dataset_tag, chunk_size)
+    basket_store.ensure_inference_chunk_plan(con, dataset_tag, chunk_size)
 
     n_done = 0
     while True:
-        claimed = basket_store.claim_next_chunk(conn_uri, dataset_tag, worker_id, stale_after_seconds)
+        claimed = basket_store.claim_next_chunk(con, dataset_tag, worker_id, stale_after_seconds)
         if claimed is None:
             break
 
-        chunk_df = basket_store.get_basket_range(conn_uri, dataset_tag, claimed["seq_lo"], claimed["seq_hi"])
+        chunk_df = basket_store.get_basket_range(con, dataset_tag, claimed["seq_lo"], claimed["seq_hi"])
         basket_ids, z_array = _embed_basket_chunk(chunk_df, G, model, device, batch_size=batch_size)
 
         # Namespaced by dataset_tag — training ("train") and scoring
@@ -668,7 +667,7 @@ def run_inference(conn_uri, dataset_tag, G, model, device, worker_id=None,
         chunk_path = os.path.join(output_dir, f"embeddings_chunk_{dataset_tag}_{claimed['chunk_id']}.parquet")
         pd.DataFrame({"basket_id": basket_ids, "gnn_embedding": list(z_array)}).to_parquet(chunk_path, index=False)
 
-        basket_store.mark_chunk_complete(conn_uri, dataset_tag, claimed["chunk_id"])
+        basket_store.mark_chunk_complete(con, dataset_tag, claimed["chunk_id"])
         n_done += 1
         print(f"  chunk {claimed['chunk_id']} complete ({len(chunk_df):,} baskets) "
               f"— {n_done} chunks finished by worker {worker_id!r} this run")

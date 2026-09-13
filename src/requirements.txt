@@ -26,11 +26,11 @@ sentence-transformers # needed by build_product_embeddings.py to build product
 pynndescent            # optional — cluster_basket_embeddings.py falls back to
                        # sklearn's NearestNeighbors automatically if this isn't
                        # installed, just slower on large datasets
-pgserver               # self-contained local Postgres (no manual install/config) —
-                       # basket storage lives here now, see pg_manager.py /
-                       # basket_store.py. Installed ahead of time like every
-                       # other dependency here — never pip-installed at runtime.
-psycopg2-binary        # Postgres driver — binary wheel avoids needing a C
-                       # compiler on Windows
+duckdb                 # self-contained embedded database (no server process,
+                       # no privileged setup step) — basket storage lives here
+                       # now, see duckdb_manager.py / basket_store.py. Replaced
+                       # an earlier pgserver/Postgres-based design after
+                       # pgserver's initdb step was blocked by a Windows
+                       # permission restriction on the target machine.
 lmdb                   # build-once, random-access-during-training cache for
                        # the sampled training graphs — see lmdb_graph_cache.py

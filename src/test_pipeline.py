@@ -12,11 +12,11 @@ Two kinds of check:
 2. FUNCTIONAL — builds a tiny synthetic catalog (30 products, random
    embeddings) and a synthetic raw household x tpnb x week export, writes it
    to a throwaway parquet folder, and actually runs the REAL pipeline against
-   a REAL local self-contained Postgres instance (via pg_manager.py):
+   a REAL local embedded DuckDB database (via duckdb_manager.py):
      - prepare_globals() with NO product_theme argument (a call that would
        raise TypeError if that parameter still existed)
-     - basket_store.load_raw_export_to_postgres() + build_baskets_table()
-       (the same aggregation pipeline_main.py's Stage 0 uses)
+     - basket_store.build_baskets_table() (reads the raw parquet export
+       directly — the same aggregation pipeline_main.py's Stage 0 uses)
      - basket_store.sample_training_baskets() (the training-sample draw)
      - lmdb_graph_cache.load_or_build_lmdb_cache() + LMDBGraphDataset (the
        training-graph cache, including a cache-hit reload)
@@ -29,8 +29,10 @@ Two kinds of check:
    paths, confirming inference actually exercises the graph convolutions
    rather than skipping them.
 
-   Requires `pgserver` installed (see requirements.txt) — this test starts
-   a real, throwaway local Postgres instance under ./test_pgdata/.
+   Requires `duckdb` installed (see requirements.txt) — this test opens a
+   real, embedded DuckDB database at data/pipeline.duckdb (same file
+   pipeline_main.py uses, under a throwaway "pytest" dataset_tag so it
+   can't collide with real "train"/"score" data).
 
 Run from inside src/:  python test_theme_free_pipeline.py
 Exits non-zero on any failure, so it's CI-friendly.
@@ -58,7 +60,7 @@ ACTIVE_FILES = [
     "build_product_embeddings.py",
     "parquet_loader.py",
     "cluster_basket_embeddings.py",
-    "pg_manager.py",
+    "duckdb_manager.py",
     "basket_store.py",
     "lmdb_graph_cache.py",
 ]
@@ -143,7 +145,7 @@ def build_synthetic_raw_export(tpnbs, n_baskets=25, seed=1) -> pd.DataFrame:
     A synthetic RAW household x tpnb x week export — one row per
     (household, tpnb, week), matching the real warehouse export's shape —
     rather than pre-aggregated basket rows. Aggregation into baskets is now
-    Postgres's job (basket_store.build_baskets_table), so the test needs to
+    DuckDB's job (basket_store.build_baskets_table), so the test needs to
     exercise that same path instead of handing it already-basket-shaped rows.
     """
     rng = np.random.default_rng(seed)
@@ -171,14 +173,14 @@ def check_functional():
     print()
     print("=" * 60)
     print("FUNCTIONAL CHECK: train/score consistency on synthetic data "
-          "(real Postgres + LMDB, throwaway)")
+          "(real DuckDB + LMDB, throwaway)")
     print("=" * 60)
 
     import torch
     from GraphBuilder import prepare_globals, run_inference, merge_inference_output
     from GNN_Train import BasketGNN
     import GraphBuilder as gb
-    import pg_manager
+    import duckdb_manager
     import basket_store
     import lmdb_graph_cache
 
@@ -222,23 +224,22 @@ def check_functional():
     assert G["in_dim"] == emb_dim + 4, f"expected in_dim == emb_dim+4, got {G['in_dim']}"
     print(f"  prepare_globals(): in_dim={G['in_dim']} (emb_dim={emb_dim}+4), no theme_ids key — OK")
 
-    conn_uri = pg_manager.get_connection_uri()
-    # Drop any leftover Postgres state from a previous test run BEFORE
+    con = duckdb_manager.get_connection()
+    # Drop any leftover DuckDB state from a previous test run BEFORE
     # touching local output files — otherwise a stale inference_chunks_pytest
     # table (all rows already 'complete' from a prior run) would make
     # run_inference below claim nothing, while _cleanup() has already wiped
     # this run's local chunk-parquet output, leaving nothing for
     # merge_inference_output to merge.
-    basket_store.drop_all(conn_uri, dataset_tag)
-    basket_store.load_raw_export_to_postgres(conn_uri, raw_export_dir, dataset_tag)
+    basket_store.drop_all(con, dataset_tag)
     n_baskets_total, _units_avg_pg, _products_pg = basket_store.build_baskets_table(
-        conn_uri, dataset_tag, min_basket_products=2,
+        con, raw_export_dir, dataset_tag, min_basket_products=2,
     )
-    print(f"  basket_store.load_raw_export_to_postgres() + build_baskets_table(): "
-          f"{n_baskets_total} baskets built in Postgres — OK")
+    print(f"  basket_store.build_baskets_table(): "
+          f"{n_baskets_total} baskets built in DuckDB (read directly from parquet) — OK")
 
     sampled = basket_store.sample_training_baskets(
-        conn_uri, dataset_tag, n_samples=n_baskets_total, seed=42,
+        con, dataset_tag, n_samples=n_baskets_total, seed=42,
     )
     print(f"  basket_store.sample_training_baskets(): {len(sampled)} baskets sampled — OK")
 
@@ -287,7 +288,7 @@ def check_functional():
     print(f"  model.encode() on an LMDB-cached training graph: shape {tuple(z_train_path.shape)} — OK")
 
     run_inference(
-        conn_uri, dataset_tag, G, model, device,
+        con, dataset_tag, G, model, device,
         worker_id="pytest-worker", chunk_size=10, batch_size=8, output_dir=output_dir,
     )
     merged = merge_inference_output(dataset_tag, output_dir=output_dir)
@@ -298,13 +299,13 @@ def check_functional():
     print(f"  run_inference() + merge_inference_output(): {len(merged)} baskets embedded, "
           f"restartable chunk queue — OK")
 
-    basket_store.drop_all(conn_uri, dataset_tag)
+    basket_store.drop_all(con, dataset_tag)
     _cleanup()
 
     print("PASSED — training and scoring paths run the same graph "
           "construction and the same full GNN encoding, at consistent "
           "feature widths, with no theme/category input anywhere, sourced "
-          "from a real Postgres instance and an LMDB-backed training cache.")
+          "from a real DuckDB database and an LMDB-backed training cache.")
     return True
 
 

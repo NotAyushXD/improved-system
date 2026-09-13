@@ -64,7 +64,7 @@ import torch
 from sklearn.preprocessing import normalize
 
 import parquet_loader
-import pg_manager
+import duckdb_manager
 import basket_store
 from GraphBuilder import prepare_globals, run_inference, merge_inference_output
 from GNN_Train import BasketGNN
@@ -180,20 +180,20 @@ def main():
 
     G, model, device = load_globals_and_model()
 
-    conn_uri = pg_manager.get_connection_uri()
+    con = duckdb_manager.get_connection()
 
-    print(f"Loading new transaction data from {args.new_transactions}...")
+    print(f"Building baskets from {args.new_transactions}...")
     # Same whole-basket construction pipeline_main.py's Stage 0 uses — basket
     # grain is WEEK (household_number x year_week_number), not a true
     # single-visit basket. See the "BASKET GRAIN" note at the top of
     # pipeline_main.py and data/ns_household_tpnb_week_agg_train.sql.
-    basket_store.load_raw_export_to_postgres(conn_uri, args.new_transactions, DATASET_TAG)
+    # DuckDB reads the parquet export directly — no separate load step.
     # product_units_avg returned here is discarded — this script already has
     # its own from training (PRODUCT_UNITS_PATH), and reusing that one
     # (rather than a fresh one computed only from the new/held-out data) is
     # what keeps product features consistent between train and score.
     n_baskets_total, _discarded_units_avg, _discarded_products = basket_store.build_baskets_table(
-        conn_uri, DATASET_TAG, min_basket_products=MIN_BASKET_PRODUCTS,
+        con, args.new_transactions, DATASET_TAG, min_basket_products=MIN_BASKET_PRODUCTS,
     )
     print(f"  {n_baskets_total:,} new baskets built (before already-embedded exclusion)")
 
@@ -202,8 +202,8 @@ def main():
     # `existing_ids` at real scale is the entire training basket population
     # (tens of millions of rows), which is exactly the kind of object this
     # whole redesign exists to avoid materializing as a Python set.
-    basket_store.exclude_existing_basket_ids(conn_uri, DATASET_TAG, EXISTING_EMBEDDINGS_PATH)
-    n_to_score = basket_store.count_baskets(conn_uri, DATASET_TAG)
+    basket_store.exclude_existing_basket_ids(con, DATASET_TAG, EXISTING_EMBEDDINGS_PATH)
+    n_to_score = basket_store.count_baskets(con, DATASET_TAG)
     print(f"  Need embedding: {n_to_score:,}")
 
     if n_to_score == 0:
@@ -211,9 +211,9 @@ def main():
         return
 
     print(f"\nEmbedding {n_to_score:,} baskets via full GNN encoding "
-          f"(restartable, chunked from Postgres)...")
+          f"(restartable, chunked from DuckDB)...")
     run_inference(
-        conn_uri, DATASET_TAG, G, model, device,
+        con, DATASET_TAG, G, model, device,
         worker_id=args.worker_id, batch_size=EMBED_BATCH_SIZE,
     )
     new_embeddings = merge_inference_output(

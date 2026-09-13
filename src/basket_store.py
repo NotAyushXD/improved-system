@@ -4,51 +4,43 @@ basket_store.py
 The shared basket-storage layer — used by BOTH pipeline_main.py (training)
 and score_new_baskets.py (scoring), via a `dataset_tag` argument
 ("train" / "score") that keeps their tables separate in the same local
-Postgres instance (see pg_manager.py). This is the fix for the recurring
+DuckDB database (see duckdb_manager.py). This is the fix for the recurring
 memory bug in this pipeline: `baskets` was always held as one Python object
 for the whole script, and at real week-grain scale that's bigger than
-available RAM. Basket storage now lives in Postgres; nothing in this file
+available RAM. Basket storage now lives in DuckDB; nothing in this file
 ever holds the full basket population in Python memory — every function
 here either streams bounded chunks, or returns a result whose size is
 bounded by something OTHER than basket count (catalog size, chunk size, or
 the training-sample size).
+
+DuckDB detail worth knowing: it can query parquet files DIRECTLY
+(`read_parquet(...)`), streaming/aggregating straight off disk — so unlike
+the earlier Postgres-based design, there's no separate "load raw rows into
+a staging table" step at all. build_baskets_table() reads the raw export
+straight from its parquet files and produces the basket table in one pass.
 
 Grain reminder: a "basket" here is everything one household bought in one
 WEEK (household_number x year_week_number) — see
 data/ns_household_tpnb_week_agg_train.sql for why this, not a true
 single-visit basket, is the finest grain this warehouse supports.
 
-Requires `psycopg2-binary` and a running Postgres connection URI from
-pg_manager.get_connection_uri().
+Every function here takes `con` — the shared DuckDB connection object from
+duckdb_manager.get_connection() — not a URI to reconnect with (DuckDB has
+no server/URI model; the connection IS the open database file handle).
 """
 
-import io
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-REQUIRED_RAW_COLS = ["household_number", "tpnb", "year_number", "period_number",
-                     "week_number", "quantity"]
-
+REQUIRED_RAW_COLS = {"household_number", "tpnb", "year_number", "period_number", "week_number", "quantity"}
 BASKET_COLS = ["household_number", "year_week_number", "basket_id", "products", "units"]
 
-# Session-level tuning — these only affect QUERY SPEED, never correctness:
-# Postgres spills hash aggregates / sorts to disk automatically past whatever
-# work_mem is set to, so raising this is a performance knob, not a memory
-# ceiling anything can silently overflow. No arbitrary cap here on purpose.
-# NOTE: work_mem's hard max is 2097151 kB (just under 2GB) — "2GB" parses to
-# 2097152 kB, one over the limit, and Postgres rejects it outright. 1GB
-# leaves headroom without needing to hit that exact boundary.
-PG_WORK_MEM = "1GB"
-PG_MAINTENANCE_WORK_MEM = "1GB"
-
-# Lowercase-only on purpose: table names built from this are passed
-# unquoted to to_regclass() in ensure_inference_chunk_plan(), which folds
-# unquoted identifiers to lowercase per standard SQL rules — a mixed-case
-# tag would make sql.Identifier()-created tables (case-preserving) invisible
-# to that existence check. Restricting to lowercase avoids the mismatch
-# entirely rather than requiring every lookup site to remember to quote.
+# Lowercase-only: kept simple and consistent, even though DuckDB (unlike
+# Postgres's to_regclass()) doesn't have the same case-folding gotcha —
+# still avoids any ambiguity about identifier quoting.
 _TAG_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -56,464 +48,324 @@ def _validate_tag(dataset_tag: str):
     if not _TAG_RE.match(dataset_tag):
         raise ValueError(
             f"dataset_tag must be a plain lowercase identifier matching "
-            f"{_TAG_RE.pattern!r} (it's used to build table names, and is "
-            f"looked up case-foldingly elsewhere) — got {dataset_tag!r}"
+            f"{_TAG_RE.pattern!r} (it's used to build table names) — got {dataset_tag!r}"
         )
 
 
-def _seed_to_pg_seed(seed: int) -> float:
-    """Postgres setseed() wants a float in [-1, 1] — deterministic map from an int seed."""
+def _qi(name: str) -> str:
+    """Quote a (validated) identifier for safe interpolation into SQL text."""
+    return f'"{name}"'
+
+
+def _seed_to_duckdb_seed(seed: int) -> float:
+    """DuckDB's setseed(), like Postgres's, wants a float in [-1, 1]."""
     return (seed % 2000 - 1000) / 1000.0
 
 
-def _connect(conn_uri):
-    import psycopg2
-    return psycopg2.connect(conn_uri)
+def _glob_for(path) -> str:
+    """A parquet path can be a single file or a folder of part-files (the
+    Databricks/Spark export shape) — read_parquet() needs a glob for the
+    latter, a plain path for the former."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found.")
+    return str(path / "*.parquet") if path.is_dir() else str(path)
 
 
-def _fetch_basket_range(conn, baskets_table: str, lo: int, hi: int) -> pd.DataFrame:
-    from psycopg2 import sql
-    with conn.cursor() as cur:
-        cur.execute(
-            sql.SQL(
-                "SELECT household_number, year_week_number, basket_id, products, units "
-                "FROM {} WHERE basket_seq BETWEEN %s AND %s ORDER BY basket_seq"
-            ).format(sql.Identifier(baskets_table)),
-            (lo, hi),
-        )
-        rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=BASKET_COLS)
+def _fetch_basket_range(con, baskets_table: str, lo: int, hi: int) -> pd.DataFrame:
+    return con.execute(
+        f"SELECT household_number, year_week_number, basket_id, products, units "
+        f"FROM {_qi(baskets_table)} WHERE basket_seq BETWEEN ? AND ? ORDER BY basket_seq",
+        [lo, hi],
+    ).df()
 
 
 # ─────────────────────────────────────────────
-# LOAD — stream the raw warehouse export straight into Postgres
+# AGGREGATE — build the per-basket table directly from the raw parquet export
 # ─────────────────────────────────────────────
 
-def load_raw_export_to_postgres(conn_uri, parquet_path, dataset_tag: str,
-                                  batch_size: int = 20_000_000):
+def build_baskets_table(con, parquet_path, dataset_tag: str, min_basket_products: int = 2):
     """
-    Streams the household x tpnb x week export (a Databricks/Spark
-    folder-of-part-files export) via pyarrow.dataset.to_batches() — same
-    bounded-batch read this pipeline already used in the retired
-    parquet_loader.stream_build_baskets_and_units_avg() — but instead of
-    accumulating into Python dicts, pipes each batch straight into a
-    Postgres staging table via COPY. Only one batch (bounded by
-    `batch_size` rows) is ever in Python memory at a time; nothing
-    accumulates client-side across batches at all.
+    Reads the household x tpnb x week export straight from its parquet
+    files via read_parquet() and builds the per-basket table in one SQL
+    pass — DuckDB streams/aggregates directly off disk, so the raw flat
+    table is never materialized as a Python object OR as an intermediate
+    DuckDB table. This replaces the old Python dict-accumulator (and the
+    Postgres design's separate staging-table load step) entirely.
+
+    Returns (n_baskets_total, product_units_avg, product_uniques) — all
+    three are bounded by catalog size or a single COUNT(*), never by
+    basket count.
     """
     _validate_tag(dataset_tag)
-    from pathlib import Path
-    import pyarrow.dataset as pa_dataset
-    from psycopg2 import sql
+    glob_path = _glob_for(parquet_path)
 
-    parquet_path = Path(parquet_path)
-    if not parquet_path.exists():
-        raise FileNotFoundError(
-            f"{parquet_path} not found — run the household x tpnb x week export SQL "
-            f"on your warehouse, download the result as parquet, and save it here."
-        )
-
-    dataset = pa_dataset.dataset(str(parquet_path), format="parquet")
-    missing = set(REQUIRED_RAW_COLS) - set(dataset.schema.names)
+    # Sanity-check the export has the columns we need before spending time
+    # scanning it — read_parquet's schema is available via a 0-row query.
+    schema_cols = set(con.execute(f"SELECT * FROM read_parquet(?) LIMIT 0", [glob_path]).df().columns)
+    missing = REQUIRED_RAW_COLS - schema_cols
     if missing:
         raise ValueError(f"{parquet_path} is missing columns {missing}.")
 
-    staging_table = f"staging_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(staging_table)))
-            cur.execute(sql.SQL("""
-                CREATE TABLE {} (
-                    household_number BIGINT,
-                    tpnb TEXT,
-                    year_number INTEGER,
-                    period_number INTEGER,
-                    week_number INTEGER,
-                    quantity DOUBLE PRECISION
-                )
-            """).format(sql.Identifier(staging_table)))
-        conn.commit()
-
-        copy_sql = sql.SQL(
-            "COPY {} (household_number, tpnb, year_number, period_number, week_number, quantity) "
-            "FROM STDIN WITH (FORMAT csv)"
-        ).format(sql.Identifier(staging_table)).as_string(conn)
-
-        n_rows, n_batches = 0, 0
-        for record_batch in dataset.to_batches(columns=REQUIRED_RAW_COLS, batch_size=batch_size):
-            df = record_batch.to_pandas()
-            df["tpnb"] = df["tpnb"].astype(str)
-            buf = io.StringIO()
-            df[REQUIRED_RAW_COLS].to_csv(buf, index=False, header=False)
-            buf.seek(0)
-            with conn.cursor() as cur:
-                cur.copy_expert(copy_sql, buf)
-            conn.commit()
-
-            n_batches += 1
-            n_rows += len(df)
-            del df, buf
-            print(f"  batch {n_batches}: {n_rows:,} rows loaded into Postgres "
-                  f"({staging_table}) so far")
-
-        print(f"Loaded {n_rows:,} household x tpnb x week rows across {n_batches} batches "
-              f"into {staging_table} (from {parquet_path})")
-    finally:
-        conn.close()
-
-
-# ─────────────────────────────────────────────
-# AGGREGATE — build the per-basket table, in Postgres, once
-# ─────────────────────────────────────────────
-
-def build_baskets_table(conn_uri, dataset_tag: str, min_basket_products: int = 2):
-    """
-    Replaces the old Python dict-accumulator basket-building step with one
-    SQL pass. Postgres's own disk-spilling hash aggregate handles the
-    "finalize a basket only once every one of its rows has been seen"
-    correctness requirement natively — no assumption about row order in the
-    staging table, no need to hold partial per-basket accumulators in Python.
-
-    Returns (n_baskets_total, product_units_avg, product_uniques) — all three
-    are bounded by catalog size or a single COUNT(*), never by basket count.
-    """
-    _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
-    staging_table = f"staging_{dataset_tag}"
     baskets_table = f"baskets_{dataset_tag}"
+    con.execute(f"DROP TABLE IF EXISTS {_qi(baskets_table)}")
+    con.execute(
+        f"""
+        CREATE TABLE {_qi(baskets_table)} AS
+        SELECT ROW_NUMBER() OVER (ORDER BY household_number, year_week_number) AS basket_seq,
+               household_number, year_week_number,
+               (CAST(household_number AS VARCHAR) || '_' || CAST(year_week_number AS VARCHAR)) AS basket_id,
+               list(tpnb) AS products,
+               list(quantity) AS units,
+               CASE
+                   WHEN len(list(tpnb)) <= 1  THEN 0
+                   WHEN len(list(tpnb)) <= 5  THEN 1
+                   WHEN len(list(tpnb)) <= 15 THEN 2
+                   WHEN len(list(tpnb)) <= 50 THEN 3
+                   ELSE 4
+               END AS size_bucket
+        FROM (
+            SELECT household_number,
+                   year_number * 100 + week_number AS year_week_number,
+                   tpnb, quantity
+            FROM read_parquet(?)
+            WHERE household_number IS NOT NULL AND tpnb IS NOT NULL
+        ) t
+        GROUP BY household_number, year_week_number
+        HAVING len(list(tpnb)) >= ?
+        """,
+        [glob_path, min_basket_products],
+    )
 
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("SET work_mem = %s"), (PG_WORK_MEM,))
-            cur.execute(sql.SQL("SET maintenance_work_mem = %s"), (PG_MAINTENANCE_WORK_MEM,))
+    con.execute(f'CREATE UNIQUE INDEX "idx_{dataset_tag}_seq" ON {_qi(baskets_table)} (basket_seq)')
+    con.execute(f'CREATE INDEX "idx_{dataset_tag}_bucket" ON {_qi(baskets_table)} (size_bucket)')
+    con.execute(f'CREATE INDEX "idx_{dataset_tag}_bid" ON {_qi(baskets_table)} (basket_id)')
 
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(baskets_table)))
-            cur.execute(sql.SQL("""
-                CREATE TABLE {baskets} AS
-                SELECT ROW_NUMBER() OVER (ORDER BY household_number, year_week_number) AS basket_seq,
-                       household_number, year_week_number,
-                       (household_number::text || '_' || year_week_number::text) AS basket_id,
-                       array_agg(tpnb) AS products,
-                       array_agg(quantity) AS units,
-                       CASE
-                           WHEN array_length(array_agg(tpnb), 1) <= 1  THEN 0
-                           WHEN array_length(array_agg(tpnb), 1) <= 5  THEN 1
-                           WHEN array_length(array_agg(tpnb), 1) <= 15 THEN 2
-                           WHEN array_length(array_agg(tpnb), 1) <= 50 THEN 3
-                           ELSE 4
-                       END AS size_bucket
-                FROM (
-                    SELECT household_number,
-                           year_number * 100 + week_number AS year_week_number,
-                           tpnb, quantity
-                    FROM {staging}
-                ) t
-                GROUP BY household_number, year_week_number
-                HAVING array_length(array_agg(tpnb), 1) >= %(min_basket_products)s
-            """).format(baskets=sql.Identifier(baskets_table), staging=sql.Identifier(staging_table)),
-            {"min_basket_products": min_basket_products})
+    n_baskets_total = con.execute(f"SELECT COUNT(*) FROM {_qi(baskets_table)}").fetchone()[0]
 
-            cur.execute(sql.SQL("CREATE UNIQUE INDEX ON {} (basket_seq)").format(sql.Identifier(baskets_table)))
-            cur.execute(sql.SQL("CREATE INDEX ON {} (size_bucket)").format(sql.Identifier(baskets_table)))
-            cur.execute(sql.SQL("CREATE INDEX ON {} (basket_id)").format(sql.Identifier(baskets_table)))
+    units_avg_rows = con.execute(
+        "SELECT tpnb, AVG(quantity) FROM read_parquet(?) GROUP BY tpnb", [glob_path]
+    ).fetchall()
+    product_units_avg = {r[0]: float(r[1]) for r in units_avg_rows}
 
-            cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(baskets_table)))
-            n_baskets_total = cur.fetchone()[0]
+    uniq_rows = con.execute("SELECT DISTINCT tpnb FROM read_parquet(?) ORDER BY tpnb", [glob_path]).fetchall()
+    product_uniques = np.array([r[0] for r in uniq_rows])
 
-            cur.execute(sql.SQL("SELECT tpnb, AVG(quantity) FROM {} GROUP BY tpnb")
-                        .format(sql.Identifier(staging_table)))
-            product_units_avg = {row[0]: float(row[1]) for row in cur.fetchall()}
-
-            cur.execute(sql.SQL("SELECT DISTINCT tpnb FROM {} ORDER BY tpnb")
-                        .format(sql.Identifier(staging_table)))
-            product_uniques = np.array([row[0] for row in cur.fetchall()])
-
-            cur.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(staging_table)))
-        conn.commit()
-
-        print(f"  {baskets_table}: {n_baskets_total:,} baskets, "
-              f"{len(product_uniques):,} distinct products (staging table dropped)")
-        return n_baskets_total, product_units_avg, product_uniques
-    finally:
-        conn.close()
+    print(f"  {baskets_table}: {n_baskets_total:,} baskets, "
+          f"{len(product_uniques):,} distinct products (read directly from parquet)")
+    return n_baskets_total, product_units_avg, product_uniques
 
 
 # ─────────────────────────────────────────────
 # STREAM — bounded-size chunks for the co-purchase matrix loop
 # ─────────────────────────────────────────────
 
-def stream_basket_chunks(conn_uri, dataset_tag: str, chunk_size: int, start_seq: int = 1):
+def stream_basket_chunks(con, dataset_tag: str, chunk_size: int, start_seq: int = 1):
     """
     Generator yielding one DataFrame (<= chunk_size rows) at a time, in
     basket_seq order. Used by pipeline_main.py's co-purchase chunk loop,
     which already has its own restart mechanism (the fingerprinted
-    copurchase_sparse checkpoint) — this only needs to be a plain sequential
-    stream, not a claimed queue.
+    copurchase_sparse checkpoint) — this only needs to be a plain
+    sequential stream.
     """
     _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
     baskets_table = f"baskets_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("SELECT MAX(basket_seq) FROM {}").format(sql.Identifier(baskets_table)))
-            max_seq = cur.fetchone()[0] or 0
+    max_seq = con.execute(f"SELECT MAX(basket_seq) FROM {_qi(baskets_table)}").fetchone()[0] or 0
 
-        lo = start_seq
-        while lo <= max_seq:
-            hi = min(lo + chunk_size - 1, max_seq)
-            df = _fetch_basket_range(conn, baskets_table, lo, hi)
-            if len(df) > 0:
-                yield df
-            lo = hi + 1
-    finally:
-        conn.close()
+    lo = start_seq
+    while lo <= max_seq:
+        hi = min(lo + chunk_size - 1, max_seq)
+        df = _fetch_basket_range(con, baskets_table, lo, hi)
+        if len(df) > 0:
+            yield df
+        lo = hi + 1
 
 
 # ─────────────────────────────────────────────
 # SAMPLE — stratified-by-size training sample, computed in SQL
 # ─────────────────────────────────────────────
 
-def sample_training_baskets(conn_uri, dataset_tag: str, n_samples: int, seed: int) -> pd.DataFrame:
+def sample_training_baskets(con, dataset_tag: str, n_samples: int, seed: int) -> pd.DataFrame:
     """
     Same stratified-by-basket-size logic GraphBuilder.sample_baskets used to
     do in-memory (pd.cut over the whole `baskets` DataFrame) — computed here
     via the size_bucket column build_baskets_table() already persisted, with
     an index on it, so each stratum's random draw
-    (`WHERE size_bucket = %s ORDER BY random() LIMIT %s`) only sorts that
+    (`WHERE size_bucket = ? ORDER BY random() LIMIT ?`) only sorts that
     stratum's rows, not the whole population. Returns ONE DataFrame
     (n_samples rows) — the only basket-shaped object that stays fully
-    resident in Python memory anywhere in this design, by construction far
-    smaller than the full basket population.
+    resident in Python memory anywhere in this design.
     """
     _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
     baskets_table = f"baskets_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("SET work_mem = %s"), (PG_WORK_MEM,))
-            cur.execute("SELECT setseed(%s)", (_seed_to_pg_seed(seed),))
-            cur.execute(sql.SQL("SELECT size_bucket, COUNT(*) FROM {} GROUP BY size_bucket")
-                        .format(sql.Identifier(baskets_table)))
-            stratum_counts = dict(cur.fetchall())
 
-        total = sum(stratum_counts.values())
-        if total == 0:
-            print("  WARNING: baskets table is empty — nothing to sample.")
-            return pd.DataFrame(columns=BASKET_COLS)
+    con.execute("SELECT setseed(?)", [_seed_to_duckdb_seed(seed)])
+    stratum_counts = dict(
+        con.execute(f"SELECT size_bucket, COUNT(*) FROM {_qi(baskets_table)} GROUP BY size_bucket").fetchall()
+    )
+    total = sum(stratum_counts.values())
+    if total == 0:
+        print("  WARNING: baskets table is empty — nothing to sample.")
+        return pd.DataFrame(columns=BASKET_COLS)
 
-        parts = []
-        with conn.cursor() as cur:
-            for bucket, count in stratum_counts.items():
-                if count == 0:
-                    continue
-                quota = min(count, max(1, round(n_samples * count / total)))
-                cur.execute(sql.SQL(
-                    "SELECT household_number, year_week_number, basket_id, products, units "
-                    "FROM {} WHERE size_bucket = %s ORDER BY random() LIMIT %s"
-                ).format(sql.Identifier(baskets_table)), (bucket, quota))
-                rows = cur.fetchall()
-                parts.append(pd.DataFrame(rows, columns=BASKET_COLS))
+    parts = []
+    for bucket, count in stratum_counts.items():
+        if count == 0:
+            continue
+        quota = min(count, max(1, round(n_samples * count / total)))
+        df = con.execute(
+            f"SELECT household_number, year_week_number, basket_id, products, units "
+            f"FROM {_qi(baskets_table)} WHERE size_bucket = ? ORDER BY random() LIMIT ?",
+            [bucket, quota],
+        ).df()
+        parts.append(df)
 
-        sampled = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=BASKET_COLS)
-        if len(sampled) > n_samples:
-            sampled = sampled.sample(n=n_samples, random_state=seed).reset_index(drop=True)
+    sampled = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=BASKET_COLS)
+    if len(sampled) > n_samples:
+        sampled = sampled.sample(n=n_samples, random_state=seed).reset_index(drop=True)
 
-        print(f"  Sampled {len(sampled):,} baskets across {len(stratum_counts)} "
-              f"basket-size strata (via Postgres, indexed per-stratum random sort)")
-        return sampled
-    finally:
-        conn.close()
+    print(f"  Sampled {len(sampled):,} baskets across {len(stratum_counts)} "
+          f"basket-size strata (via DuckDB, indexed per-stratum random sort)")
+    return sampled
 
 
 # ─────────────────────────────────────────────
 # RESTARTABLE INFERENCE CHUNK QUEUE
-# A Postgres table, not just an in-memory generator — this is what makes a
+#
+# A DuckDB table, not just an in-memory generator — this is what makes a
 # long inference run resumable after a crash: already-'complete' chunks are
-# never redone, and a chunk left 'running' by a machine that crashed becomes
-# claimable again automatically after `stale_after_seconds`.
+# never redone.
+#
+# IMPORTANT LIMITATION vs. the earlier Postgres design: DuckDB has no
+# row-level locking (no FOR UPDATE SKIP LOCKED). claim_next_chunk() below
+# is safe for this pipeline's actual usage — one process claiming chunks
+# sequentially — but is NOT safe if ever called concurrently from multiple
+# processes/threads at once (two callers could both see and claim the same
+# "pending" chunk in a race). If true multi-machine parallel inference is
+# ever built, it would need a different coordination mechanism than DuckDB
+# can provide on its own (e.g. a small separate lock file per chunk, or a
+# lightweight external coordinator) — this is an honest trade-off of
+# switching away from Postgres, not something worked around here.
 # ─────────────────────────────────────────────
 
-def ensure_inference_chunk_plan(conn_uri, dataset_tag: str, chunk_size: int):
+def ensure_inference_chunk_plan(con, dataset_tag: str, chunk_size: int):
     """
     Creates and populates the chunk-plan table ONCE per dataset_tag. If it
     already exists (a resumed run after a crash), it's left untouched so
     already-complete chunks are never redone.
     """
     _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
     baskets_table = f"baskets_{dataset_tag}"
     chunks_table = f"inference_chunks_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass(%s)", (chunks_table,))
-            already_exists = cur.fetchone()[0] is not None
-            if already_exists:
-                print(f"  {chunks_table} already exists — reusing as-is "
-                      f"(resuming any pending/incomplete chunks rather than restarting)")
-                return
 
-            cur.execute(sql.SQL("SELECT MAX(basket_seq) FROM {}").format(sql.Identifier(baskets_table)))
-            max_seq = cur.fetchone()[0] or 0
+    already_exists = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [chunks_table]
+    ).fetchone()[0] > 0
+    if already_exists:
+        print(f"  {chunks_table} already exists — reusing as-is "
+              f"(resuming any pending/incomplete chunks rather than restarting)")
+        return
 
-            cur.execute(sql.SQL("""
-                CREATE TABLE {} (
-                    chunk_id   INTEGER PRIMARY KEY,
-                    seq_lo     BIGINT NOT NULL,
-                    seq_hi     BIGINT NOT NULL,
-                    status     TEXT NOT NULL DEFAULT 'pending',
-                    worker_id  TEXT,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-            """).format(sql.Identifier(chunks_table)))
+    max_seq = con.execute(f"SELECT MAX(basket_seq) FROM {_qi(baskets_table)}").fetchone()[0] or 0
 
-            rows, chunk_id, lo = [], 0, 1
-            while lo <= max_seq:
-                hi = min(lo + chunk_size - 1, max_seq)
-                rows.append((chunk_id, lo, hi))
-                chunk_id += 1
-                lo = hi + 1
+    con.execute(
+        f"""
+        CREATE TABLE {_qi(chunks_table)} (
+            chunk_id   INTEGER PRIMARY KEY,
+            seq_lo     BIGINT NOT NULL,
+            seq_hi     BIGINT NOT NULL,
+            status     VARCHAR NOT NULL DEFAULT 'pending',
+            worker_id  VARCHAR,
+            updated_at TIMESTAMP NOT NULL DEFAULT now()
+        )
+        """
+    )
 
-            if rows:
-                insert_sql = sql.SQL(
-                    "INSERT INTO {} (chunk_id, seq_lo, seq_hi) VALUES (%s, %s, %s)"
-                ).format(sql.Identifier(chunks_table)).as_string(conn)
-                with conn.cursor() as cur2:
-                    cur2.executemany(insert_sql, rows)
-        conn.commit()
-        print(f"  {chunks_table}: {len(rows):,} chunks planned ({chunk_size:,} baskets each)")
-    finally:
-        conn.close()
+    rows, chunk_id, lo = [], 0, 1
+    while lo <= max_seq:
+        hi = min(lo + chunk_size - 1, max_seq)
+        rows.append((chunk_id, lo, hi))
+        chunk_id += 1
+        lo = hi + 1
+
+    if rows:
+        con.executemany(f"INSERT INTO {_qi(chunks_table)} (chunk_id, seq_lo, seq_hi) VALUES (?, ?, ?)", rows)
+    print(f"  {chunks_table}: {len(rows):,} chunks planned ({chunk_size:,} baskets each)")
 
 
-def claim_next_chunk(conn_uri, dataset_tag: str, worker_id: str, stale_after_seconds: int = 3600):
+def claim_next_chunk(con, dataset_tag: str, worker_id: str, stale_after_seconds: int = 3600):
     """
-    Atomically claims one pending (or crashed-and-stale) chunk via
-    `FOR UPDATE SKIP LOCKED` — the standard Postgres claimed-work-queue
-    pattern. Returns None when there's nothing left to claim.
+    Claims one pending (or crashed-and-stale) chunk. See the module-level
+    note above about this NOT being safe for concurrent multi-process
+    callers — correct only for this pipeline's actual single-process usage.
+    Returns None when there's nothing left to claim.
     """
     _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
     chunks_table = f"inference_chunks_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("""
-                UPDATE {t} SET status = 'running', worker_id = %(worker_id)s, updated_at = now()
-                WHERE chunk_id = (
-                    SELECT chunk_id FROM {t}
-                    WHERE status = 'pending'
-                       OR (status = 'running' AND updated_at < now() - (%(stale)s || ' seconds')::interval)
-                    ORDER BY chunk_id
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
-                )
-                RETURNING chunk_id, seq_lo, seq_hi
-            """).format(t=sql.Identifier(chunks_table)),
-            {"worker_id": worker_id, "stale": stale_after_seconds})
-            row = cur.fetchone()
-        conn.commit()
-        if row is None:
-            return None
-        return {"chunk_id": row[0], "seq_lo": row[1], "seq_hi": row[2]}
-    finally:
-        conn.close()
+
+    # stale_after_seconds is always an internal int from our own code, never
+    # user input, so inlining it into the INTERVAL literal is safe.
+    row = con.execute(
+        f"""
+        UPDATE {_qi(chunks_table)} SET status = 'running', worker_id = ?, updated_at = now()
+        WHERE chunk_id = (
+            SELECT chunk_id FROM {_qi(chunks_table)}
+            WHERE status = 'pending'
+               OR (status = 'running' AND updated_at < now() - INTERVAL '{int(stale_after_seconds)} seconds')
+            ORDER BY chunk_id
+            LIMIT 1
+        )
+        RETURNING chunk_id, seq_lo, seq_hi
+        """,
+        [worker_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return {"chunk_id": row[0], "seq_lo": row[1], "seq_hi": row[2]}
 
 
-def mark_chunk_complete(conn_uri, dataset_tag: str, chunk_id: int):
+def mark_chunk_complete(con, dataset_tag: str, chunk_id: int):
     _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
     chunks_table = f"inference_chunks_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("UPDATE {} SET status = 'complete', updated_at = now() WHERE chunk_id = %s")
-                        .format(sql.Identifier(chunks_table)), (chunk_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    con.execute(f"UPDATE {_qi(chunks_table)} SET status = 'complete', updated_at = now() WHERE chunk_id = ?",
+                [chunk_id])
 
 
-def get_basket_range(conn_uri, dataset_tag: str, seq_lo: int, seq_hi: int) -> pd.DataFrame:
+def get_basket_range(con, dataset_tag: str, seq_lo: int, seq_hi: int) -> pd.DataFrame:
     """Fetch exactly one claimed chunk's basket rows."""
     _validate_tag(dataset_tag)
     baskets_table = f"baskets_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        return _fetch_basket_range(conn, baskets_table, seq_lo, seq_hi)
-    finally:
-        conn.close()
+    return _fetch_basket_range(con, baskets_table, seq_lo, seq_hi)
 
 
-def drop_all(conn_uri, dataset_tag: str):
-    """
-    Drops every table this module creates for a given dataset_tag (staging,
-    baskets, inference chunk-plan) — for fully resetting a tag (e.g. between
-    independent test runs, or when the source export/basket definition
-    changed and you want a clean rebuild rather than relying on the
-    per-table staleness guards elsewhere).
-    """
+def count_baskets(con, dataset_tag: str) -> int:
     _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            for table in (f"staging_{dataset_tag}", f"baskets_{dataset_tag}",
-                          f"inference_chunks_{dataset_tag}"):
-                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table)))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def count_baskets(conn_uri, dataset_tag: str) -> int:
-    _validate_tag(dataset_tag)
-    from psycopg2 import sql
-
     baskets_table = f"baskets_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(baskets_table)))
-            return cur.fetchone()[0]
-    finally:
-        conn.close()
+    return con.execute(f"SELECT COUNT(*) FROM {_qi(baskets_table)}").fetchone()[0]
+
+
+def drop_all(con, dataset_tag: str):
+    """Drops every table this module creates for a given dataset_tag — for
+    fully resetting a tag (e.g. between independent test runs)."""
+    _validate_tag(dataset_tag)
+    for table in (f"baskets_{dataset_tag}", f"inference_chunks_{dataset_tag}"):
+        con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
 
 
 # ─────────────────────────────────────────────
 # EXCLUDE ALREADY-EMBEDDED BASKETS (used by score_new_baskets.py)
 # ─────────────────────────────────────────────
 
-def exclude_existing_basket_ids(conn_uri, dataset_tag: str, existing_ids_parquet_path,
-                                  batch_size: int = 5_000_000):
+def exclude_existing_basket_ids(con, dataset_tag: str, existing_ids_parquet_path):
     """
     Removes rows from baskets_{tag} whose basket_id already appears in
     `existing_ids_parquet_path` (e.g. the training run's
     basket_gnn_embeddings.parquet) — the scoring-time equivalent of "skip
-    baskets we've already embedded". Streams ONLY the basket_id column
-    (never the embedding vectors) in bounded batches straight into a
-    throwaway Postgres table, then removes matches via one SQL anti-join.
-    The existing-id set is never materialized as a Python object — at real
-    scale it could be the entire training basket population (tens of
-    millions of rows), which is exactly the kind of object this whole
-    redesign exists to avoid holding in memory.
+    baskets we've already embedded". DuckDB reads that parquet file
+    directly for the anti-join; the existing-id set is never materialized
+    as a Python object, however large the training population is.
     """
     _validate_tag(dataset_tag)
-    from pathlib import Path
-    import pyarrow.dataset as pa_dataset
-    from psycopg2 import sql
-
     existing_ids_parquet_path = Path(existing_ids_parquet_path)
     if not existing_ids_parquet_path.exists():
         print(f"  {existing_ids_parquet_path} not found — skipping already-embedded exclusion "
@@ -521,40 +373,13 @@ def exclude_existing_basket_ids(conn_uri, dataset_tag: str, existing_ids_parquet
         return
 
     baskets_table = f"baskets_{dataset_tag}"
-    existing_table = f"existing_ids_{dataset_tag}"
-    conn = _connect(conn_uri)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(existing_table)))
-            cur.execute(sql.SQL("CREATE TABLE {} (basket_id TEXT)").format(sql.Identifier(existing_table)))
-        conn.commit()
+    glob_path = _glob_for(existing_ids_parquet_path)
 
-        copy_sql = sql.SQL("COPY {} (basket_id) FROM STDIN WITH (FORMAT csv)") \
-            .format(sql.Identifier(existing_table)).as_string(conn)
-
-        dataset = pa_dataset.dataset(str(existing_ids_parquet_path), format="parquet")
-        n_rows = 0
-        for record_batch in dataset.to_batches(columns=["basket_id"], batch_size=batch_size):
-            df = record_batch.to_pandas()
-            buf = io.StringIO()
-            df.to_csv(buf, index=False, header=False)
-            buf.seek(0)
-            with conn.cursor() as cur:
-                cur.copy_expert(copy_sql, buf)
-            conn.commit()
-            n_rows += len(df)
-            del df, buf
-
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("CREATE INDEX ON {} (basket_id)").format(sql.Identifier(existing_table)))
-            cur.execute(sql.SQL(
-                "DELETE FROM {b} WHERE basket_id IN (SELECT basket_id FROM {e})"
-            ).format(b=sql.Identifier(baskets_table), e=sql.Identifier(existing_table)))
-            n_deleted = cur.rowcount
-            cur.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(existing_table)))
-        conn.commit()
-
-        print(f"  Excluded {n_deleted:,} already-embedded baskets from {baskets_table} "
-              f"(checked against {n_rows:,} existing basket_ids)")
-    finally:
-        conn.close()
+    n_before = con.execute(f"SELECT COUNT(*) FROM {_qi(baskets_table)}").fetchone()[0]
+    con.execute(
+        f"DELETE FROM {_qi(baskets_table)} WHERE basket_id IN "
+        f"(SELECT basket_id FROM read_parquet(?))",
+        [glob_path],
+    )
+    n_after = con.execute(f"SELECT COUNT(*) FROM {_qi(baskets_table)}").fetchone()[0]
+    print(f"  Excluded {n_before - n_after:,} already-embedded baskets from {baskets_table}")

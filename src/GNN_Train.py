@@ -10,12 +10,16 @@ uses — so training and scoring can't drift apart in either features or
 encoding. See REFACTOR_NOTES.md for the full account of what changed and why.
 
 Basket storage: `baskets` is never passed into this file as one in-memory
-object anymore — it lives in Postgres (basket_store.py), addressed by
-`conn_uri` + `dataset_tag`. The training sample is drawn there (bounded,
-~N_TRAIN_SAMPLES rows), cached once to LMDB (lmdb_graph_cache.py) so
-DataLoader can randomly access it across epochs without holding all built
-graphs in RAM, and inference streams the full population from Postgres in
-restartable chunks (GraphBuilder.run_inference).
+object anymore — it lives in a local embedded DuckDB database
+(basket_store.py, duckdb_manager.py), addressed by `con` (the shared
+connection object) + `dataset_tag`. The training sample is drawn there
+(bounded, ~N_TRAIN_SAMPLES rows), cached once to LMDB (lmdb_graph_cache.py)
+so DataLoader can randomly access it across epochs without holding all
+built graphs in RAM, and inference streams the full population from DuckDB
+in restartable chunks (GraphBuilder.run_inference) — restartable for a
+single process; DuckDB has no row-level locking, so this isn't safe for
+multiple concurrent processes claiming chunks at once (see
+basket_store.claim_next_chunk).
 """
 
 import os
@@ -133,7 +137,7 @@ def batch_graph_targets(data):
 # ─────────────────────────────────────────────
 
 def train_and_embed(
-    conn_uri,
+    con,
     dataset_tag,
     product_embedding,
     product_id_to_index,
@@ -156,10 +160,10 @@ def train_and_embed(
     in_dim = G["in_dim"]   # emb_dim + 4
     print(f"  Node feature dim: {in_dim}  (emb_dim={G['emb_dim']} + 4 extra features)")
 
-    # ── Step 2: Sample training baskets (from Postgres, bounded result size) ──
+    # ── Step 2: Sample training baskets (from DuckDB, bounded result size) ──
     print("\n[ 2 / 4 ] Sampling training baskets...")
     sampled = basket_store.sample_training_baskets(
-        conn_uri, dataset_tag, n_samples=N_TRAIN_SAMPLES, seed=42,
+        con, dataset_tag, n_samples=N_TRAIN_SAMPLES, seed=42,
     )
 
     # ── Step 3: Build (or reuse) the LMDB training-graph cache ──
@@ -233,16 +237,16 @@ def train_and_embed(
             print(f"  Warning: {nan_batches} NaN batches skipped in epoch {epoch+1}")
 
     # ── Inference (restartable, bounded-memory, one chunk at a time) ──
-    # Streams the FULL basket population from Postgres in claimed chunks,
+    # Streams the FULL basket population from DuckDB in claimed chunks,
     # builds a real graph per chunk, runs it through the SAME model.encode()
     # path used during training, and writes each chunk's embeddings straight
     # to disk — see GraphBuilder.run_inference. A crash partway through
     # resumes from whatever chunks are still pending/stale rather than
-    # starting over.
+    # starting over (single-process only — see basket_store.claim_next_chunk).
     print("\n[ Inference ] Embedding all baskets via full GNN encoding "
-          "(restartable, chunked from Postgres)...")
+          "(restartable, chunked from DuckDB)...")
     run_inference(
-        conn_uri, dataset_tag, G, model, device,
+        con, dataset_tag, G, model, device,
         worker_id=worker_id, batch_size=8192,
     )
     basket_gnn_embeddings = merge_inference_output(dataset_tag, output_dir=OUTPUT_DIR)

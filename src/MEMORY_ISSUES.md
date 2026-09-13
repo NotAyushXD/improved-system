@@ -7,7 +7,7 @@ here came from the same root cause** — holding the entire population of
 baskets (tens of millions of rows at real scale) as one object in Python's
 memory for the whole script. Each fix either shrank what's held at a given
 moment, moved the data somewhere that isn't Python's memory (disk,
-Postgres, LMDB), or removed a redundant copy of something already large.
+DuckDB, LMDB), or removed a redundant copy of something already large.
 
 No fix ever reduced the amount of data used or the quality of the model —
 every fix is an engineering/storage change, not a data-reduction one.
@@ -43,13 +43,18 @@ batch had been read, those dictionaries held the **entire** basket
 population anyway, just spread across many small steps instead of one big
 one. Same problem, just hidden one layer deeper.
 
-**Fix:** This grouping step now happens inside a small, local, automatically-
-managed Postgres database instead of in Python. Postgres knows how to group
-huge tables into smaller ones without needing everything in memory at
-once (it spills to disk on its own when needed) — this is exactly what a
-database is built for, so instead of re-inventing that logic in Python, we
-just use it. The result is one basket-level table that lives in the
-database, not in a Python variable.
+**Fix:** This grouping step now happens inside a small, local, embedded
+database (DuckDB) instead of in Python. DuckDB knows how to group huge
+tables into smaller ones without needing everything in memory at once (it
+spills to disk on its own when needed), and can read the raw export
+directly from its files — this is exactly what a database is built for, so
+instead of re-inventing that logic in Python, we just use it. The result is
+one basket-level table that lives in the database, not in a Python
+variable. (An earlier version of this fix used a self-contained Postgres
+instance instead of DuckDB — switched after Postgres's setup step turned
+out to be blocked by a permission restriction on the deployment machine;
+the underlying idea — do the grouping in a database, not Python — is the
+same either way.)
 
 ---
 
@@ -207,7 +212,7 @@ Nothing resembling the full list of IDs ever gets built as a Python object.
 
 Every fix here follows the same idea: **don't build the whole thing in
 Python memory just because you eventually need to look at all of it.**
-Stream it in pieces, store it somewhere disk-backed (Postgres, LMDB, plain
+Stream it in pieces, store it somewhere disk-backed (DuckDB, LMDB, plain
 files) that's built for handling more data than fits in RAM, and only ever
 pull a small, bounded piece into Python at any one time.
 
@@ -217,8 +222,8 @@ pull a small, bounded piece into Python at any one time.
 
 | # | Stage | Where the issue was | Main solution | File(s) changed |
 |---|---|---|---|---|
-| 1 | Stage 0 | Loading the raw warehouse export in one shot (`pd.read_parquet()`) | Read in bounded batches instead of one giant load | `parquet_loader.py` (original streaming fix) → `basket_store.py` (`load_raw_export_to_postgres`) |
-| 2 | Stage 0/1 | Grouping raw rows into baskets (Python dict accumulators) | Do the grouping inside Postgres, not Python | `parquet_loader.py` (`stream_build_baskets_and_units_avg`, now retired) → `basket_store.py` (`build_baskets_table`) |
+| 1 | Stage 0 | Loading the raw warehouse export in one shot (`pd.read_parquet()`) | Read in bounded batches instead of one giant load; now DuckDB reads the parquet files directly, no Python-side batching needed at all | `parquet_loader.py` (original streaming fix, now retired) → `basket_store.py` (`build_baskets_table`, via DuckDB's `read_parquet()`) |
+| 2 | Stage 0/1 | Grouping raw rows into baskets (Python dict accumulators) | Do the grouping inside a database (DuckDB), not Python | `parquet_loader.py` (`stream_build_baskets_and_units_avg`, now retired) → `basket_store.py` (`build_baskets_table`) |
 | 3 | Stage 1 | Building the co-purchase matrix in one shot | Build it in checkpointed chunks, resumable on crash | `pipeline_main.py` (co-purchase chunk loop + checkpoint files) |
 | 4 | Stage 1 | Per-basket co-purchase lookup table (200GB threshold) | Slice a tiny per-basket table on the fly instead of one shared giant one | `GraphBuilder.py` (`_basket_dense_cp_submatrix`) |
 | 5 | Stage 1 | Picking the training sample (copied the whole basket table) | Sample via lightweight indexes, then via a database query | `GraphBuilder.py` (`sample_baskets`, now retired) → `basket_store.py` (`sample_training_baskets`) |

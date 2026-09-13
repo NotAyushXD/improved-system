@@ -10,11 +10,10 @@ plain parquet file:
                                                don't exist in your warehouse yet)
 
 Basket loading (the household x tpnb x week export) no longer goes through
-this module — it's loaded straight into the local self-contained Postgres
-instance by basket_store.load_raw_export_to_postgres(), which reuses the
-same bounded-batch pyarrow.dataset streaming read this module used to do,
-just piping each batch into Postgres via COPY instead of accumulating it in
-Python. See basket_store.py and pg_manager.py.
+this module — basket_store.build_baskets_table() reads it directly from its
+parquet files via DuckDB's read_parquet(), streaming/aggregating straight
+off disk with no separate load step at all. See basket_store.py and
+duckdb_manager.py.
 
 No live warehouse connection required — this only reads local files. Update
 PRODUCT_EMBEDDINGS_PARQUET below to wherever you've saved the download, or

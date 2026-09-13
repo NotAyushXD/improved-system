@@ -3,9 +3,10 @@ pipeline_main.py
 
 End-to-end pipeline:  your warehouse (manual export)  ->  GNN basket embeddings  ->  need-state clustering
 
-    Stage 0   Read the two parquet files exported from your workspace, load the
-              household x tpnb x week export into Postgres (parquet_loader.py
-              for product embeddings, pg_manager.py + basket_store.py for baskets)
+    Stage 0   Read the two parquet files exported from your workspace, build the
+              per-basket table in DuckDB directly from the household x tpnb x week
+              export (parquet_loader.py for product embeddings,
+              duckdb_manager.py + basket_store.py for baskets)
     Stage 1   Build the co-purchase matrix, train the GNN, embed every basket
     Stage 2   Cluster the resulting basket embeddings — BOTH Leiden and GMM    (cluster_basket_embeddings.py)
     Stage 3   Save need-state output as parquet for manual reload into your warehouse
@@ -33,16 +34,25 @@ finest grain the data supports. See the comment at the top of
 data/ns_household_tpnb_week_agg_train.sql for the full reasoning, and
 data/TABLE_REFERENCE.md for what each source table actually contains.
 
-BASKET STORAGE — POSTGRES, NOT A PYTHON DATAFRAME: `baskets` used to be
+BASKET STORAGE — DUCKDB, NOT A PYTHON DATAFRAME: `baskets` used to be
 held as one Python object for this entire script's run, which at real
 week-grain scale (tens of millions of baskets) is bigger than available
-RAM. Basket storage now lives in a self-contained, locally-managed
-Postgres instance (pg_manager.py starts it — no manual install/config
-needed; basket_store.py owns the load/aggregate/stream/sample functions).
-Nothing in this file ever holds the full basket population in memory —
-Stage 1's co-purchase loop streams bounded chunks, the training sample is a
-small SQL-drawn subset, and inference streams the full population from
-Postgres in restartable chunks (see GraphBuilder.run_inference).
+RAM. Basket storage now lives in a local, embedded DuckDB database
+(duckdb_manager.py opens it — no server process, no privileged setup step;
+basket_store.py owns the aggregate/stream/sample functions, and reads the
+raw export straight from its parquet files via DuckDB's read_parquet()
+rather than loading it into Python first). Nothing in this file ever holds
+the full basket population in memory — Stage 1's co-purchase loop streams
+bounded chunks, the training sample is a small SQL-drawn subset, and
+inference streams the full population from DuckDB in restartable chunks
+(see GraphBuilder.run_inference — restartable for a single process; DuckDB
+has no row-level locking, so this isn't safe for concurrent processes).
+
+(An earlier version of this used a self-contained Postgres instance via
+`pgserver` instead of DuckDB — dropped because `initdb`'s privileged
+directory-permission step was blocked outright on the target machine, even
+running as Administrator, on every local drive tried. DuckDB needs no such
+privileged step — it just opens an ordinary file.)
 
 BREAKING CHANGE — cached artifact schema: GraphBuilder.py's node feature
 layout changed (in_dim = emb_dim + 4, was + 5) and its sub-clustering
@@ -62,17 +72,17 @@ attributes, never from basket/purchase data. The co-purchase-matrix build's
 own checkpoint (copurchase_sparse.checkpoint.npz + .progress.txt) and the
 LMDB training-graph cache are both self-protecting: they fingerprint what
 they were built from and rebuild automatically on mismatch, rather than
-silently resuming into stale data. The Postgres `baskets_train` table and
+silently resuming into stale data. The DuckDB `baskets_train` table and
 `inference_chunks_train` chunk-plan table are NOT fingerprinted — if you
-change the source export or basket definition, drop them manually (they
-live in the local Postgres instance under data/pgdata/) or just delete
-data/pgdata/ entirely to start clean.
+change the source export or basket definition, drop them manually
+(`basket_store.drop_all(con, "train")`) or just delete
+data/pipeline.duckdb entirely to start clean.
 There is no product_theme.pkl to delete — that file is never written by
 this version, and never read by score_new_baskets.py either.
 
 There's no live database connection to your WAREHOUSE anywhere in this file
-(the Postgres instance it does use is a private, local, self-contained one
-managed by pg_manager.py — not your company's data warehouse). Before
+(the DuckDB database it does use is a private, local, embedded file
+managed by duckdb_manager.py — not your company's data warehouse). Before
 running this, you need to have already run build_product_embeddings.py
 (product embeddings don't exist yet, so that script builds them from
 scratch — see its own docstring).
@@ -86,7 +96,7 @@ your downloaded tables:
     │   ├── ns_tpnb_to_tpna_mapping/                (folder)
     │   ├── ns_household_tpnb_week_agg_train/       (folder)
     │   ├── ns_household_tpnb_week_agg_score/       (folder — used later by score_new_baskets.py)
-    │   ├── pgdata/                                 (the local Postgres instance's data directory)
+    │   ├── pipeline.duckdb                         (the local embedded DuckDB database file)
     │   └── output/                                 (everything this pipeline WRITES lands here —
     │                                                 product_embeddings.parquet, caches, the
     │                                                 trained model, embeddings, need-state output)
@@ -120,7 +130,7 @@ import scipy.sparse as sp
 from scipy.sparse import csr_matrix
 
 import parquet_loader
-import pg_manager
+import duckdb_manager
 import basket_store
 from GNN_Train import train_and_embed
 from cluster_basket_embeddings import (
@@ -143,7 +153,7 @@ GMM_N_COMPONENTS = 30
 # losing already-completed work — it does NOT change the result: X.T @ X is
 # exactly additive over row-disjoint chunks of X (a basket only contributes
 # co-purchase pairs to itself, never across baskets, and each chunk is a
-# disjoint basket_seq range from the Postgres baskets table).
+# disjoint basket_seq range from the DuckDB baskets table).
 # Lower this if you still see memory pressure; raise it for fewer, faster
 # chunks once you've confirmed headroom.
 COPURCHASE_CHUNK_BASKETS = 500_000
@@ -169,9 +179,9 @@ def main():
     parser.add_argument(
         "--worker-id", default=None,
         help="Label for this process in the restartable inference chunk queue "
-             "(defaults to hostname-pid). Only matters if you're running more "
-             "than one process against the same Postgres instance at once — "
-             "single-machine runs can ignore this.",
+             "(defaults to hostname-pid). DuckDB's chunk queue is only safe for "
+             "one process at a time (see basket_store.claim_next_chunk) — this "
+             "is mostly a diagnostic label for single-machine runs.",
     )
     args = parser.parse_args()
 
@@ -193,26 +203,23 @@ def main():
               f"warehouse export, DELETE IT before continuing.")
 
     # ─────────────────────────────────────────────
-    # Stage 0: read the manually-downloaded warehouse exports, load baskets
-    # into the local self-contained Postgres instance
+    # Stage 0: read the manually-downloaded warehouse exports, build the
+    # per-basket table in the local embedded DuckDB database
     # ─────────────────────────────────────────────
     print("[Stage 0] Reading warehouse exports...")
     product_df_2 = parquet_loader.load_product_embeddings(PRODUCT_EMBEDDINGS_PARQUET)
 
-    conn_uri = pg_manager.get_connection_uri()
-    print("Loading household x tpnb x week export into Postgres "
-          "(streamed in bounded batches via COPY — never held as one object)...")
-    basket_store.load_raw_export_to_postgres(conn_uri, HOUSEHOLD_TPNB_WEEK_PARQUET, "train")
-
-    print("Building the per-basket table in Postgres (one SQL pass, "
-          "disk-spilling aggregate — replaces the old Python dict accumulator)...")
+    con = duckdb_manager.get_connection()
+    print("Building the per-basket table in DuckDB (reads the household x tpnb x week "
+          "export directly from its parquet files — never held as one Python object, "
+          "no separate load step needed)...")
     n_baskets_total, product_units_avg, product_uniques = basket_store.build_baskets_table(
-        conn_uri, "train", min_basket_products=MIN_BASKET_PRODUCTS,
+        con, HOUSEHOLD_TPNB_WEEK_PARQUET, "train", min_basket_products=MIN_BASKET_PRODUCTS,
     )
 
     BASKET_COUNT_WARN_THRESHOLD = 2_000_000
     if n_baskets_total > BASKET_COUNT_WARN_THRESHOLD:
-        print(f"  NOTE: {n_baskets_total:,} baskets — this now lives in Postgres, not Python "
+        print(f"  NOTE: {n_baskets_total:,} baskets — this now lives in DuckDB, not Python "
               f"memory, so basket count alone no longer risks an OOM crash the way it used "
               f"to. If this looks unexpectedly large, check "
               f"ns_household_tpnb_week_agg_train.sql's MOD(household_number, N) = 0 filter is "
@@ -224,7 +231,7 @@ def main():
 
     # ─────────────────────────────────────────────
     # Stage 1a: co-purchase matrix — chunked + checkpointed, streamed from
-    # Postgres in row-disjoint basket_seq ranges
+    # DuckDB in row-disjoint basket_seq ranges
     # ─────────────────────────────────────────────
     print("\n[Stage 1] Building co-purchase matrix "
           f"(chunked {COPURCHASE_CHUNK_BASKETS:,} baskets at a time, checkpointed to disk)...")
@@ -263,7 +270,7 @@ def main():
         copurchase_sparse = csr_matrix((n_products_cp, n_products_cp), dtype=np.int32)
 
     chunk_stream = basket_store.stream_basket_chunks(
-        conn_uri, "train", COPURCHASE_CHUNK_BASKETS,
+        con, "train", COPURCHASE_CHUNK_BASKETS,
         start_seq=start_chunk * COPURCHASE_CHUNK_BASKETS + 1,
     )
     for chunk_i, chunk_df in zip(range(start_chunk, n_chunks), chunk_stream):
@@ -326,7 +333,7 @@ def main():
     # ─────────────────────────────────────────────
     print("\n[Stage 1] Training GNN + embedding baskets...")
     basket_gnn_embeddings = train_and_embed(
-        conn_uri             = conn_uri,
+        con                  = con,
         dataset_tag          = "train",
         product_embedding    = product_embedding,
         product_id_to_index  = product_id_to_index,
