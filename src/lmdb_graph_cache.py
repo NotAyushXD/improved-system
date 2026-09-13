@@ -189,6 +189,20 @@ class LMDBGraphDataset(PyGDataset):
             data_bytes = txn.get(str(idx).encode())
         return pickle.loads(data_bytes)
 
+    def close(self):
+        """
+        Closes this instance's read handle, if one was ever opened. lmdb
+        refuses to open the same environment path twice concurrently within
+        one process — call this before constructing a second
+        LMDBGraphDataset over the same lmdb_path in the same process (e.g.
+        in a test, or a notebook/REPL session; a normal `python
+        pipeline_main.py` run never needs this, since each run is its own
+        process).
+        """
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_env"] = None   # never send a live LMDB handle across a process boundary

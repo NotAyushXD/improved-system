@@ -257,14 +257,23 @@ def check_functional():
     print(f"  lmdb_graph_cache: {len(train_dataset)} graphs cached, node width == in_dim, "
           f"edge_attr width == 2 — OK")
 
+    n_graphs_first_open = len(train_dataset)
+    # lmdb refuses to open the same environment path twice concurrently
+    # within one process — close this instance's read handle before
+    # constructing a second LMDBGraphDataset over the same lmdb_path below.
+    # g0 (already fetched above) stays valid — it's a plain deserialized
+    # Data object, independent of the env staying open.
+    train_dataset.close()
+
     # Cache-hit reload — manifest matches, should NOT rebuild.
     lmdb_graph_cache.load_or_build_lmdb_cache(
         sampled, G, lmdb_path, manifest_path,
         seed=42, n_train_samples_requested=n_baskets_total,
     )
     reloaded_dataset = lmdb_graph_cache.LMDBGraphDataset(lmdb_path)
-    assert len(reloaded_dataset) == len(train_dataset), "cache round-trip returned a different graph count"
+    assert len(reloaded_dataset) == n_graphs_first_open, "cache round-trip returned a different graph count"
     print(f"  lmdb_graph_cache cache-hit reload round-trip — OK")
+    reloaded_dataset.close()
 
     # Tiny untrained model — this test checks shapes and that both paths
     # exercise the same code, not embedding quality.

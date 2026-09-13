@@ -37,8 +37,11 @@ BASKET_COLS = ["household_number", "year_week_number", "basket_id", "products", 
 # Postgres spills hash aggregates / sorts to disk automatically past whatever
 # work_mem is set to, so raising this is a performance knob, not a memory
 # ceiling anything can silently overflow. No arbitrary cap here on purpose.
-PG_WORK_MEM = "2GB"
-PG_MAINTENANCE_WORK_MEM = "2GB"
+# NOTE: work_mem's hard max is 2097151 kB (just under 2GB) — "2GB" parses to
+# 2097152 kB, one over the limit, and Postgres rejects it outright. 1GB
+# leaves headroom without needing to hit that exact boundary.
+PG_WORK_MEM = "1GB"
+PG_MAINTENANCE_WORK_MEM = "1GB"
 
 # Lowercase-only on purpose: table names built from this are passed
 # unquoted to to_regclass() in ensure_inference_chunk_plan(), which folds
