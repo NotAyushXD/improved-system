@@ -79,7 +79,12 @@ SEED                 = config.SEED
 # saved manifest by lmdb_graph_cache.load_or_build_lmdb_cache() so a cached
 # LMDB training-graph set built under a different feature layout is never
 # silently reused.
-GRAPH_BUILDER_VERSION = 2
+# 3: fixed the edge relative-strength denominator (was an arbitrary neighbour
+#    rather than the node's strongest link, for any node with <= TOP_K
+#    neighbours). Edge feature [1] changes value, so every graph cached under
+#    version 2 is stale — this bump forces the LMDB cache to rebuild instead of
+#    training on the old edge scaling.
+GRAPH_BUILDER_VERSION = 3
 
 # All pipeline-produced artifacts (caches, models, embeddings) live under
 # this folder rather than scattered in the working directory. Created here
@@ -155,12 +160,30 @@ def _build_edges_numba(indptr, indices, data, top_k):
             final_cols = tmp_cols
             final_vals = tmp_vals
 
-        # The selection loop above always finds the single largest
-        # remaining value first, so final_vals[0] is this node's strongest
-        # co-purchase edge. Every selected edge is expressed as a fraction
-        # of that — a purely co-purchase-derived relative-strength signal,
-        # replacing the old same_theme edge flag.
-        max_val_for_node = final_vals[0] if len(final_vals) > 0 else 1.0
+        # Each selected edge is expressed as a fraction of this node's
+        # STRONGEST co-purchase link — a purely co-purchase-derived
+        # relative-strength signal, replacing the old same_theme edge flag.
+        #
+        # This used to read `final_vals[0]`, on the reasoning that the
+        # selection loop above emits the largest value first. That is true
+        # ONLY in the `k > top_k` branch, where the greedy loop runs. In the
+        # `else` branch — every node with <= top_k neighbours, i.e. every
+        # basket of <= 11 products, which is a large share of week-grain
+        # baskets — final_vals is still in CSR COLUMN order, so final_vals[0]
+        # was an arbitrary neighbour rather than the strongest one. With
+        # co-purchase counts of 30/90/60 that produced relative strengths of
+        # 1.0/3.0/2.0 instead of 0.33/1.0/0.67: the documented invariant
+        # (every value in (0, 1], exactly one equal to 1.0) was violated, and
+        # small and large baskets had their edge features on different scales.
+        #
+        # Scanning for the max explicitly is correct in both branches. Written
+        # as a loop rather than final_vals.max() deliberately — it is trivially
+        # verifiable under numba's typing with no reliance on array-method
+        # support, and it compiles to the same thing.
+        max_val_for_node = final_vals[0]
+        for s in range(1, len(final_vals)):
+            if final_vals[s] > max_val_for_node:
+                max_val_for_node = final_vals[s]
         if max_val_for_node <= 0:
             max_val_for_node = 1.0
 

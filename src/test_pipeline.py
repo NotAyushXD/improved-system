@@ -394,22 +394,22 @@ def check_graph_primitives():
     #   (a) every relative strength is <= 1.0
     #   (b) each node's strongest edge has relative strength == 1.0
     #
-    # KNOWN TO FAIL against the current implementation. max_val_for_node is
-    # taken as final_vals[0], which is only the maximum in the k > top_k
-    # branch (where a greedy descending selection runs). In the else branch
-    # -- every node with <= top_k neighbours, i.e. every basket of <= 11
-    # products -- final_vals is still in CSR COLUMN order, so final_vals[0]
-    # is an arbitrary neighbour, not the strongest. Fix is one line:
-    #     max_val_for_node = final_vals.max() if len(final_vals) > 0 else 1.0
-    # Leaving the assertion as the CORRECT behaviour on purpose, so this
-    # test goes green when the bug is fixed rather than enshrining it.
+    # REGRESSION GUARD. This failed until GRAPH_BUILDER_VERSION 3.
+    # max_val_for_node was taken as final_vals[0], which is only the maximum
+    # in the k > top_k branch (where a greedy descending selection runs). In
+    # the else branch -- every node with <= top_k neighbours, i.e. every
+    # basket of <= 11 products -- final_vals is still in CSR COLUMN order, so
+    # final_vals[0] was an arbitrary neighbour, not the strongest. With the
+    # 30/90/60 counts below it divided by 30 instead of 90, yielding
+    # 1.0/3.0/2.0 where 0.33/1.0/0.67 was intended. Both assertions below are
+    # the DOCUMENTED contract, so they also pin the invariant going forward.
     small = np.zeros((4, 4), dtype=np.float32)
     pairs = {(0, 1): 30.0, (0, 2): 90.0, (0, 3): 60.0}
     for (i, j), v in pairs.items():
         small[i, j] = v
         small[j, i] = v
     csr_s = sp.csr_matrix(small)
-    _, _, _, rel_s = _build_edges_numba(
+    src_s, dst_s, _, rel_s = _build_edges_numba(
         csr_s.indptr.astype(np.int64), csr_s.indices.astype(np.int64),
         csr_s.data.astype(np.float32), 10,
     )
@@ -417,10 +417,21 @@ def check_graph_primitives():
         ok = _fail(
             f"relative strength exceeds 1.0 (max={rel_s.max():.3f}) — node's "
             f"strongest-link denominator is wrong for nodes with <= top_k "
-            f"neighbours. See the comment above this assertion for the one-line fix."
+            f"neighbours. See the comment above this assertion."
         )
     else:
-        print("  _build_edges_numba: relative strength <= 1.0 for a small basket — OK")
+        # Node 0's counts are 30/90/60, so its edges must be scaled by 90:
+        # exactly one edge at 1.0 (the strongest), the rest strictly below.
+        got = {int(d): float(r) for s, d, r in zip(src_s, dst_s, rel_s) if s == 0}
+        want = {1: 30.0 / 90.0, 2: 1.0, 3: 60.0 / 90.0}
+        if set(got) != set(want) or not all(np.isclose(got[k], want[k]) for k in want):
+            ok = _fail(f"node 0's relative strengths should be {want}, got {got}")
+        elif sum(1 for v in got.values() if np.isclose(v, 1.0)) != 1:
+            ok = _fail(f"exactly one of a node's edges must have relative strength "
+                       f"1.0 (its strongest link), got {got}")
+        else:
+            print("  _build_edges_numba: relative strength scaled by the node's own "
+                  "strongest link, exactly one edge at 1.0 — OK")
 
     # ── _basket_dense_cp_submatrix: identical to the old implementation ──
     # This function was rewritten for speed (csr[rows][:,cols] materialised
