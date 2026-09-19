@@ -114,8 +114,24 @@ def _find_env_file():
 
 
 def _parse_env_file(path: Path) -> dict:
+    # encoding is explicit on purpose. Path.read_text() with no encoding uses
+    # the LOCALE default, which is UTF-8 on Linux/macOS but cp1252 on a
+    # Western-European Windows install (Python 3.14 still behaves this way;
+    # PEP 686's UTF-8 default lands later). The shipped .env contains box-drawing
+    # characters and arrows, so a locale-default read crashed on Windows with
+    # `UnicodeDecodeError: 'charmap' codec can't decode byte 0x90` — a config
+    # file being unreadable purely because of which OS wrote it.
+    # utf-8-sig also tolerates the BOM that Notepad and some Windows editors add.
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"{path} is not valid UTF-8 ({e}). Re-save it as UTF-8 — on Windows, "
+            f"Notepad's 'Save as' has an Encoding dropdown, and VS Code shows the "
+            f"current encoding in the status bar. .env files are read as UTF-8 "
+            f"regardless of the system locale so that the same file works on every "
+            f"machine."
+        ) from None
     except OSError as e:
         raise OSError(
             f"Found {path} but could not read it ({type(e).__name__}: {e}). Fix the "

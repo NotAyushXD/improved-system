@@ -282,7 +282,7 @@ def main():
         start_chunk = n_chunks
     elif os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
         try:
-            _progress_fields = open(_CP_PROGRESS).read().split(",")
+            _progress_fields = open(_CP_PROGRESS, encoding="utf-8").read().split(",")
             _ckpt_chunk = int(_progress_fields[0])
             _ckpt_fingerprint = tuple(_progress_fields[1:3]) if len(_progress_fields) >= 3 else None
         except (ValueError, IndexError):
@@ -336,7 +336,7 @@ def main():
         os.replace(tmp_ckpt, _CP_CHECKPOINT)   # atomic — never leaves a truncated checkpoint
 
         tmp_progress = _CP_PROGRESS + ".tmp"
-        with open(tmp_progress, "w") as f:
+        with open(tmp_progress, "w", encoding="utf-8") as f:
             f.write(f"{chunk_i + 1},{n_baskets_total},{n_products_cp}")
         os.replace(tmp_progress, _CP_PROGRESS)   # atomic — never leaves an empty/truncated progress file
 
@@ -363,7 +363,7 @@ def main():
     # instead of spending hours rebuilding an identical matrix (see the reuse
     # check above). Written AFTER the .npz so a crash between the two leaves the
     # matrix un-reusable rather than reusable-and-wrong.
-    with open(_CP_FINAL_META, "w") as f:
+    with open(_CP_FINAL_META, "w", encoding="utf-8") as f:
         json.dump(_cp_fingerprint, f)
     with open(os.path.join(OUTPUT_DIR, "product_id_to_index.pkl"), "wb") as f:
         pickle.dump(product_id_to_index, f)

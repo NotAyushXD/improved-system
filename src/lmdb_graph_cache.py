@@ -97,7 +97,7 @@ def _manifest_matches(manifest_path: str, expected: dict) -> bool:
     if not os.path.exists(manifest_path):
         return False
     try:
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             saved = json.load(f)
     except (OSError, json.JSONDecodeError):
         return False
@@ -106,7 +106,7 @@ def _manifest_matches(manifest_path: str, expected: dict) -> bool:
 
 def _write_manifest(manifest_path: str, manifest: dict):
     tmp_path = manifest_path + ".tmp"
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f)
     os.replace(tmp_path, manifest_path)   # atomic — never leaves a truncated manifest
 

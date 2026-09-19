@@ -96,7 +96,9 @@ def check_no_theme_identifiers():
             all_violations.append(f"{fname}: MISSING — expected to exist and be theme-free")
             continue
 
-        tree = ast.parse(path.read_text())
+        # Explicit encoding: these source files contain box-drawing characters
+        # and em dashes, and a locale-default read fails on Windows (cp1252).
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if BANNED_SUBSTRING in node.name.lower():
@@ -241,12 +243,18 @@ def check_config():
     # A .env file is actually read, and a real env var beats it.
     with tempfile.TemporaryDirectory() as td:
         env_path = Path(td) / "t.env"
+        # Non-ASCII on purpose: the shipped .env is full of box-drawing
+        # characters, and reading it with the locale default (cp1252 on a
+        # Western-European Windows box) raised UnicodeDecodeError. Keeping a
+        # non-ASCII byte in this fixture means a regression to a
+        # locale-default read fails here rather than in production.
         env_path.write_text(
-            '# comment line\n'
+            '# comment line — with an em dash and a box char │\n'
             'PIPELINE_EPOCHS=77\n'
             'PIPELINE_TOP_K=12   # trailing comment must be stripped\n'
             'PIPELINE_GMM_COVARIANCE="full"\n'
-            'PIPELINE_TRANSITION_MAX_WEEK_GAP=none\n'
+            'PIPELINE_TRANSITION_MAX_WEEK_GAP=none\n',
+            encoding="utf-8",
         )
         env = dict(_os.environ)
         env["PIPELINE_ENV_FILE"] = str(env_path)
@@ -282,7 +290,7 @@ def check_config():
     # parameter exists but nobody can discover it.
     example = Path("../.env.example")
     try:
-        example_text = example.read_text()
+        example_text = example.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         example_text = None
         ok = _fail("../.env.example is missing — it is the only documentation of these keys")
