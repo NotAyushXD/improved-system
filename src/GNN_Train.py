@@ -150,6 +150,14 @@ def train_and_embed(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
+    # Weight init, dropout masks and DataLoader shuffling all draw from torch's
+    # global RNG, which was previously left unseeded — so two runs on identical
+    # data produced different models, and a lost checkpoint could never be
+    # reconstructed. Seeding makes a retrain reproducible, which is what turns
+    # "the model file was lost" from unrecoverable into merely annoying.
+    torch.manual_seed(config.SEED)
+    np.random.seed(config.SEED)
+
     # ── Step 1: Prepare globals ──
     print("[ 1 / 4 ] Preparing globals...")
     G = prepare_globals(
@@ -244,6 +252,27 @@ def train_and_embed(
     # to disk — see GraphBuilder.run_inference. A crash partway through
     # resumes from whatever chunks are still pending/stale rather than
     # starting over (single-process only — see basket_store.claim_next_chunk).
+    # ── Save model BEFORE inference ──
+    # This used to happen AFTER run_inference() returned, which quietly
+    # defeated the whole point of making inference restartable. Inference over
+    # a full basket population takes hours-to-days; if the process died (or was
+    # stopped to apply a fix) at any point during it, the trained weights —
+    # which existed only in this process's memory — were lost for good. Every
+    # chunk already embedded then became an orphan: its embeddings came from a
+    # model that no longer exists and, with no torch seed set, cannot be
+    # reproduced by retraining. The chunk queue would happily "resume", but the
+    # remaining chunks would be embedded by DIFFERENT weights than the
+    # completed ones, silently mixing two incompatible embedding spaces into
+    # one clustering.
+    #
+    # Saving here makes the restartability real: the weights survive the
+    # process, so a killed run genuinely resumes where it left off.
+    model_path = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"\nModel saved to {model_path} BEFORE inference — a crash or stop "
+          f"during the (long) inference pass can now resume against these exact "
+          f"weights instead of losing them.")
+
     print("\n[ Inference ] Embedding all baskets via full GNN encoding "
           "(restartable, chunked from DuckDB)...")
     run_inference(
@@ -251,10 +280,6 @@ def train_and_embed(
         worker_id=worker_id,
     )
     basket_gnn_embeddings = merge_inference_output(dataset_tag, output_dir=OUTPUT_DIR)
-
-    # ── Save model ──
-    model_path = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
-    torch.save(model.state_dict(), model_path)
 
     print("\nDone. Saved:")
     print(f"  {os.path.join(OUTPUT_DIR, 'basket_gnn_embeddings.parquet')}  "

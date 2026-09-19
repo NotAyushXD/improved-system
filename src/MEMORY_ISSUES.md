@@ -1,16 +1,27 @@
-# Memory issues in this pipeline — what broke, and how it was fixed
+# Memory and speed issues in this pipeline — what broke, and how it was fixed
 
 This document walks through every stage of the pipeline where we hit (or
 could have hit) an out-of-memory problem, in the order those stages
-actually run. The short version of the whole story: **almost every issue
-here came from the same root cause** — holding the entire population of
-baskets (tens of millions of rows at real scale) as one object in Python's
-memory for the whole script. Each fix either shrank what's held at a given
-moment, moved the data somewhere that isn't Python's memory (disk,
-DuckDB, LMDB), or removed a redundant copy of something already large.
+actually run — and then, at the end, the one place where the pipeline ran
+out of *time* rather than memory. The short version of the memory story:
+**almost every issue there came from the same root cause** — holding the
+entire population of baskets (tens of millions of rows at real scale) as
+one object in Python's memory for the whole script. Each fix either shrank
+what's held at a given moment, moved the data somewhere that isn't Python's
+memory (disk, DuckDB, LMDB), or removed a redundant copy of something
+already large.
 
 No fix ever reduced the amount of data used or the quality of the model —
 every fix is an engineering/storage change, not a data-reduction one.
+
+**Read this part too:** the speed section near the end
+([Stage 1 — Inference was going to take nine days](#stage-1--inference-was-going-to-take-nine-days))
+is not a separate topic. That slowdown was *caused by* one of the memory
+fixes below (#4). Solving a memory problem by doing a small piece of work
+per basket is correct — but it moves the cost from "how much RAM do we
+need" to "how fast is that small piece of work", and at 57 million baskets
+a millisecond in the wrong place is a fortnight of wall clock. The two
+concerns are the same story told twice.
 
 ---
 
@@ -208,17 +219,169 @@ Nothing resembling the full list of IDs ever gets built as a Python object.
 
 ---
 
+---
+
+# Speed — when the pipeline ran out of time instead of memory
+
+Everything above is about not running out of RAM. This section is about the
+one place where the pipeline fit in memory perfectly well and simply would
+not finish.
+
+---
+
+## Stage 1 — Inference was going to take nine days
+
+**Problem:** Embedding every basket (the restartable chunked step, #7 above)
+was measured on real data at roughly **17.4 minutes per 50,000-basket
+chunk**. That works out to about **21 milliseconds per basket**. Across a
+population of 57.1 million baskets, that's ~1,143 chunks and roughly **9 to
+10 days of continuous running** on a CPU machine.
+
+Nothing was crashing. Memory was fine. It was just never going to finish in
+a sensible amount of time.
+
+21 milliseconds is a suspicious number, and that's what made this findable.
+The actual work per basket is tiny — build a graph of a few dozen products
+and push it through a small model. The model part takes microseconds. So the
+time had to be going somewhere that had nothing to do with the model.
+
+**Cause — and it came from one of the memory fixes above.** Fix #4 solved a
+100GB+ memory problem by giving each basket its own small slice of the
+co-purchase table instead of building one giant shared one. That was the
+right call, and it stays. But *the way* that slice was being taken was
+quietly doing enormous amounts of unnecessary work:
+
+> To get the co-purchase numbers for the ~30 products in one basket, the
+> code asked for those 30 **rows** of the big co-purchase table, and only
+> then narrowed down to the 30 **columns** it wanted.
+>
+> The catch is what a "row" contains. The row for a popular product — milk,
+> bread, bananas — lists every other product it has *ever* been bought
+> alongside, which at a 200,000-product catalog is a very large fraction of
+> the catalog. So the code was copying out hundreds of thousands of numbers
+> per product, for every product in the basket, in order to keep 900 of them
+> (30 × 30) and throw the rest away.
+>
+> Then it did that again for the next basket. 57 million times.
+
+**Fix:** Stop reading whole rows. Each row's entries are stored in sorted
+order, so instead of copying the row and filtering it, the code now
+**looks up** just the handful of products it actually needs — the same way
+you'd find a word in a dictionary by opening it near the right letter
+rather than reading every page from the start.
+
+The cost of this no longer depends on how popular the products in the basket
+are. A basket containing milk now costs the same as one containing an
+obscure item, which was emphatically not true before.
+
+**Why you can trust it on a half-finished run.** This is the important part.
+A long inference run was already 370 chunks in — several days of compute
+that nobody wanted to redo. A "faster" version that produced even slightly
+different numbers would have made those 370 chunks inconsistent with
+everything after them, and the only safe response would have been to start
+over.
+
+So the replacement was checked to be **exactly identical**, not
+approximately identical:
+
+- compared against the original implementation across **3,000 randomly
+  generated co-purchase matrices** of varying size and density — every
+  single value matched
+- plus the awkward edge cases on purpose: products that co-occur with
+  nothing at all, baskets of one product, the very first and very last
+  product in the catalog, and baskets containing the entire catalog
+- the same comparison is now a permanent test
+  (`test_pipeline.py`, graph-primitives group), so a future change to this
+  function can't silently alter results
+- and `benchmark_inference.py` re-runs the comparison against **your real
+  co-purchase matrix and your real baskets** before you rely on it
+
+Because the numbers are identical, a half-finished run just **resumes**. The
+chunk queue skips the chunks already marked complete; the one that was
+interrupted mid-flight goes back in the queue and is redone.
+
+**One supporting change.** The new lookup relies on each row's entries being
+sorted and free of duplicates. That's normally already true of how the
+co-purchase matrix is built, but "normally" isn't good enough when the
+failure mode is silently reading *wrong* co-purchase numbers into every node
+and edge in the pipeline. So `prepare_globals()` now explicitly guarantees
+it. Both calls are no-ops when the matrix is already in that form, and
+neither copies the matrix — so this costs nothing in the normal case and
+removes an entire class of silent-corruption risk.
+
+**How to check what this is actually worth on your data.** The speedup
+depends on how dense your co-purchase matrix is — specifically, the average
+number of entries per product row, which is exactly what the old code was
+copying. That number is a property of your data, not something that can be
+predicted from here. So rather than quoting a figure:
+
+```
+cd src
+python benchmark_inference.py --remaining-baskets <however many you have left>
+```
+
+It runs in about two minutes and reports three things: whether old and new
+agree element-for-element on your matrix, a per-basket cost breakdown of
+each stage (slice extraction, graph building, model), and a projected wall
+clock for the baskets you have left — single-process and with parallel
+workers.
+
+---
+
+## Stage 2 — Still open: clustering at 57 million baskets
+
+This one is **not fixed**, and is flagged here so it isn't discovered the
+hard way after a long inference run finally completes.
+
+**Problem:** The memory fixes above all concern getting *to* the basket
+embeddings. Stage 2 then has to cluster them, and at 57 million baskets the
+arithmetic is uncomfortable on a memory-constrained CPU machine:
+
+| what | rough size at 57M baskets |
+|---|---|
+| the embeddings themselves | ~15 GB |
+| ...while being normalised (makes a copy) | ~29 GB at peak |
+| the nearest-neighbour graph | a few hundred million connections, several GB as a table, more once handed to the clustering library |
+| GMM's internal working array | ~14 GB **per iteration**, and it runs many iterations, three times over |
+
+The nearest-neighbour search itself is already handled (#9 — an approximate
+method built for this scale), and the code prints the graph size before
+clustering so it shows up as a number rather than a silent crash. But the
+normalisation copy and the GMM working array are new at this volume.
+
+**The likely fix, not yet implemented:** cluster a sample rather than the
+whole population, then assign everything else. Fit Leiden and GMM on a few
+million baskets, then label the remaining tens of millions by asking which
+already-found group each one falls nearest to. Both halves of this already
+exist in the codebase — it's exactly what `score_new_baskets.py` does for
+newly arriving baskets (`assign_new_baskets_to_clusters` for the Leiden
+side, the saved GMM model's own prediction for the other). What's missing is
+wiring that path into the main run so the full population never has to be
+clustered in one go.
+
+This turns an intractable 57-million-point clustering into a tractable
+few-million-point one plus a cheap streaming assignment pass, and it is the
+next thing to build.
+
+---
+
 ## The one-sentence summary
 
-Every fix here follows the same idea: **don't build the whole thing in
-Python memory just because you eventually need to look at all of it.**
+Every memory fix here follows the same idea: **don't build the whole thing
+in Python memory just because you eventually need to look at all of it.**
 Stream it in pieces, store it somewhere disk-backed (DuckDB, LMDB, plain
 files) that's built for handling more data than fits in RAM, and only ever
 pull a small, bounded piece into Python at any one time.
 
+And the speed fix adds the natural follow-on: **once you're doing a small
+piece of work per basket, make sure that small piece is actually small.**
+Doing per-item work is what keeps memory flat — but it also means the cost
+of that one item gets multiplied by tens of millions, so anything wasteful
+hiding inside it stops being a rounding error and becomes the whole runtime.
+
 ---
 
-## Summary table
+## Summary table — memory
 
 | # | Stage | Where the issue was | Main solution | File(s) changed |
 |---|---|---|---|---|
@@ -232,3 +395,22 @@ pull a small, bounded piece into Python at any one time.
 | 8 | Stage 1 | Duplicate full-size copy of the co-purchase matrix | Removed the redundant whole-matrix copy | `GraphBuilder.py` (`prepare_globals`) |
 | 9 | Stage 2 | Nearest-neighbor search across all basket embeddings | Use an approximate method (`pynndescent`), confirmed active; log graph size before clustering | `cluster_basket_embeddings.py` (`build_basket_knn_graph`) |
 | 10 | Scoring | Checking new baskets against every previously-scored basket ID | Compare inside the database (anti-join), never build a Python set of all IDs | `score_new_baskets.py`, `basket_store.py` (`exclude_existing_basket_ids`) |
+
+---
+
+## Summary table — speed
+
+| # | Stage | Where the issue was | Main solution | File(s) changed |
+|---|---|---|---|---|
+| 11 | Stage 1 | Embedding every basket: ~21 ms per basket → **~9-10 days** for 57.1M baskets. Taking a basket's slice of the co-purchase table read *entire rows* first (hundreds of thousands of entries for popular products) to keep 900 of them. A direct consequence of memory fix #4. | Look up only the needed entries by binary search over each row's sorted indices, instead of copying the row and filtering. Cost no longer scales with product popularity. Verified **bit-identical** over 3,000 random matrices + edge cases, so a part-finished run resumes instead of restarting. | `GraphBuilder.py` (`_basket_dense_cp_submatrix`) |
+| 12 | Stage 1 | The new lookup needs each row's indices sorted and de-duplicated — usually already true, but a silent wrong-answer risk if ever not | `prepare_globals()` now guarantees canonical form explicitly. No-op when already canonical; no matrix copy either way | `GraphBuilder.py` (`prepare_globals`) |
+| — | Stage 1 | No way to tell where per-basket time was going, or to confirm a "faster" version returns the same numbers on real data | Added a benchmark that reports old-vs-new equivalence, a per-stage cost breakdown, and a projected wall clock for the baskets remaining | `benchmark_inference.py` (new) |
+
+---
+
+## Known and still open
+
+| Stage | Issue | Status |
+|---|---|---|
+| Stage 2 | Clustering 57M embeddings: ~29 GB peak during normalisation, ~14 GB per GMM iteration, several GB for the neighbour graph | **Not fixed.** Likely approach — cluster a few-million-basket sample, then assign the rest using the already-existing `assign_new_baskets_to_clusters` / saved-GMM prediction path. Next thing to build. |
+| Stage 1 | Multi-process inference would cut wall clock further, but each worker needs its own copy of the embedding matrix and co-purchase matrix | **Not built.** Viable on Linux/macOS, where `fork` shares those pages copy-on-write. On Windows each worker gets a full copy, which may not fit — check the platform before launching workers. |

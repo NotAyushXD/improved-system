@@ -120,6 +120,7 @@ Run:  python pipeline_main.py [--worker-id NAME]
 """
 
 import argparse
+import json
 import os
 import pickle
 import gc
@@ -243,11 +244,43 @@ def main():
 
     _CP_CHECKPOINT = os.path.join(OUTPUT_DIR, "copurchase_sparse.checkpoint.npz")
     _CP_PROGRESS   = os.path.join(OUTPUT_DIR, "copurchase_sparse.progress.txt")
+    _CP_FINAL      = os.path.join(OUTPUT_DIR, "copurchase_sparse.npz")
+    _CP_FINAL_META = os.path.join(OUTPUT_DIR, "copurchase_sparse.meta.json")
+
+    # ── Reuse a COMPLETED co-purchase matrix from a previous run ──
+    # The in-progress checkpoint is deleted once the build finishes, so a
+    # rerun used to rebuild this from scratch even though copurchase_sparse.npz
+    # was sitting right there — hours of recomputation for nothing. That matters
+    # far more than it looks: a run that dies during the (much longer) inference
+    # pass has to come back through this stage first.
+    # The .meta.json sidecar records what the saved matrix was built FROM, so a
+    # changed export or basket definition rebuilds instead of silently reusing a
+    # matrix that no longer matches the data.
+    _cp_fingerprint = {"n_baskets": int(n_baskets_total), "n_products": int(n_products_cp)}
+    copurchase_sparse = None
+    if os.path.exists(_CP_FINAL) and os.path.exists(_CP_FINAL_META):
+        try:
+            with open(_CP_FINAL_META) as f:
+                saved_meta = json.load(f)
+        except (OSError, ValueError):
+            saved_meta = None
+        if saved_meta == _cp_fingerprint:
+            print(f"  Reusing completed co-purchase matrix from {_CP_FINAL} "
+                  f"(n_baskets={n_baskets_total:,}, n_products={n_products_cp:,} both match) "
+                  f"— skipping the rebuild. Delete that file to force a fresh build.")
+            copurchase_sparse = sp.load_npz(_CP_FINAL).tocsr()
+            print(f"  Loaded: nnz={copurchase_sparse.nnz:,}")
+        else:
+            print(f"  {_CP_FINAL} exists but was built for {saved_meta} while this run has "
+                  f"{_cp_fingerprint} — rebuilding rather than reusing a mismatched matrix.")
 
     n_chunks = (n_baskets_total + COPURCHASE_CHUNK_BASKETS - 1) // COPURCHASE_CHUNK_BASKETS
 
     start_chunk = 0
-    if os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
+    if copurchase_sparse is not None:
+        # Loaded complete from the previous run above — skip the whole build.
+        start_chunk = n_chunks
+    elif os.path.exists(_CP_CHECKPOINT) and os.path.exists(_CP_PROGRESS):
         try:
             _progress_fields = open(_CP_PROGRESS).read().split(",")
             _ckpt_chunk = int(_progress_fields[0])
@@ -325,7 +358,13 @@ def main():
     # these names. Save them now while they're in scope. No product_theme to
     # save — that concept doesn't exist in this pipeline.
     print("Saving inference-time artifacts (needed later to score new baskets)...")
-    sp.save_npz(os.path.join(OUTPUT_DIR, "copurchase_sparse.npz"), copurchase_sparse.tocsr())
+    sp.save_npz(_CP_FINAL, copurchase_sparse.tocsr())
+    # Sidecar recording what this matrix was built from, so a rerun can reuse it
+    # instead of spending hours rebuilding an identical matrix (see the reuse
+    # check above). Written AFTER the .npz so a crash between the two leaves the
+    # matrix un-reusable rather than reusable-and-wrong.
+    with open(_CP_FINAL_META, "w") as f:
+        json.dump(_cp_fingerprint, f)
     with open(os.path.join(OUTPUT_DIR, "product_id_to_index.pkl"), "wb") as f:
         pickle.dump(product_id_to_index, f)
     with open(os.path.join(OUTPUT_DIR, "product_units_avg.pkl"), "wb") as f:
