@@ -176,22 +176,6 @@ one basket at a time, never the full catalog-wide matrix at once.
 
 ## 4. THE KEY PART: how one basket becomes a graph
 
-⚠️ **There are two different graphs in this pipeline — don't conflate them.**
-This section is about the FIRST one only:
-
-| | Graph #1 — this section (§4) | Graph #2 — later (§6) |
-|---|---|---|
-| One graph per... | **basket** (a new graph for every single basket) | the *whole population* (just one graph, built once) |
-| Node = | **product** (as it appears in that basket) | **basket** (represented by its 64-dim embedding) |
-| Edge = | co-purchase count between 2 products | embedding similarity between 2 baskets |
-| Feeds | the GNN → produces one 64-dim vector per basket | Leiden → produces a need-state cluster label |
-| Lifespan | transient — built, encoded, discarded per basket | built once, over every basket's embedding |
-
-So "one graph per basket" means **the basket is the unit that gets its own
-graph, not a node inside one** — the products inside it are that graph's
-nodes. A basket only becomes a node itself later, in the second, different
-graph (§6) used for clustering.
-
 This is `GraphBuilder.build_one_graph()` — called once per basket, identically
 during training and scoring. Take the basket above: `[MILK, BREAD, EGGS, BUTTER]`.
 
@@ -387,9 +371,6 @@ cluster over next.
 ---
 
 ## 6. Basket embeddings → need-states
-
-This is **Graph #2** from §4's disambiguation table — a different graph
-from the per-basket product graphs above. Here, **each basket is one node**.
 
 Every basket now has one 64-dim vector. Two independent clustering passes
 run over these vectors (not over products, not over raw baskets):

@@ -41,25 +41,26 @@ import joblib
 from sklearn.preprocessing import normalize, minmax_scale
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import adjusted_rand_score
+import config
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
-BASKET_KNN_K       = 15     # neighbors per basket before mutual-kNN filtering
-USE_MUTUAL_KNN     = True   # an edge only counts if BOTH baskets rank each other in top-K
-LEIDEN_RESOLUTION  = 1.0    # starting point — sweep before trusting this, see sweep_resolution()
-SAMPLE_SEED        = 42
+BASKET_KNN_K       = config.BASKET_KNN_K   # neighbors per basket before mutual-kNN filtering
+USE_MUTUAL_KNN     = config.USE_MUTUAL_KNN # an edge only counts if BOTH baskets rank each other in top-K
+LEIDEN_RESOLUTION  = config.LEIDEN_RESOLUTION  # starting point — sweep before trusting, see sweep_resolution()
+SAMPLE_SEED        = config.SEED
 
 # GMM defaults — placeholders, see module docstring above
-GMM_K_MIN          = 5
-GMM_K_MAX          = 60
-GMM_K_STEP         = 5
-GMM_N_INIT         = 3
-GMM_COVARIANCE     = "diag"   # "diag" scales to more dimensions than "full" without blowing up
+GMM_K_MIN          = config.GMM_K_MIN
+GMM_K_MAX          = config.GMM_K_MAX
+GMM_K_STEP         = config.GMM_K_STEP
+GMM_N_INIT         = config.GMM_N_INIT
+GMM_COVARIANCE     = config.GMM_COVARIANCE   # "diag" scales to more dimensions than "full"
 
 # All pipeline-produced artifacts land here, not the working directory.
-OUTPUT_DIR         = "../data/output"
+OUTPUT_DIR         = config.OUTPUT_DIR
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 GMM_MODEL_PATH     = os.path.join(OUTPUT_DIR, "gmm_basket_model.pkl")   # fitted model, reloaded by score_new_baskets.py
@@ -266,7 +267,7 @@ def assign_new_baskets_to_clusters(
     new_embeddings: pd.DataFrame,
     reference_embeddings: pd.DataFrame,
     reference_clusters: pd.DataFrame,
-    k: int = 15,
+    k: int = None,
 ) -> pd.DataFrame:
     """
     Leiden is transductive — it has no native way to place a brand-new point
@@ -292,6 +293,7 @@ def assign_new_baskets_to_clusters(
         (cluster_confidence = fraction of the k neighbors that agreed on the
         assigned cluster — low values flag baskets sitting between need-states)
     """
+    k = k if k is not None else config.ASSIGN_NEW_BASKET_K
     ref = reference_embeddings.merge(
         reference_clusters[["basket_id", "need_state_cluster"]], on="basket_id", how="inner"
     )

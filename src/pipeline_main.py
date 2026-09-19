@@ -126,6 +126,7 @@ import gc
 
 import numpy as np
 import pandas as pd
+import joblib
 import scipy.sparse as sp
 from scipy.sparse import csr_matrix
 
@@ -134,18 +135,22 @@ import duckdb_manager
 import basket_store
 from GNN_Train import train_and_embed
 from cluster_basket_embeddings import (
-    cluster_basket_embeddings,
+    build_basket_knn_graph,
+    run_leiden_on_basket_graph,
     cluster_basket_embeddings_gmm,
     compare_leiden_gmm,
+    GMM_MODEL_PATH,
 )
+import need_state_graph
+import config
 
 # Drop degenerate 1-item baskets.
-MIN_BASKET_PRODUCTS = 2
+MIN_BASKET_PRODUCTS = config.MIN_BASKET_PRODUCTS
 
 # Placeholder K for GMM — replace with your real best_k_value.py logic once
 # shared. cluster_basket_embeddings.select_k_via_bic() sweeps a range and
 # reports BIC/AIC per K if you want to eyeball it first.
-GMM_N_COMPONENTS = 30
+GMM_N_COMPONENTS = config.GMM_N_COMPONENTS
 
 # Co-purchase matrix is built in row-chunks of this many baskets at a time,
 # with the running result checkpointed to disk after every chunk. This
@@ -156,22 +161,22 @@ GMM_N_COMPONENTS = 30
 # disjoint basket_seq range from the DuckDB baskets table).
 # Lower this if you still see memory pressure; raise it for fewer, faster
 # chunks once you've confirmed headroom.
-COPURCHASE_CHUNK_BASKETS = 500_000
+COPURCHASE_CHUNK_BASKETS = config.COPURCHASE_CHUNK_BASKETS
 
 # Chunk size for the restartable inference pass over the full basket
 # population (see GraphBuilder.run_inference) — independent of the
 # co-purchase chunk size above.
-INFERENCE_CHUNK_BASKETS = 50_000
+INFERENCE_CHUNK_BASKETS = config.INFERENCE_CHUNK_BASKETS
 
 # All pipeline-produced artifacts (caches, models, embeddings, cluster
 # output) live under this one folder — nothing gets written to the working
 # directory. Input SQL exports you downloaded by hand stay under data/
 # directly (they're inputs, not outputs of this script).
-OUTPUT_DIR = "../data/output"
+OUTPUT_DIR = config.OUTPUT_DIR
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-PRODUCT_EMBEDDINGS_PARQUET  = os.path.join(OUTPUT_DIR, "product_embeddings.parquet")
-HOUSEHOLD_TPNB_WEEK_PARQUET = "../data/ns_household_tpnb_week_agg_train"
+PRODUCT_EMBEDDINGS_PARQUET  = config.out("product_embeddings.parquet")
+HOUSEHOLD_TPNB_WEEK_PARQUET = config.HOUSEHOLD_TPNB_WEEK_TRAIN
 
 
 def main():
@@ -214,10 +219,10 @@ def main():
           "export directly from its parquet files — never held as one Python object, "
           "no separate load step needed)...")
     n_baskets_total, product_units_avg, product_uniques = basket_store.build_baskets_table(
-        con, HOUSEHOLD_TPNB_WEEK_PARQUET, "train", min_basket_products=MIN_BASKET_PRODUCTS,
+        con, HOUSEHOLD_TPNB_WEEK_PARQUET, config.TRAIN_DATASET_TAG, min_basket_products=MIN_BASKET_PRODUCTS,
     )
 
-    BASKET_COUNT_WARN_THRESHOLD = 2_000_000
+    BASKET_COUNT_WARN_THRESHOLD = config.BASKET_COUNT_WARN_THRESHOLD
     if n_baskets_total > BASKET_COUNT_WARN_THRESHOLD:
         print(f"  NOTE: {n_baskets_total:,} baskets — this now lives in DuckDB, not Python "
               f"memory, so basket count alone no longer risks an OOM crash the way it used "
@@ -347,7 +352,15 @@ def main():
     # ─────────────────────────────────────────────
 
     print("\n[Stage 2a] Leiden clustering...")
-    leiden_clusters = cluster_basket_embeddings(basket_gnn_embeddings)
+    # Called as two steps rather than via cluster_basket_embeddings(), which
+    # builds `edges` internally and then drops it on return. The basket-level
+    # edge list IS the cross-need-state structure — every edge whose endpoints
+    # land in different communities is a boundary between two need-states — and
+    # Stage 2.5 below needs it. Same graph, same Leiden call, same result;
+    # the edge list just stays in scope now.
+    basket_edges   = build_basket_knn_graph(basket_gnn_embeddings)
+    leiden_clusters = run_leiden_on_basket_graph(basket_edges)
+    print(f"\nNeed-state clusters found: {leiden_clusters['need_state_cluster'].nunique()}")
 
     print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
     gmm_clusters = cluster_basket_embeddings_gmm(basket_gnn_embeddings, n_components=GMM_N_COMPONENTS)
@@ -363,6 +376,24 @@ def main():
     need_state_clusters.to_parquet(need_state_clusters_path, index=False)
     print(f"  Saved {need_state_clusters_path} ({len(need_state_clusters):,} rows, "
           f"columns: need_state_cluster [Leiden], need_state_cluster_gmm [GMM])")
+
+    # ─────────────────────────────────────────────
+    # Stage 2.5: need-state GRAPHS — how need-states relate to each other
+    # ─────────────────────────────────────────────
+    # Stage 2 produces need-state LABELS. This produces the EDGES between
+    # need-states, which the pipeline previously computed and discarded. Two
+    # different edge sets, for two different questions (see need_state_graph.py):
+    #   adjacency  — which need-states border each other (undirected, static)
+    #   transitions — where households actually go next (directed, time-ordered)
+    # Only the second can answer "what journey can this customer take".
+    print("\n[Stage 2.5] Building need-state graphs...")
+    _gmm_model = joblib.load(GMM_MODEL_PATH) if os.path.exists(GMM_MODEL_PATH) else None
+    need_state_graph.build_and_save_all(
+        edges                 = basket_edges,
+        leiden_clusters       = leiden_clusters,
+        basket_gnn_embeddings = basket_gnn_embeddings,
+        gmm                   = _gmm_model,
+    )
 
     # ─────────────────────────────────────────────
     # Stage 3: reload into your warehouse (manual)

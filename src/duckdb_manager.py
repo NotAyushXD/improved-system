@@ -27,10 +27,11 @@ Python process (unlike psycopg2, where reconnecting per call was cheap).
 """
 
 import os
+import config
 
 # Overridable via an env var for the same reason pg_manager.py's PGDATA_DIR
 # was — in case the default location ever needs to move.
-DB_PATH = os.environ.get("PIPELINE_DUCKDB_PATH") or os.path.join("..", "data", "pipeline.duckdb")
+DB_PATH = config.DUCKDB_PATH
 
 _con = None  # module-level singleton — one shared connection per process
 

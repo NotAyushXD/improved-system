@@ -65,13 +65,14 @@ import numba
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
+import config
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
-TOP_K               = 10
-SEED                 = 42
+TOP_K                = config.TOP_K
+SEED                 = config.SEED
 
 # Bumped any time build_one_graph()'s feature/edge layout changes (the same
 # class of change that moved in_dim from D+5 to D+4). Compared against a
@@ -83,7 +84,7 @@ GRAPH_BUILDER_VERSION = 2
 # All pipeline-produced artifacts (caches, models, embeddings) live under
 # this folder rather than scattered in the working directory. Created here
 # so any of this module's write sites can assume it already exists.
-OUTPUT_DIR           = "../data/output"
+OUTPUT_DIR           = config.OUTPUT_DIR
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Global product sub-clustering (whole catalog, no theme/category
@@ -92,10 +93,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # your catalog size; a few hundred products call for a small handful of
 # candidates near the low end, a few hundred thousand call for something
 # like what's here.
-SUBCL_K_CANDIDATES   = [50, 100, 200, 400]
-SUBCL_N_INIT         = 5
-SUBCL_BATCH_SIZE      = 4096
-SUBCL_SIL_SAMPLE      = 5000   # silhouette evaluated on a sample, not the whole catalog
+SUBCL_K_CANDIDATES   = config.SUBCL_K_CANDIDATES
+SUBCL_N_INIT         = config.SUBCL_N_INIT
+SUBCL_BATCH_SIZE      = config.SUBCL_BATCH_SIZE
+SUBCL_SIL_SAMPLE      = config.SUBCL_SIL_SAMPLE   # silhouette evaluated on a sample, not the whole catalog
 SUBCL_CACHE_PATH      = os.path.join(OUTPUT_DIR, "product_subclusters.pkl")  # cached after first run
 
 
@@ -254,10 +255,28 @@ def build_product_subclusters(product_embedding):
     product_distinctiveness: dict  tpnb -> float [0,1]
     best_k                  : int  (for reference/logging)
     """
+    # Fingerprint guard. This cache used to be keyed by FILENAME ALONE and
+    # reused as-is on any future run — pipeline_main.py printed a warning
+    # about it and relied on the operator to delete the file by hand. Now that
+    # SUBCL_* and SEED are env-tunable (config.py), that is no longer good
+    # enough: changing a value in .env would silently reuse sub-clusters built
+    # under the old settings. The fingerprint is stored inside the cache and
+    # compared here, so a settings change rebuilds automatically.
+    expected_fp = config.subcluster_fingerprint()
     if os.path.exists(SUBCL_CACHE_PATH):
         print(f"  Loading cached product sub-clusters from {SUBCL_CACHE_PATH}...")
         try:
-            return joblib.load(SUBCL_CACHE_PATH)
+            cached = joblib.load(SUBCL_CACHE_PATH)
+            if isinstance(cached, dict) and cached.get("fingerprint") == expected_fp:
+                return cached["product_subcluster"], cached["product_distinctiveness"], cached["best_k"]
+            if isinstance(cached, dict):
+                print(f"  IGNORING cached sub-clusters: built with "
+                      f"{cached.get('fingerprint')}, this run wants {expected_fp} — "
+                      f"rebuilding rather than mixing settings.")
+            else:
+                print(f"  IGNORING cached sub-clusters at {SUBCL_CACHE_PATH}: written by an "
+                      f"older version with no fingerprint, so what settings produced it "
+                      f"cannot be verified. Rebuilding from scratch.")
         except Exception as e:
             print(f"  Cached file exists but failed to load ({type(e).__name__}: {e}) — "
                   f"treating it as stale and rebuilding from scratch.")
@@ -294,9 +313,17 @@ def build_product_subclusters(product_embedding):
         product_distinctiveness[t] = float(distinctiveness[i])
 
     result = (product_subcluster, product_distinctiveness, best_k)
+    # Stored as a dict carrying the fingerprint, so the loader above can tell
+    # what settings produced it rather than trusting the filename.
+    payload = {
+        "fingerprint": expected_fp,
+        "product_subcluster": product_subcluster,
+        "product_distinctiveness": product_distinctiveness,
+        "best_k": best_k,
+    }
     tmp_path = SUBCL_CACHE_PATH + ".tmp"
     try:
-        joblib.dump(result, tmp_path, compress=0)
+        joblib.dump(payload, tmp_path, compress=0)
         os.replace(tmp_path, SUBCL_CACHE_PATH)   # atomic — never leaves a truncated file
     except Exception:
         if os.path.exists(tmp_path):
@@ -364,6 +391,19 @@ def prepare_globals(product_embedding, product_id_to_index,
     print("  Using co-purchase matrix as CSR (no whole-matrix dtype copy)...")
     csr = copurchase_sparse.tocsr()
 
+    # _basket_dense_cp_submatrix() binary-searches each row's column indices,
+    # which requires them SORTED and DE-DUPLICATED. tocsr() normally produces
+    # that already, so both calls below are usually no-ops — but "usually" is
+    # not good enough when the failure mode is silently reading the wrong
+    # co-purchase counts into every node feature and edge in the pipeline.
+    # Both operate in place; neither copies the matrix.
+    if not csr.has_canonical_format:
+        print("  Normalising co-purchase matrix to canonical CSR "
+              "(sorted, de-duplicated indices) — required by the per-basket "
+              "submatrix lookup...")
+        csr.sum_duplicates()
+    csr.sort_indices()
+
     return dict(
         emb_matrix          = emb_matrix,
         emb_dim             = emb_dim,
@@ -409,15 +449,59 @@ def prepare_globals(product_embedding, product_id_to_index,
 # ─────────────────────────────────────────────
 
 def _basket_dense_cp_submatrix(products, csr, pid2idx):
+    """
+    Extracts the (n x n) co-purchase submatrix for ONE basket's products.
+
+    PERFORMANCE — this is the hottest function in the pipeline; it runs once
+    per basket, so at 57M baskets a millisecond here is 16 hours of wall clock.
+
+    The previous implementation was:
+
+        csr[global_idx_arr][:, global_idx_arr].todense()
+
+    which is correct but pathologically slow at catalog scale. `csr[rows]`
+    materialises the ENTIRE rows first — every nonzero in them — and only then
+    does `[:, cols]` narrow to the basket's own products. A row for a popular
+    product (milk, bread) co-occurs with a large fraction of the catalog, so a
+    single row can carry 100k+ nonzeros; a 30-item basket therefore copied
+    millions of entries to keep 900 of them. Measured at ~20ms per basket,
+    which is ~9 days of inference over a 57M-basket population.
+
+    This version instead binary-searches each row's sorted column indices for
+    just the basket's own products: n searchsorted calls over n targets each,
+    independent of how many nonzeros the row actually has. Same numbers, same
+    dtype, same zeros — see test_pipeline.check_graph_primitives(), which
+    asserts the two implementations agree exactly.
+
+    REQUIRES canonical CSR (sorted, de-duplicated column indices per row).
+    prepare_globals() guarantees that via sum_duplicates()/sort_indices().
+    """
     global_idx_arr = np.array(
         sorted({pid2idx[p] for p in products if p in pid2idx}), dtype=np.int64
     )
-    if len(global_idx_arr) == 0:
+    n = len(global_idx_arr)
+    if n == 0:
         return {}, np.zeros((0, 0), dtype=np.float32)
     local_idx_map = {int(g): l for l, g in enumerate(global_idx_arr)}
-    dense_cp = np.asarray(
-        csr[global_idx_arr][:, global_idx_arr].todense(), dtype=np.float32
-    )
+
+    indptr, indices, data = csr.indptr, csr.indices, csr.data
+    # searchsorted compares against the index array's own dtype; matching it
+    # here avoids an int32->int64 upcast of the (large) row slice on every call.
+    targets = global_idx_arr.astype(indices.dtype, copy=False)
+
+    dense_cp = np.zeros((n, n), dtype=np.float32)
+    for li in range(n):
+        gi = global_idx_arr[li]
+        start, end = indptr[gi], indptr[gi + 1]
+        if start == end:
+            continue                      # product co-occurs with nothing
+        row_cols = indices[start:end]     # sorted — canonical CSR
+        pos = np.searchsorted(row_cols, targets)
+        np.clip(pos, 0, len(row_cols) - 1, out=pos)
+        hit = row_cols[pos] == targets    # exact match, not just insertion point
+        if hit.any():
+            dense_cp[li, hit] = data[start:end][pos[hit]]
+
     return local_idx_map, dense_cp
 
 
@@ -626,8 +710,8 @@ def _embed_basket_chunk(chunk_df, G, model, device, batch_size=4096):
 
 
 def run_inference(con, dataset_tag, G, model, device, worker_id=None,
-                    chunk_size=50_000, batch_size=4096, output_dir=None,
-                    stale_after_seconds=3600):
+                    chunk_size=None, batch_size=None, output_dir=None,
+                    stale_after_seconds=None):
     """
     Claims one chunk at a time from the DuckDB inference-chunk queue
     (basket_store.ensure_inference_chunk_plan / claim_next_chunk),
@@ -648,6 +732,10 @@ def run_inference(con, dataset_tag, G, model, device, worker_id=None,
 
     worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
     output_dir = output_dir or OUTPUT_DIR
+    chunk_size = chunk_size if chunk_size is not None else config.INFERENCE_CHUNK_BASKETS
+    batch_size = batch_size if batch_size is not None else config.INFERENCE_BATCH_SIZE
+    stale_after_seconds = (stale_after_seconds if stale_after_seconds is not None
+                           else config.CHUNK_STALE_AFTER_SECONDS)
     os.makedirs(output_dir, exist_ok=True)
     basket_store.ensure_inference_chunk_plan(con, dataset_tag, chunk_size)
 

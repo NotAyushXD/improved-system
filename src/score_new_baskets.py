@@ -69,6 +69,7 @@ import basket_store
 from GraphBuilder import prepare_globals, run_inference, merge_inference_output
 from GNN_Train import BasketGNN
 from cluster_basket_embeddings import assign_new_baskets_to_clusters
+import config
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -76,7 +77,7 @@ from cluster_basket_embeddings import assign_new_baskets_to_clusters
 
 # All pipeline-produced artifacts (from a prior pipeline_main.py run, and
 # this script's own outputs) live under this folder, not the working directory.
-OUTPUT_DIR = "../data/output"
+OUTPUT_DIR = config.OUTPUT_DIR
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MODEL_PATH         = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
@@ -84,7 +85,7 @@ PRODUCT_IDX_PATH   = os.path.join(OUTPUT_DIR, "product_id_to_index.pkl")
 COPURCHASE_PATH    = os.path.join(OUTPUT_DIR, "copurchase_sparse.npz")
 PRODUCT_UNITS_PATH = os.path.join(OUTPUT_DIR, "product_units_avg.pkl")
 
-MIN_BASKET_PRODUCTS = 2   # same floor pipeline_main.py applies at training time
+MIN_BASKET_PRODUCTS = config.MIN_BASKET_PRODUCTS   # same floor pipeline_main.py applies at training time
 
 # Same file used in training (Stage 0 of pipeline_main.py) — reusing it here,
 # rather than a fresh pull, keeps product embeddings identical between train
@@ -100,8 +101,8 @@ NEW_CLUSTERS_OUT      = os.path.join(OUTPUT_DIR, "new_basket_need_states.parquet
 MERGED_EMBEDDINGS_OUT = os.path.join(OUTPUT_DIR, "basket_gnn_embeddings_merged.parquet")
 MERGED_CLUSTERS_OUT   = os.path.join(OUTPUT_DIR, "basket_need_state_clusters_merged.parquet")
 
-EMBED_BATCH_SIZE = 8192
-DATASET_TAG = "score"
+EMBED_BATCH_SIZE = config.INFERENCE_BATCH_SIZE
+DATASET_TAG = config.SCORE_DATASET_TAG
 
 
 # ─────────────────────────────────────────────

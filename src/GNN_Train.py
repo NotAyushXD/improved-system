@@ -38,34 +38,35 @@ import joblib
 from GraphBuilder import prepare_globals, run_inference, merge_inference_output
 import basket_store
 import lmdb_graph_cache
+import config
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
-HIDDEN_DIM      = 128
-OUT_DIM         = 64
-DROPOUT         = 0.1
-EDGE_DIM        = 2
-TRAIN_BATCH     = 256
-EPOCHS          = 20
-LR              = 1e-4   # reduced from 1e-3 — prevents divergence with new features
-WEIGHT_DECAY    = 1e-5
-N_TRAIN_SAMPLES = 300_000  # was 1_000_000 — reduced as an extra memory safety
+HIDDEN_DIM      = config.HIDDEN_DIM
+OUT_DIM         = config.OUT_DIM
+DROPOUT         = config.DROPOUT
+EDGE_DIM        = config.EDGE_DIM
+TRAIN_BATCH     = config.TRAIN_BATCH
+EPOCHS          = config.EPOCHS
+LR              = config.LR   # default 1e-4, reduced from 1e-3 — prevents divergence
+WEIGHT_DECAY    = config.WEIGHT_DECAY
+N_TRAIN_SAMPLES = config.N_TRAIN_SAMPLES  # default 300_000 — was 1_000_000 — reduced as an extra memory safety
                             # margin on a shared machine. With the LMDB-backed
                             # dataset (build once, random-access during
                             # training, never all resident in RAM) this is no
                             # longer a hard memory constraint — raise it back
                             # up if more training data is wanted, independent
                             # of RAM.
-NUM_WORKERS     = 0 if os.name == "nt" else 4   # see the __main__ guard note
+NUM_WORKERS     = config.NUM_WORKERS   # see the __main__ guard note
                             # in pipeline_main.py — nonzero DataLoader workers
                             # on Windows require that guard to be in place,
                             # since `spawn` re-imports/re-executes the
                             # launching module in every worker process.
 
 # All pipeline-produced artifacts land here, not the working directory.
-OUTPUT_DIR      = "../data/output"
+OUTPUT_DIR      = config.OUTPUT_DIR
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 LMDB_TRAINING_GRAPHS_PATH = os.path.join(OUTPUT_DIR, "training_graphs.lmdb")
@@ -163,7 +164,7 @@ def train_and_embed(
     # ── Step 2: Sample training baskets (from DuckDB, bounded result size) ──
     print("\n[ 2 / 4 ] Sampling training baskets...")
     sampled = basket_store.sample_training_baskets(
-        con, dataset_tag, n_samples=N_TRAIN_SAMPLES, seed=42,
+        con, dataset_tag, n_samples=N_TRAIN_SAMPLES, seed=config.SEED,
     )
 
     # ── Step 3: Build (or reuse) the LMDB training-graph cache ──
@@ -173,7 +174,7 @@ def train_and_embed(
     print("\n[ 3 / 4 ] Building (or reusing) LMDB training-graph cache...")
     lmdb_graph_cache.load_or_build_lmdb_cache(
         sampled, G, LMDB_TRAINING_GRAPHS_PATH, LMDB_MANIFEST_PATH,
-        seed=42, n_train_samples_requested=N_TRAIN_SAMPLES,
+        seed=config.SEED, n_train_samples_requested=N_TRAIN_SAMPLES,
     )
     train_dataset = lmdb_graph_cache.LMDBGraphDataset(LMDB_TRAINING_GRAPHS_PATH)
     print(f"  Training graphs ready: {len(train_dataset):,} (LMDB-backed, lazy random access)")
@@ -247,7 +248,7 @@ def train_and_embed(
           "(restartable, chunked from DuckDB)...")
     run_inference(
         con, dataset_tag, G, model, device,
-        worker_id=worker_id, batch_size=8192,
+        worker_id=worker_id,
     )
     basket_gnn_embeddings = merge_inference_output(dataset_tag, output_dir=OUTPUT_DIR)
 

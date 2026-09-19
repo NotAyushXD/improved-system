@@ -48,6 +48,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
+import config
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -59,14 +60,14 @@ from sklearn.decomposition import PCA
 # .parquet file. pandas can read that folder directly via pd.read_parquet(),
 # so these constants point straight at the folder names as downloaded —
 # no need to merge them into one file yourself.
-PRODUCT_ATTRIBUTES_TPNA_PARQUET = Path("../data/ns_item_lookup_tpna")
-TPNB_TO_TPNA_MAPPING_PARQUET    = Path("../data/ns_tpnb_to_tpna_mapping")
+PRODUCT_ATTRIBUTES_TPNA_PARQUET = Path(config.PRODUCT_ATTRIBUTES_TPNA)
+TPNB_TO_TPNA_MAPPING_PARQUET    = Path(config.TPNB_TO_TPNA_MAPPING)
 
-OUTPUT_PARQUET = Path("../data/output/product_embeddings.parquet")
+OUTPUT_PARQUET = Path(config.out("product_embeddings.parquet"))
 
 # Swap for a local model path if you're on an offline machine — same as
 # multiview_clustering_v5.py's local E:\...\miniLMV6L2 copy.
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = config.EMBEDDING_MODEL_NAME
 
 # "All-but-the-top" anisotropy correction — removes the top N principal
 # components after mean-centering. multiview_clustering_v5.py found this
@@ -74,10 +75,10 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # otherwise sits in a few generic/boilerplate directions). N=2 is a starting
 # point carried over from there, not re-validated for this product set —
 # check downstream clustering quality with and without this before trusting it.
-APPLY_ANISOTROPY_CORRECTION = True
-N_TOP_PCS_TO_REMOVE = 2
+APPLY_ANISOTROPY_CORRECTION = config.APPLY_ANISOTROPY_CORRECTION
+N_TOP_PCS_TO_REMOVE = config.N_TOP_PCS_TO_REMOVE
 
-SEED = 42
+SEED = config.SEED
 
 
 # ─────────────────────────────────────────────

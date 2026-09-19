@@ -26,6 +26,7 @@ import pickle
 import lmdb
 from torch_geometric.data import Dataset as PyGDataset
 
+import config
 from GraphBuilder import _basket_dense_cp_submatrix, build_one_graph, GRAPH_BUILDER_VERSION
 
 _COMMIT_EVERY = 2000  # periodic commits during the build pass, bounding write-txn memory
@@ -127,6 +128,13 @@ def load_or_build_lmdb_cache(sampled_baskets_df, G, lmdb_path: str, manifest_pat
         "n_graphs": len(sampled_baskets_df),
         "in_dim": G["in_dim"],
         "n_train_samples_requested": n_train_samples_requested,
+        # Everything that changes per-basket GRAPH construction — TOP_K and the
+        # global sub-clustering settings. These became env-tunable (config.py),
+        # and TOP_K in particular was NOT tracked here before: changing it
+        # altered how many edges each node gets, yet the manifest still
+        # matched, so a stale cache was silently reused and the model trained
+        # on graphs built under different settings than the run requested.
+        "graph_fingerprint": config.graph_fingerprint(),
     }
 
     if os.path.exists(lmdb_path) and _manifest_matches(manifest_path, expected_manifest):

@@ -24,8 +24,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import config
 
-PRODUCT_EMBEDDINGS_PARQUET = Path("../data/output/product_embeddings.parquet")
+PRODUCT_EMBEDDINGS_PARQUET = Path(config.out("product_embeddings.parquet"))
 
 REQUIRED_PRODUCT_COLS = {"tpnb", "embedding"}
 
