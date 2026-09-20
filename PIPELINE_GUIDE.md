@@ -58,6 +58,14 @@ top of `data/ns_household_tpnb_week_agg_train.sql` for the full reasoning.
                         data/output/basket_need_state_clusters.parquet
                                               │
                                               ▼
+                                   Stage 2.5: need-state GRAPHS
+                                   (need_state_graph.py — see §6b)
+                                    ├─ adjacency   : which need-states border
+                                    │                 each other (undirected)
+                                    └─ transitions : where households actually
+                                                     go next (directed)
+                                              │
+                                              ▼
                                    Stage 3: manually re-upload into
                                    the warehouse (need_state_cluster,
                                    need_state_cluster_gmm per basket)
@@ -66,10 +74,22 @@ top of `data/ns_household_tpnb_week_agg_train.sql` for the full reasoning.
    (later/held-out weeks)                  (scores NEW baskets against
                                               the already-trained model —
                                               no retraining)
+
+ Every parameter above comes from .env via src/config.py — see §2b.
 ```
 
 Need-states are **discovered after the fact** by profiling what's dominant
 in each cluster — themes/categories are never fed in as an input anywhere.
+
+**Three things that surprise most readers**, each covered in detail below:
+
+1. **A basket is a household's whole WEEK**, not a shopping trip — no
+   transaction ID exists in any source table (see the warning above).
+2. **Households are never nodes in any graph.** The GNN's graphs have
+   *product* nodes; households only meet each other in the basket kNN graph,
+   and only as (household, week) pairs. See `HOUSEHOLD_GRAPH_FLOW.md`.
+3. **A need-state is an occasion, not a customer segment.** The same
+   household appears in several need-states across different weeks.
 
 ---
 
@@ -90,19 +110,103 @@ improved-system/
 │                                                  to the working directory. product_embeddings.parquet,
 │                                                  caches, the trained model, the LMDB training-graph
 │                                                  cache, embeddings, cluster output)
+├── .env                                        (YOUR local settings — gitignored, edit freely)
+├── .env.example                                (committed template documenting all 50 parameters)
 └── src/
-    ├── build_product_embeddings.py
-    ├── pipeline_main.py
-    ├── duckdb_manager.py
-    ├── basket_store.py
-    ├── lmdb_graph_cache.py
-    ├── GraphBuilder.py
-    ├── GNN_Train.py
-    ├── cluster_basket_embeddings.py
-    ├── parquet_loader.py
-    ├── score_new_baskets.py
-    └── test_theme_free_pipeline.py
+    ├── config.py                    Every tunable parameter, typed + validated. Reads .env. See §2b.
+    ├── build_product_embeddings.py  Step 1 — product text vectors (run once)
+    ├── pipeline_main.py             Steps 2-4 — baskets, co-purchase, GNN, clustering, need-state graphs
+    ├── duckdb_manager.py            Opens the local embedded DuckDB file
+    ├── basket_store.py              Basket table, sampling, restartable chunk queue
+    ├── lmdb_graph_cache.py          Build-once training-graph cache (disk-backed)
+    ├── GraphBuilder.py              Per-basket graph construction + chunked inference
+    ├── GNN_Train.py                 The BasketGNN model, training, model reuse
+    ├── cluster_basket_embeddings.py Leiden + GMM over basket embeddings
+    ├── need_state_graph.py          Stage 2.5 — adjacency / transitions / journeys  (see §6b)
+    ├── parquet_loader.py            Reads product_embeddings.parquet
+    ├── score_new_baskets.py         Score NEW weeks against the trained model
+    ├── benchmark_inference.py       Measure per-basket cost before a long run  (see §11)
+    ├── reset_inference.py           Clear state left by an interrupted run     (see §11)
+    └── test_pipeline.py             The test suite — run before any long run   (see §8)
 ```
+
+All source files are **UTF-8** and contain non-ASCII characters (box-drawing,
+em dashes) in comments. Every file this code reads is opened with an explicit
+encoding for that reason — on a Western-European Windows install the locale
+default is cp1252, which cannot decode them. If you add a file that gets read
+at runtime, specify `encoding="utf-8"`. Your `.env` must be saved as UTF-8
+too (a BOM is tolerated).
+
+---
+
+## 2b. Configuration — everything lives in `.env`
+
+Every tunable parameter is defined once in `src/config.py` and set in `.env`.
+Nothing is hardcoded in the pipeline files any more.
+
+**Precedence:** a real environment variable beats `.env`, which beats the
+built-in default.
+
+```powershell
+cd src
+python config.py                              # what WILL be used, and where each value came from
+$env:PIPELINE_EPOCHS=50; python pipeline_main.py   # override for one run, no file edit
+```
+
+Always run `python config.py` before a long job. It prints all 50 values,
+marks overrides with `*`, and prints the two cache fingerprints.
+
+### Getting started
+
+`cp .env.example .env`, then edit. `.env.example` documents every parameter
+with its default and the reasoning behind it; `.env` is your working copy and
+is gitignored.
+
+### ⚠ Some parameters invalidate cached artifacts
+
+This is the nuance that matters most. Several values change the *meaning* of
+files the pipeline caches on disk. Before `config.py` existed, changing one
+required a code edit; now it is one line in `.env`, so the pipeline
+fingerprints them and rebuilds automatically rather than silently reusing
+something built under different settings.
+
+| Fingerprint | Covers | Protects |
+|---|---|---|
+| `graph_fingerprint()` | `TOP_K`, all `SUBCL_*`, `SEED` | the LMDB training-graph cache **and** the trained model |
+| `subcluster_fingerprint()` | all `SUBCL_*`, `SEED` | `product_subclusters.pkl` |
+
+So changing `PIPELINE_TOP_K` forces a training-graph rebuild *and* a retrain,
+because both depend on it. Changing `PIPELINE_EPOCHS` forces a retrain but not
+a graph rebuild. Changing `PIPELINE_LEIDEN_RESOLUTION` forces neither — it
+runs after embeddings exist. `test_pipeline.py` asserts exactly this, in both
+directions: over-invalidating would cost needless hours.
+
+Artifacts **not** fingerprinted, which you must delete by hand if their inputs
+change: `basket_gnn_embeddings.parquet`, `gmm_basket_model.pkl`,
+`basket_need_state_clusters.parquet`, and the DuckDB tables
+(`basket_store.drop_all(con, "train")`).
+
+### Validation happens at import
+
+Bad values fail immediately with a clear message, not six hours into a run:
+
+```
+ValueError: Config error: PIPELINE_GMM_COVARIANCE='banana' is not a valid
+choice from ['diag', 'full', 'spherical', 'tied'].
+```
+
+Cross-parameter checks run too — `GMM_K_MIN > GMM_K_MAX` is rejected, and
+`EDGE_DIM != 2` is rejected because `_build_edges_numba` emits exactly two
+edge features and anything else would crash at the first `GINEConv`.
+
+### The one deliberately-unset parameter
+
+`PIPELINE_NUM_WORKERS` is the only parameter whose default is platform-aware:
+**0 on Windows, 4 elsewhere**. On Windows the `spawn` start method re-imports
+the launching module in every worker. `pipeline_main.py` has the required
+`if __name__ == "__main__"` guard so workers are safe — but hardcoding a
+number in `.env` would silently change behaviour depending on which OS the
+file is copied to. Leave it unset unless tuning a known machine.
 
 ---
 
@@ -425,6 +529,67 @@ What it does:
 
 ---
 
+## 6b. Stage 2.5 — need-state graphs (`need_state_graph.py`)
+
+Stage 2 produces need-state *labels*. Stage 2.5 produces the **edges between
+need-states**, which earlier versions computed and threw away:
+`cluster_basket_embeddings()` built the basket kNN edge list, handed it to
+Leiden, and let it go out of scope. `pipeline_main.py` now calls
+`build_basket_knn_graph()` and `run_leiden_on_basket_graph()` separately so
+the edge list survives.
+
+**Two edge sets, and they are not interchangeable.** This is the single most
+important nuance in this stage:
+
+| | Adjacency (undirected) | Transitions (directed) |
+|---|---|---|
+| built from | contracting the basket kNN graph | sequencing each household's own weeks |
+| means | "these two occasions border each other" | "after A, households go to B next week" |
+| use for | substitutable / easily-confused need-states | **journeys**, next-best-action |
+| file | `need_state_adjacency.parquet` | `need_state_transitions.parquet` |
+
+**Similarity is not movement.** Households do not travel along adjacency
+edges. Reading journeys off the adjacency graph gives a plausible-looking
+answer that is wrong.
+
+```python
+import pandas as pd, need_state_graph as nsg
+clusters = pd.read_parquet("../data/output/basket_need_state_clusters.parquet")
+trans    = pd.read_parquet("../data/output/need_state_transitions.parquet")
+
+nsg.journeys_for_household(clusters, trans, household_number=4213)
+# -> current_need_state, as_of_week, history, next_steps, journeys
+```
+
+Nuances worth knowing:
+
+- **`need_state_gmm_overlap.parquet` uses GMM component ids**, a *different*
+  labelling from Leiden's `need_state_cluster`. Its columns are named
+  `gmm_component_a/b` deliberately so a join against the other tables fails
+  loudly instead of silently returning nonsense. Relate the two through
+  `basket_id` in `basket_need_state_clusters.parquet`, which carries both.
+- **`basket_knn_edges.parquet` is capped** at `PIPELINE_BASKET_EDGE_WRITE_CAP`
+  (50M). At full population the kNN graph can exceed 1B edges — hundreds of
+  GB — so above the cap the write is skipped with a message. Expect this at
+  57M baskets; it is correct behaviour, and the need-state-grain tables are
+  always written.
+- **Journeys are first-order Markov** — they assume where a household goes
+  next depends only on where it is now. That is untested and, on an ~8-week
+  window, untestable. Read multi-step paths as plausible routes, not
+  forecasts, and check `low_support_steps` first.
+- **`PIPELINE_TRANSITION_MAX_WEEK_GAP`** decides how a household's weeks
+  become transitions. `1` counts only consecutive calendar weeks; `none`
+  counts consecutive *observed* baskets however far apart. Households do not
+  shop every week, so on a short window `1` yields very few transitions.
+  `.env` ships with `none` for this reason — the trade-off is that a 1-week
+  and a 6-week step are treated alike, which `avg_week_gap` on every row lets
+  you check.
+- **A household is never a node.** It survives only as a prefix inside
+  `basket_id`, and nothing links a household's own weeks to each other.
+  See `HOUSEHOLD_GRAPH_FLOW.md` for the full picture.
+
+---
+
 ## 7. After clustering: naming/profiling need-states (not yet implemented)
 
 `pipeline_main.py`'s closing comment is explicit that **themes, if wanted at
@@ -440,80 +605,229 @@ human-readable terms.
 
 ## 8. Sanity-check the pipeline itself
 
-```
-python test_theme_free_pipeline.py
+**Run this before any long job.** It is fast, and it has caught real bugs
+that would otherwise have surfaced hours into a run.
+
+```powershell
+python .\test_pipeline.py              # everything
+python .\test_pipeline.py --fast       # skip the DuckDB/LMDB/torch functional check
+python .\test_pipeline.py --prod-outputs   # also check real artifacts in data/output
 ```
 
-Two checks, both must pass (exit code 0):
-1. **Static** — walks the AST of every active pipeline file and fails if any
-   function/parameter/variable name contains "theme" (guards against
-   reintroducing category-based logic), and fails if the old
-   `split_basket_by_theme.py` file has reappeared.
-2. **Functional** — builds a tiny synthetic catalog and a synthetic raw
-   household×tpnb×week export, and actually runs the real pipeline against a
-   real (throwaway-tagged) local embedded DuckDB database: `prepare_globals()`
-   → `basket_store.build_baskets_table()` (reads the parquet directly) →
-   `sample_training_baskets()` → `lmdb_graph_cache.load_or_build_lmdb_cache()`
-   → `GraphBuilder.run_inference()` + `merge_inference_output()`, asserting
-   training and inference produce node feature tensors of identical width
-   and that both exercise the full GNN encoder (not a shortcut). Requires
-   `duckdb` installed. Good to run once after any environment setup, before
-   trusting a real run.
+Six groups, all must pass (exit code 0):
+
+| # | Group | What it protects |
+|---|---|---|
+| 1 | **Static** | No `theme`-named identifier can reappear; `split_basket_by_theme.py` stays deleted |
+| 1b | **Config** | Defaults match the original hardcoded values; types are real; **cache fingerprints move when they should and stay put when they shouldn't**; bad values fail at import; `.env` precedence and UTF-8 parsing; `.env.example` documents every key |
+| 2 | **Graph primitives** | `_minmax` edge cases, the memory-safe distance expansion, top-K edge selection, **edge relative-strength scaling**, the **bit-identical** per-basket submatrix rewrite, exact node-feature slot layout, duplicate-product unit summing, **zero/negative quantities (returns)** |
+| 3 | **Co-purchase additivity** | Proves chunked `XᵀX` equals single-shot exactly — every edge feature depends on this and it was previously only a claim in a comment |
+| 7 | **Need-state graph** | Adjacency maths pinned to hand-computed values, year-boundary week ranking, transition counts/probabilities, journey beam search, GMM overlap batch-invariance and column naming |
+| 4-6 | **Functional / parity / basket store** | Real DuckDB + real LMDB on synthetic data; **train/score parity by VALUE, not just width**; basket grain semantics and the `basket_id` format journeys depend on |
+| 8 | **Prod outputs** (opt-in) | Embedding collapse, degenerate clusters, label coverage — things synthetic data structurally cannot catch |
+
+Two limits worth knowing. The functional check uses 25 baskets, so it cannot
+catch **memory behaviour at production chunk sizes** — a 50,000-graph
+accumulation is invisible at that scale, and that is exactly the bug that
+once produced "0 chunks complete" after hours of running. And `--prod-outputs`
+only checks artifacts that already exist; it skips cleanly otherwise.
 
 ---
 
 ## 9. Quick-reference: run order
 
-```bash
+```powershell
 cd src
 
-# 0. Run all SQL files in data/ against your warehouse first, download
-#    each result as parquet into the matching data/ subfolder.
+# 0. Run the SQL in data/ against your warehouse, download each result as
+#    parquet into the matching data/ subfolder.
 
-# 1. Sanity check the code (optional but recommended first time)
-python test_theme_free_pipeline.py
+# 1. Configure, and check what will actually be used
+copy ..\.env.example ..\.env      # first time only, then edit
+python .\config.py
 
-# 2. Build product embeddings (only needs to be re-run if the product
-#    catalog / attributes change)
-python build_product_embeddings.py
+# 2. Verify the code before spending hours on it
+python .\test_pipeline.py
 
-# 3. Delete stale caches under data/output/ if this is a first run after any
-#    data or basket-grain change: basket_gnn_model.pt,
-#    copurchase_sparse.npz, product_id_to_index.pkl, product_units_avg.pkl,
-#    basket_gnn_embeddings.parquet, gmm_basket_model.pkl,
-#    basket_need_state_clusters.parquet, embeddings_chunk_*.parquet,
-#    training_graphs.lmdb/ (and its .manifest.json)
-#    (product_subclusters.pkl / product_embeddings.parquet do NOT need
-#    deleting — they're product-text-derived, not basket-derived. The LMDB
-#    cache also self-checks a manifest and rebuilds automatically on
-#    mismatch, so deleting it manually is a belt-and-suspenders step, not
-#    strictly required.)
+# 3. Product embeddings (re-run only if the product catalog/attributes change)
+python .\build_product_embeddings.py
 
-# 4. Train the GNN + cluster into need-states
-python pipeline_main.py
-#    -> data/output/basket_need_state_clusters.parquet  (upload this to the warehouse)
+# 4. OPTIONAL — measure per-basket inference cost before committing to it
+python .\benchmark_inference.py --n-baskets 500
 
-# 5. (Later, periodically) score new/held-out weeks without retraining
-python score_new_baskets.py --new-transactions <path to new weeks' parquet>
+# 5. The main run. Tee the log: it is long, and the per-chunk ETA lines
+#    are what you will want to read back.
+python .\pipeline_main.py 2>&1 | Tee-Object -FilePath run.log
+#    -> data/output/basket_need_state_clusters.parquet   (upload to warehouse)
+#    -> data/output/need_state_adjacency.parquet         (Stage 2.5)
+#    -> data/output/need_state_transitions.parquet       (Stage 2.5)
+
+# 6. Confirm the output actually means something
+python .\test_pipeline.py --fast --prod-outputs
+
+# 7. (Later, periodically) score new weeks without retraining
+python .\score_new_baskets.py --new-transactions ..\data\ns_household_tpnb_week_agg_score
 ```
+
+**On a rerun, steps 3-5 reuse what they can:** the co-purchase matrix, the
+LMDB training-graph cache, the trained model, and every completed inference
+chunk. You do not need to delete anything by hand unless a fingerprint check
+tells you it is stale — and then it rebuilds automatically. The old advice to
+"delete stale caches before running" no longer applies; the fingerprints do
+that job now, and do it more reliably than a checklist.
+
+If a run died and the **model file is missing**, see `reset_inference.py` in
+§10b before rerunning.
 
 ---
 
-## 10. Key knobs you'll likely want to revisit
+## 10b. Running at production scale — operations
 
-| Setting | Where | Current value | Note |
-|---|---|---|---|
-| `MIN_BASKET_PRODUCTS` | `pipeline_main.py` / `score_new_baskets.py` | 2 | Drops 1-item baskets |
-| `N_TRAIN_SAMPLES` | `GNN_Train.py` | 300,000 | With the LMDB-backed training cache this is no longer a hard memory ceiling — raise it for more training data whenever you want, independent of RAM |
-| `COPURCHASE_CHUNK_BASKETS` | `pipeline_main.py` | 500,000 | Baskets per co-purchase-matrix chunk, streamed from DuckDB; lower if still memory-constrained |
-| `INFERENCE_CHUNK_BASKETS` | `pipeline_main.py` | 50,000 | Baskets per restartable inference chunk (see `GraphBuilder.run_inference`) |
-| `PIPELINE_DUCKDB_PATH` (env var) | `duckdb_manager.py` | `../data/pipeline.duckdb` | Where the embedded DuckDB database file lives — override if that location ever has issues |
-| `SUBCL_K_CANDIDATES` | `GraphBuilder.py` | [50, 100, 200, 400] | Global product sub-cluster K candidates — tune to catalog size |
-| `TOP_K` | `GraphBuilder.py` | 10 | Co-purchase edges kept per node per basket graph |
-| `EPOCHS` / `LR` | `GNN_Train.py` | 20 / 1e-4 | GNN training |
-| `LEIDEN_RESOLUTION` | `cluster_basket_embeddings.py` | 1.0 | Run `sweep_resolution()` first rather than trusting this |
-| `GMM_N_COMPONENTS` | `pipeline_main.py` | 30 | Explicit placeholder — replace with real best-K logic, or eyeball `select_k_via_bic()` |
-| Training/scoring period ranges | `ns_household_tpnb_week_agg_train.sql` / `..._score.sql` | `202603–202604` | Must match `ns_item_lookup_tpna.sql`'s range for training; scoring range should be later |
+Measured on the real data: **57,115,804 baskets**, **154,597 products** in the
+co-purchase matrix, **1,474,348,846 non-zeros** (mean 9,537 per product row),
+198,652 products with embeddings. CPU-only Windows box. These numbers drive
+everything below.
+
+### What each stage costs
+
+| Stage | Cost | Reused on rerun? |
+|---|---|---|
+| Stage 0 — build basket table | ~30-60 min | No, always rebuilds |
+| Stage 1a — co-purchase matrix | hours | **Yes** — fingerprinted `.meta.json` sidecar |
+| LMDB training-graph cache | ~3 min | Yes, unless `graph_fingerprint` changed |
+| Training (20 epochs, 300k graphs) | ~2h25m | **Yes** — model manifest |
+| Inference (57M baskets) | the long pole | Yes, per-chunk |
+| Stage 2 — clustering | see the warning below | No |
+
+### Watch the first chunk
+
+```
+chunk 0 done in 71s (704 baskets/s, 1,420 us/basket) | 1/1,143 chunks | ETA 22.5 h
+```
+
+That line prints the moment chunk 0 finishes, with an ETA from this run's
+rolling average. A per-basket progress bar appears within seconds. **If the
+rate looks wrong, stop immediately** — do not discover it on day nine.
+
+### Memory is bounded by batch size, not chunk size
+
+`PIPELINE_INFERENCE_CHUNK_BASKETS` controls how much work is *checkpointed*;
+`PIPELINE_INFERENCE_BATCH_SIZE` controls how much is held in **RAM**. Graphs
+are built into a buffer of batch-size, encoded, and discarded. The co-purchase
+matrix alone is ~11.8 GB resident, so:
+
+| `INFERENCE_BATCH_SIZE` | approximate peak |
+|---:|---:|
+| 8,192 | ~12.6 GB |
+| 2,048 (recommended here) | ~12.2 GB |
+
+**If you hit memory pressure, halve the batch size.** Lowering the *chunk*
+size does not help.
+
+### If a run dies
+
+Inference is restartable: completed chunks are skipped, the interrupted one
+returns to the queue. The trained model is saved **before** inference starts,
+so the weights survive. Just rerun `pipeline_main.py`.
+
+**Only reset if the model file is missing.** `reset_inference.py` handles
+this and refuses to delete when a model exists:
+
+```powershell
+python .\reset_inference.py          # dry run
+python .\reset_inference.py --yes
+```
+
+Why it matters: a model that no longer exists cannot be reproduced without
+the same seed, so chunks it embedded can never be safely mixed with chunks
+from a new model. Two incompatible embedding spaces in one clustering fails
+silently — nothing errors, the need-states are just wrong.
+
+### Verify the output means something
+
+```powershell
+python .\test_pipeline.py --fast --prod-outputs
+```
+
+Checks the real artifacts for **embedding collapse** (if the autoencoder
+learned a near-constant, every basket lands in the same place and clustering
+is meaningless while appearing to succeed), degenerate clusters, and label
+coverage. Worth running the moment inference finishes — a low training loss
+does *not* rule collapse out.
+
+### ⚠ Stage 2 at 57M baskets is not solved
+
+| | at 57M × 64 dims |
+|---|---|
+| embeddings in memory | ~15 GB |
+| `normalize()` copy | **~29 GB peak** |
+| mutual-kNN edges | ~300M undirected, several GB |
+| GMM working array | **~14 GB per EM iteration**, ×3 inits |
+
+On a memory-constrained box Stage 2 may not complete. The intended fix —
+cluster a few-million-basket sample, then assign the rest with
+`assign_new_baskets_to_clusters` / the saved GMM's `predict` (both already
+exist, that is what `score_new_baskets.py` does) — **is not yet wired into
+the main run.**
+
+### Known data nuance: returns
+
+`quantity` is a weekly SUM including refunds, so it can be 0 or negative. A
+product bought and returned in the same week nets to 0; a net refund goes
+negative. `log1p` is undefined at/below −1, so those become `0.0` in the
+`log_units` node feature — the same value as "bought nothing". That is
+inherited behaviour, not a deliberate modelling choice. Quantify it before
+relying on that feature:
+
+```sql
+SELECT COUNT(*) FILTER (WHERE quantity <= 0) AS non_positive, COUNT(*) AS total
+FROM read_parquet('../data/ns_household_tpnb_week_agg_train/*.parquet');
+```
+
+If the share is large, decide deliberately in SQL whether returns should be
+filtered, rather than inheriting a `nan_to_num` side effect.
+
+---
+
+## 11. Diagnostic scripts
+
+**`benchmark_inference.py`** — run before committing to a long inference pass.
+Reports old-vs-new equivalence of the per-basket submatrix lookup on *your*
+matrix, a per-stage cost breakdown in microseconds, and a projected wall
+clock. Two minutes.
+
+```powershell
+python .\benchmark_inference.py --n-baskets 500 --remaining-baskets 57115804
+```
+
+**`reset_inference.py`** — clears orphaned chunk state (see §10b). Dry-run by
+default; refuses to act when a model file exists unless `--force`.
+
+---
+
+## 12. Key knobs you'll likely want to revisit
+
+Every one of these now lives in `.env`, not in a source file. Run
+`python config.py` to see the effective value of all 50.
+
+| `.env` key | Default | Note |
+|---|---|---|
+| `PIPELINE_MIN_BASKET_PRODUCTS` | 2 | Below 2 a basket has no co-purchase pair at all |
+| `PIPELINE_N_TRAIN_SAMPLES` | 300,000 | LMDB-backed, so no longer a RAM ceiling — raise freely |
+| `PIPELINE_COPURCHASE_CHUNK_BASKETS` | 500,000 | Lower first under memory pressure. Does not change results |
+| `PIPELINE_INFERENCE_CHUNK_BASKETS` | 50,000 | Checkpoint granularity — **not** a memory lever |
+| `PIPELINE_INFERENCE_BATCH_SIZE` | 8,192 (2,048 here) | **The** inference memory lever |
+| `PIPELINE_TOP_K` | 10 | ⚠ rebuilds graph cache + forces retrain |
+| `PIPELINE_SUBCL_K_CANDIDATES` | 50,100,200,400 | ⚠ same. On this catalog k=400 was picked at the range ceiling with silhouette still rising — consider extending |
+| `PIPELINE_EPOCHS` / `PIPELINE_LR` | 20 / 1e-4 | ⚠ forces retrain. LR reduced from 1e-3 to prevent divergence |
+| `PIPELINE_LEIDEN_RESOLUTION` | 1.0 | Placeholder — run `sweep_resolution()` first |
+| `PIPELINE_GMM_N_COMPONENTS` | 30 | Placeholder — see `select_k_via_bic()` |
+| `PIPELINE_TRANSITION_MAX_WEEK_GAP` | `none` here | The only value in `.env` deviating from code default; see §6b |
+| `PIPELINE_NUM_WORKERS` | unset | Platform-aware; leave unset (see §2b) |
+| `PIPELINE_DUCKDB_PATH` | `../data/pipeline.duckdb` | Keep on a fast local disk, not a synced folder |
+| Training/scoring SQL period ranges | `202603-202604` | In the `.sql` files, not `.env`. ~8 weeks — the binding constraint on journey quality |
+
+⚠ = changing it invalidates a cached artifact, which rebuilds automatically.
 
 See `data/TABLE_REFERENCE.md` for what each underlying warehouse table
 actually contains, and why basket grain landed on WEEK rather than a true

@@ -45,7 +45,16 @@ actually is, and exactly what's packed inside it**.
                                                ▼
                      data/output/basket_need_state_clusters.parquet
                      (need_state_cluster, need_state_cluster_gmm per basket)
+                                               │
+                                               ▼
+                              Stage 2.5 — need_state_graph.py  (§8)
+                     adjacency (which need-states border each other)
+                     transitions (where households actually go next)
 ```
+
+Every parameter mentioned in this document is set in `.env` via
+`src/config.py` — see PIPELINE_GUIDE.md §2b. The values quoted here are the
+defaults.
 
 ---
 
@@ -444,7 +453,103 @@ of the basket-grain discussion in `data/TABLE_REFERENCE.md`.
 
 ---
 
-## 7. Dimension cheat-sheet
+## 7. Nuances that are easy to misread
+
+Each of these is real behaviour of the current code, verified by a test in
+`test_pipeline.py`. Several were bugs found the hard way.
+
+**1. `distinctiveness` is arguably named backwards.** It is computed as
+`1 − d(own centroid) / d(farthest centroid)`, so a **high** value means the
+product sits **close** to its own sub-cluster centroid — i.e. *typical* of it,
+not distinctive from it. Worth knowing before interpreting node feature
+`[386]`.
+
+**2. Every 2-item basket gets `cp_score = 1.0` for both nodes.** With n=2
+there is exactly one co-purchase pair, so both raw scores tie, and `_minmax()`
+maps "all equal and positive" to 1.0. Do not read `cp_score` as absolute
+popularity — it is within-basket-relative only.
+
+**3. Edge relative-strength was wrong for small baskets until
+`GRAPH_BUILDER_VERSION 3`.** The denominator was taken as the first neighbour
+in column order rather than the strongest link, which is only the same thing
+when a node has more than `TOP_K` neighbours. Every basket of ≤11 products
+was affected — with counts 30/90/60 it produced 1.0 / 3.0 / 2.0 instead of
+0.33 / 1.0 / 0.67, violating the documented invariant that every value lies in
+(0, 1] with exactly one equal to 1.0. The §4 worked example above describes
+the *fixed* behaviour. Embeddings produced before this fix are not comparable
+with those produced after.
+
+**4. Zero and negative quantities are real, and become `log_units = 0.0`.**
+The warehouse `quantity` column is a weekly SUM that folds in returns, so a
+product bought and returned in the same week nets to 0 and a net refund goes
+negative. `log1p` is undefined at or below −1, and those cases land on `0.0` —
+the same value as "bought nothing". That is inherited behaviour, not a
+deliberate modelling decision. If returns are a meaningful share of your data,
+decide in SQL what should happen to them.
+
+**5. `GMM_N_COMPONENTS = 30` and `LEIDEN_RESOLUTION = 1.0` are placeholders**,
+explicitly labelled as such in the code. `sweep_resolution()` and
+`select_k_via_bic()` exist to inform the choice and deliberately do not
+auto-pick.
+
+**6. `orders` and `sales_inc_vat` are exported but never consumed** by any
+Python file. Need-states here are composition-driven only — no spend or
+frequency signal enters the model.
+
+**7. No theme or category anywhere.** Product sub-clustering (node feature
+`[385]`) runs globally over the whole catalog with no pre-grouping. It is
+*derived* structure, not a supplied hierarchy label.
+
+**8. A low training loss does not mean the embeddings are useful.** The model
+reconstructs the *mean* of each basket's node features. If those means vary
+little across baskets, a near-constant output scores well — and every basket
+lands in nearly the same place, making clustering meaningless while everything
+appears to succeed. `test_pipeline.py --prod-outputs` checks for exactly this.
+
+---
+
+## 8. Stage 2.5 — how need-states relate to each other
+
+Stages 1-6 above produce need-state *labels*. `need_state_graph.py` produces
+the **edges between** need-states — which earlier versions of this pipeline
+computed and discarded.
+
+Two edge sets, for two different questions, and **they are not
+interchangeable**:
+
+```
+ADJACENCY (undirected)          TRANSITIONS (directed)
+contract the basket kNN graph   sequence each household's own weeks
+        │                                │
+        ▼                                ▼
+"these two occasions border     "after A, households go to B
+ each other; boundary baskets    next week, 40% of the time"
+ are genuinely ambiguous"
+        │                                │
+        ▼                                ▼
+use for: substitutable states   use for: JOURNEYS, next-best-action
+```
+
+Similarity is not movement. Households do not travel along adjacency edges.
+
+A third table, `need_state_gmm_overlap.parquet`, recovers the full GMM
+posterior (the code previously kept only its maximum, as `gmm_confidence`) as
+a probabilistic cross-check on adjacency. Its columns are named
+`gmm_component_a/b` rather than `need_state_a/b` on purpose: **GMM component
+ids are a different labelling from Leiden community ids**, and sharing a
+column name would invite a join that silently returns nonsense.
+
+Deliberately not provided: centroid-to-centroid distance between need-states.
+Leiden communities are arbitrary-shaped, so an elongated community's centroid
+can land where no basket exists. The quotient graph measures the same
+intuition using only points that really exist.
+
+See PIPELINE_GUIDE.md §6b for the API and `HOUSEHOLD_GRAPH_FLOW.md` for how
+households, baskets, products and need-states relate across both graphs.
+
+---
+
+## 9. Dimension cheat-sheet
 
 | Quantity | Value | Where |
 |---|---|---|
@@ -452,9 +557,9 @@ of the basket-grain discussion in `data/TABLE_REFERENCE.md`.
 | Extra node features | 4 (co-purchase score, sub-cluster id, distinctiveness, log-units) | `GraphBuilder.build_one_graph()` |
 | Node feature width (`in_dim`) | 388 | `emb_dim + 4` |
 | Edge feature width | 2 (log co-purchase count, relative strength) | `GraphBuilder._build_edges_numba()` |
-| Edges kept per node | ≤ `TOP_K = 10` | `GraphBuilder.py` |
-| GNN hidden width | 128 | `GNN_Train.HIDDEN_DIM` |
-| Basket embedding dim (`out_dim`) | 64 | `GNN_Train.OUT_DIM` |
-| Global product sub-clusters (K) | chosen from `[50, 100, 200, 400]` by silhouette | `GraphBuilder.SUBCL_K_CANDIDATES` |
-| Leiden kNN neighbors | 15 | `cluster_basket_embeddings.BASKET_KNN_K` |
-| GMM components | 30 (placeholder) | `pipeline_main.GMM_N_COMPONENTS` |
+| Edges kept per node | ≤ `TOP_K = 10` | `PIPELINE_TOP_K` in `.env` |
+| GNN hidden width | 128 | `PIPELINE_HIDDEN_DIM` in `.env` |
+| Basket embedding dim (`out_dim`) | 64 | `PIPELINE_OUT_DIM` in `.env` |
+| Global product sub-clusters (K) | chosen from `[50, 100, 200, 400]` by silhouette | `PIPELINE_SUBCL_K_CANDIDATES` in `.env`. On the real catalog k=400 was selected — the ceiling of the range, with silhouette still rising, so the true optimum is likely higher |
+| Leiden kNN neighbors | 15 | `PIPELINE_BASKET_KNN_K` in `.env` |
+| GMM components | 30 (placeholder) | `PIPELINE_GMM_N_COMPONENTS` in `.env` |

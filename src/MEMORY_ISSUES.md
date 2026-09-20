@@ -328,6 +328,91 @@ workers.
 
 ---
 
+## Stage 1 — Inference built 50,000 graphs before encoding any of them
+
+**Problem:** This is the one that actually killed a production run, and it
+looked like nothing at all. After the speed fix above, a run trained
+successfully for 2h25m, entered the embedding pass, printed warnings for
+hours, and completed **zero** chunks. No error, no traceback, no crash
+message.
+
+The cause was in how one chunk was processed. The code built a graph for
+*every* basket in the chunk into one Python list, and only then started
+feeding them to the model:
+
+> A chunk is 50,000 baskets. Each basket's graph is around 45KB of node
+> features plus edges and object overhead — so that list is roughly 3.5GB.
+> It sat alongside the co-purchase matrix, which at this data size is about
+> 11.8GB. Peak was ~15.5GB **before a single basket had been encoded**.
+
+On a memory-constrained machine that is enough for the operating system to
+kill the process outright, which on Windows leaves no Python error behind.
+
+It also meant nothing could be printed until an entire chunk had finished, so
+a run that was silently dying looked exactly like a run that was working.
+
+**Fix:** Chunk size should control how much work is *checkpointed*, not how
+much is *held in memory*. Graphs are now built into a small buffer, encoded,
+and thrown away immediately — only the 64 numbers per basket are kept. Peak
+graph memory is set by the (much smaller, tunable) batch size instead of the
+chunk size, so **lowering the batch size is now a real lever against memory
+pressure** — it did nothing before, because the whole chunk was built
+regardless.
+
+A per-basket progress bar and a per-chunk line with throughput and a live ETA
+were added at the same time, so "stuck" and "working" are no longer
+indistinguishable.
+
+---
+
+## Stage 1 — The trained model was saved AFTER inference, not before
+
+**Problem:** Not a memory issue, but it belongs here because it turned a
+recoverable interruption into four and a half lost days.
+
+The embedding pass was carefully built to be restartable: a queue tracks which
+chunks are done, so a crash resumes instead of starting over. But the trained
+model was written to disk *after* that pass finished. Since the pass runs for
+hours or days, any interruption during it destroyed the weights — they existed
+only in that process's memory. Every chunk already embedded became an orphan:
+produced by a model that no longer existed and (with no random seed set) could
+never be reproduced.
+
+Worse, the queue did not know that. A rerun would keep those chunks and embed
+only the remaining ones — using a newly trained, *different* model. The result
+is one embeddings file containing two incompatible embedding spaces, clustered
+together as if they were one. Nothing errors; the need-states are simply wrong,
+in a way that is very hard to detect afterwards.
+
+**Fix:** Save the model *before* inference starts, and set a random seed so a
+retrain is reproducible. Together these make the restartability real.
+`reset_inference.py` was added to clean up after runs that predate the fix —
+it refuses to delete anything when a model file exists, since those chunks may
+still be valid.
+
+---
+
+## Stage 1 — Two expensive things were rebuilt on every rerun
+
+**Problem:** Restarting the pipeline (to apply a fix, or after a crash) paid
+for two long stages again even though their results were sitting on disk:
+
+- the **co-purchase matrix** — hours to build, and its own in-progress
+  checkpoint is deleted on success, so nothing indicated it was already done
+- the **trained model** — over two hours, and the training code had no check
+  for an existing model at all
+
+Since a rerun usually happens *because* the long inference pass needs
+restarting, this was paid exactly when it hurt most.
+
+**Fix:** Both now record what they were built from, and are reused when that
+still matches. The co-purchase matrix gets a small sidecar file noting the
+basket and product counts; the model gets one noting its architecture,
+training settings, seed, and the graph fingerprint. Change any of those and it
+rebuilds automatically rather than silently reusing something incompatible.
+
+---
+
 ## Stage 2 — Still open: clustering at 57 million baskets
 
 This one is **not fixed**, and is flagged here so it isn't discovered the
@@ -405,6 +490,11 @@ hiding inside it stops being a rounding error and becomes the whole runtime.
 | 11 | Stage 1 | Embedding every basket: ~21 ms per basket → **~9-10 days** for 57.1M baskets. Taking a basket's slice of the co-purchase table read *entire rows* first (hundreds of thousands of entries for popular products) to keep 900 of them. A direct consequence of memory fix #4. | Look up only the needed entries by binary search over each row's sorted indices, instead of copying the row and filtering. Cost no longer scales with product popularity. Verified **bit-identical** over 3,000 random matrices + edge cases, so a part-finished run resumes instead of restarting. | `GraphBuilder.py` (`_basket_dense_cp_submatrix`) |
 | 12 | Stage 1 | The new lookup needs each row's indices sorted and de-duplicated — usually already true, but a silent wrong-answer risk if ever not | `prepare_globals()` now guarantees canonical form explicitly. No-op when already canonical; no matrix copy either way | `GraphBuilder.py` (`prepare_globals`) |
 | — | Stage 1 | No way to tell where per-basket time was going, or to confirm a "faster" version returns the same numbers on real data | Added a benchmark that reports old-vs-new equivalence, a per-stage cost breakdown, and a projected wall clock for the baskets remaining | `benchmark_inference.py` (new) |
+| 13 | Stage 1 | Inference built **all 50,000 graphs in a chunk** (~3.5GB) before encoding any — ~15.5GB peak alongside the co-purchase matrix. Killed a production run silently: 0 chunks after hours, no traceback | Build into a small buffer, encode, discard. Peak is now set by batch size (tunable, far smaller) rather than chunk size, so lowering the batch size finally helps | `GraphBuilder.py` (`_embed_basket_chunk`) |
+| 14 | Stage 1 | Nothing printed until a whole chunk finished, so a dying run and a working one looked identical | Per-basket progress bar + per-chunk line with throughput and a live ETA | `GraphBuilder.py` (`_embed_basket_chunk`, `run_inference`) |
+| 15 | Stage 1 | Model saved **after** the multi-hour inference pass, so any interruption destroyed the weights and orphaned every chunk already embedded — while the queue happily "resumed" into a different model | Save before inference; seed training so a retrain is reproducible; add a cleanup script for runs predating the fix | `GNN_Train.py`, `reset_inference.py` (new) |
+| 16 | Stage 1 | Reruns rebuilt the co-purchase matrix (hours) and retrained the model (~2h25m) even though both were on disk — paid precisely when restarting a long inference pass | Fingerprinted sidecars for both; reused when they still match, rebuilt automatically when they don't | `pipeline_main.py`, `GNN_Train.py` |
+| 17 | Stage 1 | `log1p` on the `quantity` column raised a RuntimeWarning per basket (returns make it ≤ −1), flooding the log and costing real wall-clock time on Windows stderr | Evaluate `log1p` only where defined — bit-identical to the old `log1p` + `nan_to_num` in every case, verified over 200,000 random values | `GraphBuilder.py` (`build_one_graph`) |
 
 ---
 

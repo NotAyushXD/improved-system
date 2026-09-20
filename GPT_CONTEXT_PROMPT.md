@@ -19,7 +19,7 @@ grouping size/color variants of the same product).
 anywhere to pre-group products or baskets. There used to be a
 category/"theme" based version of this pipeline; it was refactored away on
 purpose (see repeated "theme-free" comments throughout the code, and
-`test_theme_free_pipeline.py`, which fails CI if any theme/category concept
+`test_pipeline.py`, which fails CI if any theme/category concept
 is reintroduced). Do not suggest reintroducing category-based grouping
 upstream of clustering unless I explicitly ask for it.
 
@@ -61,7 +61,7 @@ project/
     │                                 baskets to existing clusters.
     ├── score_new_baskets.py          Scores new/held-out-period baskets against an already-trained model, no
     │                                 retraining — reuses GraphBuilder's exact graph-construction code.
-    ├── test_theme_free_pipeline.py   Sanity test: (1) AST-walks all active files, fails if any theme/category
+    ├── test_pipeline.py   Sanity test: (1) AST-walks all active files, fails if any theme/category
     │                                 identifier exists anywhere; (2) functional check building synthetic data and
     │                                 asserting training/scoring paths produce consistent graph features.
     └── requirements.txt              torch/torch-geometric must be installed manually first (platform/CUDA
@@ -164,21 +164,77 @@ environment was available in the environment these fixes were made in):
    what `build_product_embeddings.py` wrote and what `pipeline_main.py` /
    `score_new_baskets.py` read).
 
-## What HAS been verified
+## What HAS been verified — on the real machine, against real data
 
-`test_theme_free_pipeline.py` (both the static no-theme check and the
-functional synthetic-data check) has been run on the real target machine
-and passes end-to-end — confirms the API wiring from fixes 1-5 above is
-correct, but only at toy scale (30 products, 25 baskets).
+**Measured production scale** (this supersedes any earlier numbers in this
+document): 57,115,804 baskets; 154,597 products in the co-purchase matrix
+with 1,474,348,846 non-zeros (mean 9,537 per product row); 198,652 products
+with embeddings; global product sub-clustering selected k=400. CPU-only
+Windows box, memory-constrained.
+
+**Reached end to end:** Stage 0 (basket build), Stage 1a (co-purchase
+matrix), product sub-clustering, LMDB training-graph cache (299,999 graphs),
+and 20 epochs of GNN training (2h25m, final avg_loss 3.2e-5).
+
+**`test_pipeline.py` passes all six groups on the target machine**, including
+checks that are not toy-scale in nature: the per-basket submatrix rewrite is
+bit-identical to the original over random matrices; chunked co-purchase
+accumulation equals single-shot exactly; training and inference build
+byte-identical graphs (node *and* edge features); config fingerprints move
+when a graph-affecting parameter changes and stay put otherwise.
+
+**Fixed after being observed in production, not in theory:**
+
+7. **Per-basket co-purchase slicing was ~21ms/basket** (≈9 days for 57M).
+   `csr[rows][:, cols]` materialised entire rows — ~9,537 non-zeros each —
+   to keep ~900. Replaced with a binary search over sorted indices;
+   bit-identical, verified over 3,000 random matrices.
+8. **Edge relative-strength used the wrong denominator** for any node with
+   ≤ TOP_K neighbours (i.e. every basket of ≤11 products), producing values
+   above 1.0. `GRAPH_BUILDER_VERSION` bumped to 3.
+9. **The model was saved AFTER the multi-hour inference pass**, so any
+   interruption destroyed the weights and orphaned every completed chunk
+   while the queue happily "resumed" into a different model. Now saved
+   before, and training is seeded.
+10. **Inference built all 50,000 graphs in a chunk before encoding any**
+    (~3.5GB on top of an 11.8GB matrix). This silently killed a production
+    run — 0 chunks after hours, no traceback. Now streams through a
+    batch-sized buffer; batch size is the memory lever, chunk size is not.
+11. **Reruns rebuilt the co-purchase matrix and retrained the model** even
+    though both were on disk. Both now have fingerprinted sidecars.
+12. **All config moved to `config.py` + `.env`** (50 parameters, typed and
+    validated at import, with cache fingerprints so a `.env` tweak cannot
+    silently reuse an incompatible cache).
+13. **Windows encoding**: every runtime file read now specifies UTF-8. The
+    locale default is cp1252 there, and every source file contains non-ASCII
+    comment characters.
+14. **Stage 2.5 added** (`need_state_graph.py`): need-state adjacency,
+    household transition graph, and journey queries — recovering edge
+    structure the pipeline previously computed and discarded.
 
 ## What has NOT been verified yet
 
-None of the fixes above (or the basket-grain change) have been run against
-the real ~1B-row dataset. `pipeline_main.py` has not yet been re-run since
-the co-purchase-matrix crash that started this thread, and hasn't been run
-at all since the basket grain changed from period to week — so the "21.98M
-baskets, ~47/basket" numbers above are now stale and need to be re-measured
-after re-running the SQL and Stage 0/1.
+- **The full inference pass has never completed.** Training finishes; the
+  embedding pass over all 57M baskets has not yet run to completion since
+  the streaming/memory fix.
+- **Stage 2 has never run at this scale, and is expected not to fit**:
+  ~29GB peak while normalising 57M × 64 embeddings, ~14GB per GMM EM
+  iteration, several GB for the kNN edge list. The intended fix — cluster a
+  sample, then assign the rest via the existing `assign_new_baskets_to_clusters`
+  / saved-GMM `predict` path — is **not yet wired into the main run**.
+- **Embedding quality is unchecked.** Training loss is very low (3.2e-5),
+  which is consistent with either a good autoencoder or a collapsed one.
+  `test_pipeline.py --prod-outputs` has a collapse check that cannot run
+  until embeddings exist.
+- **`k=400` was selected at the ceiling** of the sub-cluster candidate range
+  with silhouette still rising (0.065 → 0.078 → 0.085 → 0.096), so the true
+  optimum is probably higher. Note 0.096 is weak in absolute terms.
+- **Returns are unquantified.** `quantity` is a weekly SUM including refunds;
+  non-positive values land on `log_units = 0.0`, same as "bought nothing".
+  Inherited behaviour, not a decision.
+- **Journeys rest on an ~8-week SQL window** (`202603-202604`), giving only a
+  handful of transitions per household. Widening it is the single
+  highest-value change to the journey work.
 
 ## What I'd like from you
 
