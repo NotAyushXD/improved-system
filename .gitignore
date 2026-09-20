@@ -7,7 +7,6 @@ ENV/
 # ── Local configuration ──
 # .env is per-machine (paths, tuning). .env.example IS committed — it is the
 # documented template every parameter is described in.
-.env
 .env.*
 !.env.example
 

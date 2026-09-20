@@ -587,7 +587,29 @@ def build_one_graph(
     global_idx_arr = np.array([seen[p] for p in products_clean], dtype=np.int64)
     local_idx_arr  = np.array([local_idx[gi] for gi in global_idx_arr], dtype=np.int64)
     units_arr      = np.array([unit_map[p] for p in products_clean], dtype=np.float32)
-    log_units      = np.log1p(units_arr)
+
+    # Quantities can legitimately be <= -1. The warehouse `quantity` column is
+    # a weekly SUM that folds in returns/refunds, so a product bought once and
+    # returned once nets to 0, and a net refund nets negative. log1p(-1) is
+    # -inf and log1p(x < -1) is NaN — both of which the np.nan_to_num() call
+    # further down already mapped to 0.0, so the FEATURE VALUES were always
+    # correct. What was not correct was the cost: numpy raised a RuntimeWarning
+    # for every affected basket, and at ~57M baskets that console spew both
+    # buried the chunk-progress output and burned real wall-clock time (stderr
+    # writes are slow on Windows, and slower still through a tee).
+    #
+    # Evaluating log1p only where it is defined avoids the warning while being
+    # BIT-IDENTICAL to the old behaviour, case for case:
+    #     q >= 0        -> log1p(q)                     (unchanged)
+    #     -1 < q < 0    -> log1p(q), a finite negative   (unchanged — note this
+    #                      is why a plain clamp to 0 would NOT be equivalent;
+    #                      fractional negatives are real for weighed goods)
+    #     q == -1       -> 0.0, matching nan_to_num(-inf)
+    #     q <  -1       -> 0.0, matching nan_to_num(NaN)
+    # So no cached artifact, trained model, or already-embedded chunk is
+    # invalidated by this change.
+    log_units = np.zeros_like(units_arr)
+    np.log1p(units_arr, out=log_units, where=units_arr > -1.0)
 
     # ── Node features ──
     emb      = emb_matrix[global_idx_arr]          # (n, emb_dim)
@@ -675,32 +697,71 @@ def build_one_graph(
 # total.
 # ─────────────────────────────────────────────
 
-def _embed_basket_chunk(chunk_df, G, model, device, batch_size=4096):
+def _embed_basket_chunk(chunk_df, G, model, device, batch_size=None, show_progress=True):
     """
-    Builds and encodes graphs for exactly the baskets in `chunk_df` — no
-    accumulation across chunks happens here, that's run_inference()'s job.
+    Builds and encodes graphs for exactly the baskets in `chunk_df`.
     Returns (basket_ids, z_array) for this one chunk only.
-    """
-    from torch_geometric.loader import DataLoader as PyGDataLoader
 
-    has_units    = "units" in chunk_df.columns
+    MEMORY — this used to build EVERY graph in the chunk into one Python list
+    and only then hand that list to a DataLoader. At the default chunk size of
+    50,000 baskets that list is ~3.5GB (≈45KB of node features per basket, plus
+    edge tensors and per-object overhead), and it sat alongside the ~11.8GB
+    co-purchase matrix — roughly 15.5GB resident before a single batch had been
+    encoded. On a memory-constrained machine that is enough to die silently,
+    with no Python traceback, which is exactly what "0 chunks complete after
+    hours of running" looks like.
+    Chunk size should control how much work is CHECKPOINTED at a time, not how
+    much is held in RAM. So graphs are now built into a buffer of `batch_size`,
+    encoded, and thrown away immediately — only the 64-float embeddings are
+    kept. Peak graph memory is set by INFERENCE_BATCH_SIZE (tunable, and far
+    smaller) instead of INFERENCE_CHUNK_BASKETS, and lowering the batch size is
+    now a real lever against memory pressure.
+
+    PROGRESS — nothing was printed until an entire 50,000-basket chunk had
+    finished, so a slow or stuck run was indistinguishable from a working one.
+    A per-basket bar with a rate readout now makes the throughput visible
+    within the first seconds, which is what the ETA should be computed from.
+    """
+    from torch_geometric.data import Batch
+
+    batch_size = batch_size if batch_size is not None else config.INFERENCE_BATCH_SIZE
+
     all_products = chunk_df["products"].tolist()
-    all_units    = chunk_df["units"].tolist() if has_units else None
+    all_units    = chunk_df["units"].tolist() if "units" in chunk_df.columns else None
     basket_ids   = (
         chunk_df["basket_id"].tolist()
         if "basket_id" in chunk_df.columns
         else list(range(len(chunk_df)))
     )
+    n = len(all_products)
+    if n == 0:
+        return [], np.empty((0, 0), dtype=np.float32)
 
     csr     = G["csr"]
     pid2idx = G["product_id_to_index"]
+    model.eval()
 
-    graphs = []
-    for i in range(len(chunk_df)):
+    z_parts = []
+    buf     = []
+
+    def _flush():
+        """Encode whatever is buffered, keep only the embeddings, drop the graphs."""
+        if not buf:
+            return
+        batch = Batch.from_data_list(buf).to(device)
+        with torch.no_grad():
+            z = model.encode(batch)
+        z_parts.append(z.detach().cpu().numpy().astype(np.float32))
+        buf.clear()
+        del batch, z
+
+    bar = tqdm(range(n), desc="    baskets", unit="bskt", leave=False,
+               disable=not show_progress, mininterval=2.0)
+    for i in bar:
         products = all_products[i]
         units    = all_units[i] if all_units is not None else [1.0] * len(products)
         local_idx_map, basket_dense_cp = _basket_dense_cp_submatrix(products, csr, pid2idx)
-        g = build_one_graph(
+        buf.append(build_one_graph(
             products             = products,
             units                = units,
             basket_id            = basket_ids[i],
@@ -711,24 +772,16 @@ def _embed_basket_chunk(chunk_df, G, model, device, batch_size=4096):
             dense_cp             = basket_dense_cp,
             local_idx            = local_idx_map,
             product_id_to_index  = pid2idx,
-        )
-        graphs.append(g)
+        ))
+        if len(buf) >= batch_size:
+            _flush()
+    _flush()
+    bar.close()
 
-    if not graphs:
-        return [], np.empty((0, 0), dtype=np.float32)
-
-    model.eval()
-    z_parts = []
-    loader = PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            z = model.encode(batch)
-            z_parts.append(z.detach().cpu().numpy().astype(np.float32))
-
-    del graphs, loader
     gc.collect()
 
+    if not z_parts:
+        return basket_ids, np.empty((0, 0), dtype=np.float32)
     return basket_ids, np.vstack(z_parts)
 
 
@@ -762,12 +815,26 @@ def run_inference(con, dataset_tag, G, model, device, worker_id=None,
     os.makedirs(output_dir, exist_ok=True)
     basket_store.ensure_inference_chunk_plan(con, dataset_tag, chunk_size)
 
+    import time
+
+    # How many chunks exist in total, so each line can report progress and an
+    # ETA rather than just a running count. Without this the only way to know
+    # how long a multi-hour run has left was to count log lines by hand.
+    chunks_table = f"inference_chunks_{dataset_tag}"
+    n_total = con.execute(f'SELECT COUNT(*) FROM "{chunks_table}"').fetchone()[0]
+    n_already = con.execute(
+        f"SELECT COUNT(*) FROM \"{chunks_table}\" WHERE status = 'complete'").fetchone()[0]
+    print(f"  {n_already:,}/{n_total:,} chunks already complete "
+          f"({n_total - n_already:,} to go, {chunk_size:,} baskets each)")
+
     n_done = 0
+    t_run_start = time.monotonic()
     while True:
         claimed = basket_store.claim_next_chunk(con, dataset_tag, worker_id, stale_after_seconds)
         if claimed is None:
             break
 
+        t_chunk = time.monotonic()
         chunk_df = basket_store.get_basket_range(con, dataset_tag, claimed["seq_lo"], claimed["seq_hi"])
         basket_ids, z_array = _embed_basket_chunk(chunk_df, G, model, device, batch_size=batch_size)
 
@@ -780,8 +847,18 @@ def run_inference(con, dataset_tag, G, model, device, worker_id=None,
 
         basket_store.mark_chunk_complete(con, dataset_tag, claimed["chunk_id"])
         n_done += 1
-        print(f"  chunk {claimed['chunk_id']} complete ({len(chunk_df):,} baskets) "
-              f"— {n_done} chunks finished by worker {worker_id!r} this run")
+
+        elapsed = time.monotonic() - t_chunk
+        rate = len(chunk_df) / elapsed if elapsed > 0 else float("nan")
+        # ETA from THIS run's average, not just the last chunk — one slow chunk
+        # (a big-basket stratum, a background process) shouldn't swing it.
+        avg = (time.monotonic() - t_run_start) / n_done
+        remaining = max(n_total - n_already - n_done, 0)
+        eta_h = remaining * avg / 3600
+        print(f"  chunk {claimed['chunk_id']} done in {elapsed:,.0f}s "
+              f"({rate:,.0f} baskets/s, {elapsed/max(len(chunk_df),1)*1e6:,.0f} us/basket) "
+              f"| {n_already + n_done:,}/{n_total:,} chunks "
+              f"| ETA {eta_h:,.1f} h ({eta_h/24:,.1f} d) at {avg:,.0f}s/chunk")
 
         del chunk_df, basket_ids, z_array
         gc.collect()

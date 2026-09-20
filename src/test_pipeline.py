@@ -537,6 +537,45 @@ def check_graph_primitives():
     else:
         print("  build_one_graph: duplicate products deduped with units summed — OK")
 
+    # ── build_one_graph: zero / negative quantities (returns) ────────────
+    # The warehouse `quantity` column is a weekly SUM that folds in returns, so
+    # it can be 0 or negative. log1p is -inf at -1 and NaN below it. The masked
+    # evaluation must reproduce exactly what log1p + nan_to_num used to give
+    # (a trained model and embedded chunks depend on those values being
+    # unchanged) AND must not emit a RuntimeWarning — at 57M baskets the
+    # warning spew buried progress output and cost real wall-clock time.
+    import warnings as _warnings
+
+    for units_in, want in (
+        ([1.0, 0.0, -1.0],  [float(np.log1p(1.0)), 0.0, 0.0]),
+        ([-3.0, -0.5, 2.0], [0.0, float(np.log1p(-0.5)), float(np.log1p(2.0))]),
+        ([-1.0001, -50.0, 0.0], [0.0, 0.0, 0.0]),
+    ):
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            g_neg = build_one_graph(
+                products=prods, units=units_in, basket_id="tneg",
+                emb_matrix=emb_matrix, emb_dim=emb_dim,
+                subcluster_arr=subcl, distinctiveness_arr=dist,
+                dense_cp=dense_cp, local_idx=local_idx, product_id_to_index=pid2idx,
+            )
+        got_lu = g_neg.x.numpy()[:, emb_dim + 3]
+        runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        if not np.allclose(got_lu, want, atol=1e-6):
+            ok = _fail(f"log_units for units={units_in} should be {want}, got {list(got_lu)}")
+            break
+        if runtime_warnings:
+            ok = _fail(f"units={units_in} raised {len(runtime_warnings)} RuntimeWarning(s) "
+                       f"(first: {runtime_warnings[0].message}) — log1p must not be "
+                       f"evaluated where it is undefined")
+            break
+        if not np.isfinite(g_neg.x.numpy()).all():
+            ok = _fail(f"units={units_in} produced non-finite node features")
+            break
+    else:
+        print("  build_one_graph: zero/negative quantities (returns) give the same "
+              "log_units as log1p+nan_to_num, with no RuntimeWarning — OK")
+
     # ── build_one_graph: empty/degenerate basket does not crash ──────────
     g3 = build_one_graph(
         products=["ZZZ"], units=[1.0], basket_id="t3",

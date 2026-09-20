@@ -22,6 +22,7 @@ multiple concurrent processes claiming chunks at once (see
 basket_store.claim_next_chunk).
 """
 
+import json
 import os
 import socket
 import numpy as np
@@ -35,7 +36,8 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import joblib
 
-from GraphBuilder import prepare_globals, run_inference, merge_inference_output
+from GraphBuilder import (prepare_globals, run_inference, merge_inference_output,
+                          GRAPH_BUILDER_VERSION)
 import basket_store
 import lmdb_graph_cache
 import config
@@ -71,6 +73,29 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 LMDB_TRAINING_GRAPHS_PATH = os.path.join(OUTPUT_DIR, "training_graphs.lmdb")
 LMDB_MANIFEST_PATH        = os.path.join(OUTPUT_DIR, "training_graphs.lmdb.manifest.json")
+
+# Sidecar recording what the saved model was trained under, so a rerun can
+# reuse it rather than spending hours retraining — and so it is never reused
+# after a setting that affects the weights has changed. Same pattern as the
+# LMDB training-graph manifest.
+MODEL_MANIFEST_PATH       = os.path.join(OUTPUT_DIR, "basket_gnn_model.manifest.json")
+
+
+def _manifest_matches(path: str, expected: dict) -> bool:
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f) == expected
+    except (OSError, ValueError):
+        return False
+
+
+def _write_manifest(path: str, manifest: dict):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    os.replace(tmp, path)   # atomic — never leaves a truncated manifest
 
 
 def _default_worker_id() -> str:
@@ -187,12 +212,8 @@ def train_and_embed(
     train_dataset = lmdb_graph_cache.LMDBGraphDataset(LMDB_TRAINING_GRAPHS_PATH)
     print(f"  Training graphs ready: {len(train_dataset):,} (LMDB-backed, lazy random access)")
 
-    # ── Step 4: Train ──
-    print(f"\n[ 4 / 4 ] Training GNN for {EPOCHS} epochs...")
-    train_loader = DataLoader(
-        train_dataset, batch_size=TRAIN_BATCH,
-        shuffle=True, num_workers=NUM_WORKERS,
-    )
+    # ── Step 4: Train (or reuse an already-trained model) ──
+    model_path = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
 
     model = BasketGNN(
         in_dim     = in_dim,
@@ -202,11 +223,50 @@ def train_and_embed(
         dropout    = DROPOUT,
     ).to(device)
 
+    # Reuse a matching trained model instead of retraining from scratch.
+    # Training takes hours, and inference (which follows it) takes longer still
+    # — so ANY restart of the inference pass used to pay for a full retrain
+    # first, even though a perfectly good checkpoint was sitting on disk. Worse,
+    # retraining produces a DIFFERENT model, so chunks already embedded by the
+    # previous model would be silently mixed with chunks from the new one.
+    # The manifest covers everything the weights depend on: architecture,
+    # optimiser settings, epochs, sample size, seed, and the graph fingerprint
+    # (so a change to TOP_K or sub-clustering forces a retrain, exactly as it
+    # forces an LMDB rebuild). Delete basket_gnn_model.pt to force a retrain.
+    expected_model_manifest = {
+        "in_dim": in_dim, "hidden_dim": HIDDEN_DIM, "out_dim": OUT_DIM,
+        "edge_dim": EDGE_DIM, "dropout": DROPOUT, "epochs": EPOCHS,
+        "lr": LR, "weight_decay": WEIGHT_DECAY, "train_batch": TRAIN_BATCH,
+        "n_train_samples": len(train_dataset), "seed": config.SEED,
+        "graph_builder_version": GRAPH_BUILDER_VERSION,
+        "graph_fingerprint": config.graph_fingerprint(),
+    }
+
+    if os.path.exists(model_path) and _manifest_matches(MODEL_MANIFEST_PATH, expected_model_manifest):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"\n[ 4 / 4 ] REUSING trained model from {model_path} "
+              f"(manifest matches — same architecture, settings, seed and graph "
+              f"fingerprint). Skipping {EPOCHS} epochs of training.")
+        print(f"          Delete {model_path} if you want to retrain from scratch.")
+        train_loader = None
+    else:
+        if os.path.exists(model_path):
+            print(f"\n  IGNORING {model_path}: its manifest doesn't match this run "
+                  f"(architecture, training settings, seed, or graph construction "
+                  f"changed) — retraining rather than embedding with a model built "
+                  f"under different settings.")
+        print(f"\n[ 4 / 4 ] Training GNN for {EPOCHS} epochs...")
+        train_loader = DataLoader(
+            train_dataset, batch_size=TRAIN_BATCH,
+            shuffle=True, num_workers=NUM_WORKERS,
+        )
+
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler    = GradScaler(enabled=device.type == "cuda")
     model.train()
 
-    epoch_bar = tqdm(range(EPOCHS), desc="Epochs", unit="epoch")
+    epoch_bar = tqdm(range(EPOCHS if train_loader is not None else 0),
+                     desc="Epochs", unit="epoch", disable=train_loader is None)
     for epoch in epoch_bar:
         total_loss  = 0.0
         nan_batches = 0
@@ -267,11 +327,13 @@ def train_and_embed(
     #
     # Saving here makes the restartability real: the weights survive the
     # process, so a killed run genuinely resumes where it left off.
-    model_path = os.path.join(OUTPUT_DIR, "basket_gnn_model.pt")
-    torch.save(model.state_dict(), model_path)
-    print(f"\nModel saved to {model_path} BEFORE inference — a crash or stop "
-          f"during the (long) inference pass can now resume against these exact "
-          f"weights instead of losing them.")
+    if train_loader is not None:
+        torch.save(model.state_dict(), model_path)
+        _write_manifest(MODEL_MANIFEST_PATH, expected_model_manifest)
+        print(f"\nModel saved to {model_path} BEFORE inference — a crash or stop "
+              f"during the (long) inference pass can now resume against these exact "
+              f"weights instead of losing them, AND a rerun will reuse this model "
+              f"rather than retraining.")
 
     print("\n[ Inference ] Embedding all baskets via full GNN encoding "
           "(restartable, chunked from DuckDB)...")
