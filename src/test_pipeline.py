@@ -41,6 +41,13 @@ WHAT IS CHECKED, AND WHY EACH ONE EXISTS
  8 PROD OUTPUTS    opt-in sanity checks against real artifacts in ../data/output
                     (embedding collapse, degenerate clusters, label coverage).
                     Skipped automatically when those files are absent.
+ 9 CLUSTERING      Stage 2's progress reporting, plus the two rewrites it came
+   PROGRESS         with: _build_igraph now factorizes over arrays instead of
+                    building a 57M-entry dict and a 96M-tuple list, and Leiden
+                    drives the optimiser one iteration at a time so each one
+                    reports. Both are pinned against the implementation they
+                    replaced — observability was the goal, changed cluster
+                    assignments would be a regression.
 """
 
 import argparse
@@ -1356,6 +1363,618 @@ def check_prod_outputs():
 
 
 # ─────────────────────────────────────────────
+# 9. CLUSTERING PROGRESS + GRAPH BUILD
+# ─────────────────────────────────────────────
+
+def _grouping(ids, labels):
+    """Labels -> set of frozensets of co-clustered ids, ignoring label numbering."""
+    from collections import defaultdict
+    buckets = defaultdict(set)
+    for i, lab in zip(ids, labels):
+        buckets[lab].add(i)
+    return {frozenset(members) for members in buckets.values()}
+
+
+def _same_edges(left, right):
+    """
+    Edge-table equality that survives a parquet round-trip.
+
+    Deliberately not DataFrame.equals: that compares dtypes, and pandas 3 /
+    future.infer_string reads string columns back from parquet as StringDtype
+    where they went in as object. That is a storage detail, not a difference
+    in the edges, and failing on it would be a false alarm.
+    """
+    if len(left) != len(right) or list(left.columns) != list(right.columns):
+        return False
+    for col in left.columns:
+        lhs, rhs = left[col].reset_index(drop=True), right[col].reset_index(drop=True)
+        if col == "weight":
+            if not np.allclose(lhs.to_numpy(dtype=float), rhs.to_numpy(dtype=float)):
+                return False
+        elif list(lhs.astype(object)) != list(rhs.astype(object)):
+            return False
+    return True
+
+
+def _reference_build_igraph(edges):
+    """
+    The pure-Python _build_igraph that cluster_basket_embeddings.py used to
+    have, kept here purely as the thing the vectorised version must agree with.
+    Do NOT "fix" this to match the fast one — it is the baseline.
+    """
+    baskets = sorted(set(edges["basket_a"]) | set(edges["basket_b"]))
+    idx = {b: i for i, b in enumerate(baskets)}
+    pairs = [(idx[a], idx[b]) for a, b in zip(edges["basket_a"], edges["basket_b"])]
+    return baskets, pairs, edges["weight"].tolist()
+
+
+def check_clustering_progress():
+    """
+    Stage 2's progress reporting, and the vectorised graph build it exposed.
+
+    Two separate things are verified here, and the second is the one that
+    matters for results:
+
+      * the reporting helpers themselves (duration formatting, step
+        announcement, heartbeat) — cheap to get subtly wrong, e.g. a heartbeat
+        thread that never fires or never stops;
+
+      * that the rewritten _build_igraph and the per-iteration Leiden loop are
+        BEHAVIOUR-PRESERVING. _build_igraph was changed from a Python dict +
+        tuple-list build to pd.factorize over arrays, and Leiden now runs the
+        optimiser one iteration at a time instead of calling find_partition()
+        once. Both were done for observability and memory, neither is allowed
+        to change which baskets end up clustered together — so both are pinned
+        against their previous implementation here.
+    """
+    print()
+    print("=" * 70)
+    print("9. CLUSTERING: progress reporting, vectorised graph build, Leiden parity")
+    print("=" * 70)
+
+    import io
+    import os as _os
+    import threading
+    import time as _time
+    from contextlib import redirect_stdout
+
+    import leidenalg
+
+    import cluster_basket_embeddings as cbe
+    import config
+
+    ok = True
+
+    # ── duration formatting, hand-computed ───────────────────────────────
+    fmt_cases = [(0, "0s"), (9, "9s"), (59, "59s"), (60, "1m 00s"),
+                 (95, "1m 35s"), (3600, "1h 00m 00s"), (3725, "1h 02m 05s"),
+                 (86_400, "24h 00m 00s")]
+    bad_fmt = [(s, cbe.fmt_duration(s), want) for s, want in fmt_cases
+               if cbe.fmt_duration(s) != want]
+    if bad_fmt:
+        ok = _fail(f"fmt_duration wrong (seconds, got, want): {bad_fmt}")
+    else:
+        print(f"  fmt_duration: {len(fmt_cases)} hand-computed cases — OK")
+
+    # ── progress_step announces, times, and heartbeats ───────────────────
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        with cbe.progress_step("unit test step", 2, 7, heartbeat_secs=0.05):
+            _time.sleep(0.25)
+    out = buf.getvalue()
+    if "[2/7] unit test step ..." not in out:
+        ok = _fail(f"progress_step did not announce the step: {out!r}")
+    elif "[2/7] unit test step: done in" not in out:
+        ok = _fail(f"progress_step did not report a duration: {out!r}")
+    elif "still running" not in out:
+        ok = _fail(f"heartbeat never fired for a step longer than the interval: {out!r}")
+    else:
+        beats = out.count("still running")
+        print(f"  progress_step: announces, heartbeats ({beats}x at 0.05s), "
+              f"reports duration — OK")
+
+    # A step SHORTER than the heartbeat interval must stay quiet, otherwise
+    # every fast step in the pipeline gains a useless line.
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        with cbe.progress_step("fast step", heartbeat_secs=60):
+            pass
+    if "still running" in buf.getvalue():
+        ok = _fail("heartbeat fired for a step shorter than its interval")
+    else:
+        print("  progress_step: no heartbeat for a sub-interval step — OK")
+
+    # The heartbeat thread must not outlive the step. Compared by thread
+    # IDENTITY rather than threading.active_count(): tqdm's monitor thread and
+    # numba/joblib pools come and go independently, so a bare count is flaky on
+    # a loaded box and would fail for reasons having nothing to do with this.
+    before_ids = {t.ident for t in threading.enumerate()}
+    with redirect_stdout(io.StringIO()):
+        with cbe.progress_step("thread cleanup", heartbeat_secs=0.01):
+            _time.sleep(0.05)
+    leaked = [t for t in threading.enumerate()
+              if t.ident not in before_ids and t.is_alive()]
+    if leaked:
+        ok = _fail(f"heartbeat thread outlived its step: {[t.name for t in leaked]}")
+    else:
+        print("  progress_step: heartbeat thread is joined on exit — OK")
+
+    # A step that raises must say so, not print a success-shaped line — the
+    # whole point of this helper is telling a hang from a crash.
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            with cbe.progress_step("exploding step"):
+                raise MemoryError("simulated OOM")
+    except MemoryError:
+        pass
+    else:
+        ok = _fail("progress_step swallowed an exception raised inside it")
+    crash_out = buf.getvalue()
+    if "FAILED after" not in crash_out:
+        ok = _fail(f"a step that raised did not report failure: {crash_out!r}")
+    elif "done in" in crash_out:
+        ok = _fail(f"a step that raised still printed 'done in': {crash_out!r}")
+    else:
+        print("  progress_step: a raising step reports FAILED, exception propagates — OK")
+
+    # ── _build_igraph parity vs the old pure-Python build ────────────────
+    rng = np.random.default_rng(20260922)
+    mismatches = []
+    for id_kind in ("int", "str", "sparse-int"):
+        for _ in range(60):
+            n_ids = int(rng.integers(2, 25))
+            if id_kind == "int":
+                ids = np.arange(n_ids)
+            elif id_kind == "str":
+                # Deliberately NOT zero-padded: '10' sorts before '9' as a
+                # string, so this catches a build that sorted numerically on
+                # one side and lexically on the other.
+                ids = np.array([f"b{i}" for i in range(n_ids)], dtype=object)
+            else:
+                ids = np.arange(n_ids) * int(rng.integers(1, 10_000))
+
+            m = int(rng.integers(1, 40))
+            e = pd.DataFrame({
+                "basket_a": rng.choice(ids, m),
+                "basket_b": rng.choice(ids, m),
+                "weight": rng.random(m),
+            })
+
+            want_baskets, want_pairs, want_weights = _reference_build_igraph(e)
+            with redirect_stdout(io.StringIO()):
+                g, got_baskets = cbe._build_igraph(e)
+
+            if list(got_baskets) != list(want_baskets):
+                mismatches.append((id_kind, "vertex order/identity"))
+                break
+            # Compared position by position (igraph keeps insertion order) but
+            # with each edge's endpoints unordered: the graph is undirected, so
+            # (i, j) and (j, i) are the same edge and igraph is free to store
+            # either. A real divergence — wrong index, wrong count, wrong
+            # pairing — still fails this.
+            if ([frozenset(edge.tuple) for edge in g.es]
+                    != [frozenset(p) for p in want_pairs]):
+                mismatches.append((id_kind, "edge endpoint indices"))
+                break
+            if not np.allclose(g.es["weight"], want_weights):
+                mismatches.append((id_kind, "edge weights"))
+                break
+            if g.vcount() != len(want_baskets) or g.ecount() != len(want_pairs):
+                mismatches.append((id_kind, "vcount/ecount"))
+                break
+
+    if mismatches:
+        ok = _fail(f"_build_igraph diverged from the pure-Python build: {mismatches}")
+    else:
+        print("  _build_igraph: identical vertices, edge indices and weights to the "
+              "pure-Python build (180 random cases: int / str / sparse-int ids) — OK")
+
+    # Weights must stay attached to the RIGHT edge, checked by endpoint id
+    # rather than by position — a factorize that reordered anything would pass
+    # a positional check and still corrupt every edge weight.
+    e = pd.DataFrame({
+        "basket_a": ["b2", "b0", "b1"],
+        "basket_b": ["b0", "b1", "b2"],
+        "weight":   [0.25, 0.50, 0.75],
+    })
+    with redirect_stdout(io.StringIO()):
+        g, baskets = cbe._build_igraph(e)
+    by_endpoints = {
+        frozenset((baskets[edge.source], baskets[edge.target])): edge["weight"]
+        for edge in g.es
+    }
+    want_by_endpoints = {
+        frozenset(("b2", "b0")): 0.25,
+        frozenset(("b0", "b1")): 0.50,
+        frozenset(("b1", "b2")): 0.75,
+    }
+    if by_endpoints != want_by_endpoints:
+        ok = _fail(f"edge weights not attached to the right endpoints: "
+                   f"{by_endpoints} != {want_by_endpoints}")
+    else:
+        print("  _build_igraph: each weight stays on its own edge, keyed by "
+              "basket id — OK")
+
+    # A null basket id must stop the run, not become vertex -1. This is the
+    # one place the factorize build genuinely diverges from the old
+    # sorted(set(...)) one, which would have kept NaN as a real vertex.
+    nan_edges = pd.DataFrame({
+        "basket_a": ["b0", None, "b1"],
+        "basket_b": ["b1", "b0", "b0"],
+        "weight":   [0.5, 0.5, 0.5],
+    })
+    try:
+        with redirect_stdout(io.StringIO()):
+            cbe._build_igraph(nan_edges)
+        ok = _fail("_build_igraph accepted a null basket id instead of raising")
+    except ValueError as exc:
+        if "null basket id" not in str(exc):
+            ok = _fail(f"_build_igraph raised the wrong error for a null id: {exc}")
+        else:
+            print("  _build_igraph: a null basket id raises instead of silently "
+                  "becoming vertex -1 — OK")
+
+    # ── Leiden: per-iteration loop == find_partition ─────────────────────
+    # Three 6-node cliques joined by two deliberately weak bridges. Any
+    # correct Leiden run at resolution 1.0 recovers exactly those cliques, so
+    # this is a fixed target rather than a "whatever it did last time" pin.
+    cliques = [[f"c{c}_{i}" for i in range(6)] for c in range(3)]
+    rows = []
+    for members in cliques:
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                rows.append((members[i], members[j], 1.0))
+    rows.append((cliques[0][0], cliques[1][0], 0.01))
+    rows.append((cliques[1][0], cliques[2][0], 0.01))
+    clique_edges = pd.DataFrame(rows, columns=["basket_a", "basket_b", "weight"])
+    want_groups = {frozenset(members) for members in cliques}
+
+    with redirect_stdout(io.StringIO()):
+        got = cbe.run_leiden_on_basket_graph(clique_edges, resolution=1.0)
+    got_groups = _grouping(got["basket_id"], got["need_state_cluster"])
+
+    if got_groups != want_groups:
+        ok = _fail(f"Leiden did not recover the three cliques: "
+                   f"{[sorted(x) for x in got_groups]}")
+    else:
+        print("  run_leiden_on_basket_graph: recovers 3 planted cliques — OK")
+
+    # Same graph, same seed, same iteration count, through leidenalg's own
+    # find_partition(). The per-iteration loop must agree with it.
+    with redirect_stdout(io.StringIO()):
+        g, baskets = cbe._build_igraph(clique_edges)
+    reference = leidenalg.find_partition(
+        g, leidenalg.RBConfigurationVertexPartition,
+        weights="weight", resolution_parameter=1.0,
+        n_iterations=config.LEIDEN_N_ITERATIONS, seed=config.SEED,
+    )
+    ref_groups = _grouping(baskets, reference.membership)
+    if got_groups != ref_groups:
+        ok = _fail("per-iteration Leiden loop disagrees with find_partition(): "
+                   f"{[sorted(x) for x in got_groups]} vs "
+                   f"{[sorted(x) for x in ref_groups]}")
+    else:
+        print(f"  run_leiden_on_basket_graph: same partition as "
+              f"find_partition(n_iterations={config.LEIDEN_N_ITERATIONS}, "
+              f"seed={config.SEED}) — OK")
+
+    # Informational, deliberately NOT a failure: on a graph whose right answer
+    # is not obvious, does the per-iteration loop land on exactly the same
+    # partition as find_partition()? Both are legitimate Leiden runs, so a
+    # difference is not a bug — but it decides whether Stage 2 rerun on the
+    # same embeddings reproduces its previous cluster ids, which is worth
+    # knowing before anyone compares two runs' outputs.
+    blocks = [[f"n{b}_{i}" for i in range(25)] for b in range(4)]
+    blocky = []
+    flat = [node for block in blocks for node in block]
+    for block in blocks:
+        for i in range(len(block)):
+            for j in range(i + 1, len(block)):
+                if rng.random() < 0.45:
+                    blocky.append((block[i], block[j], float(rng.uniform(0.5, 1.0))))
+    for _ in range(40):
+        a, b = rng.choice(flat, 2, replace=False)
+        if a.split("_")[0] != b.split("_")[0]:
+            blocky.append((a, b, float(rng.uniform(0.01, 0.1))))
+    blocky_edges = pd.DataFrame(blocky, columns=["basket_a", "basket_b", "weight"])
+
+    with redirect_stdout(io.StringIO()):
+        loop_result = cbe.run_leiden_on_basket_graph(blocky_edges, resolution=1.0)
+        g_b, baskets_b = cbe._build_igraph(blocky_edges)
+    ref_b = leidenalg.find_partition(
+        g_b, leidenalg.RBConfigurationVertexPartition,
+        weights="weight", resolution_parameter=1.0,
+        n_iterations=config.LEIDEN_N_ITERATIONS, seed=config.SEED,
+    )
+    loop_groups = _grouping(loop_result["basket_id"], loop_result["need_state_cluster"])
+    ref_groups_b = _grouping(baskets_b, ref_b.membership)
+    if loop_groups == ref_groups_b:
+        print(f"  INFO per-iteration loop is bit-identical to find_partition() on a "
+              f"4-block random graph ({len(loop_groups)} clusters) — reruns reproduce")
+    else:
+        print(f"  INFO per-iteration loop found {len(loop_groups)} clusters vs "
+              f"find_partition()'s {len(ref_groups_b)} on a 4-block random graph. "
+              f"Both are valid Leiden runs; cluster ids are NOT reproducible "
+              f"across the two call styles.")
+
+    # The early "converged, stopping" path must return the same answer as
+    # letting it run the full iteration budget.
+    with redirect_stdout(io.StringIO()):
+        few = cbe.run_leiden_on_basket_graph(clique_edges, resolution=1.0, n_iterations=1)
+        many = cbe.run_leiden_on_basket_graph(clique_edges, resolution=1.0, n_iterations=8)
+    if _grouping(few["basket_id"], few["need_state_cluster"]) != want_groups:
+        ok = _fail("Leiden with n_iterations=1 did not recover the cliques")
+    elif _grouping(many["basket_id"], many["need_state_cluster"]) != want_groups:
+        ok = _fail("Leiden with n_iterations=8 did not recover the cliques")
+    else:
+        print("  run_leiden_on_basket_graph: n_iterations 1 and 8 agree "
+              "(early convergence stop is label-preserving) — OK")
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cbe.run_leiden_on_basket_graph(clique_edges, resolution=1.0, n_iterations=3)
+    leiden_out = buf.getvalue()
+    if "Leiden iteration 1" not in leiden_out:
+        ok = _fail(f"Leiden did not report per-iteration progress: {leiden_out!r}")
+    elif "clusters, quality=" not in leiden_out:
+        ok = _fail(f"Leiden iteration report is missing cluster count/quality: {leiden_out!r}")
+    else:
+        print("  run_leiden_on_basket_graph: reports cluster count + quality "
+              "per iteration — OK")
+
+    # ── build_basket_knn_graph over the .to_numpy() id path ──────────────
+    # String basket ids on purpose: the real ones are "household_week", and
+    # this function now indexes them as a numpy array rather than a list.
+    # Centres chosen as distinct DIRECTIONS, not distinct positions: both this
+    # function and the GMM path L2-normalise first, so a group centred on the
+    # origin would smear into random directions all over the unit circle and
+    # the "well-separated" premise would be false.
+    centres = np.array([[1.0, 0.0], [0.0, 1.0], [-0.7071, -0.7071]])
+    emb, emb_ids = [], []
+    for c_i, centre in enumerate(centres):
+        for p_i in range(10):
+            emb.append(centre + rng.normal(scale=0.01, size=2))
+            emb_ids.append(f"{c_i}_{p_i:03d}")
+    embeddings = pd.DataFrame({"basket_id": emb_ids, "gnn_embedding": [np.asarray(v) for v in emb]})
+
+    # use_cache=False: this check is about the edge maths, and the default
+    # would write a cache file into the real ../data/output.
+    with redirect_stdout(io.StringIO()):
+        knn_edges = cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=True,
+                                               use_cache=False)
+
+    if list(knn_edges.columns) != ["basket_a", "basket_b", "weight"]:
+        ok = _fail(f"build_basket_knn_graph columns changed: {list(knn_edges.columns)}")
+    elif len(knn_edges) == 0:
+        ok = _fail("build_basket_knn_graph produced no edges for 3 well-separated groups")
+    else:
+        seen_ids = set(knn_edges["basket_a"]) | set(knn_edges["basket_b"])
+        unknown = seen_ids - set(emb_ids)
+        cross = knn_edges[knn_edges["basket_a"].str[0] != knn_edges["basket_b"].str[0]]
+        if unknown:
+            ok = _fail(f"edge list contains ids that were never input (id array "
+                       f"indexing is off): {sorted(unknown)[:5]}")
+        elif len(cross) > 0:
+            ok = _fail(f"{len(cross)} edge(s) cross well-separated groups: "
+                       f"{cross.head().to_dict('records')}")
+        elif not ((knn_edges["weight"] >= 0).all() and (knn_edges["weight"] <= 1).all()):
+            ok = _fail("edge weights fell outside [0, 1] after minmax scaling")
+        else:
+            print(f"  build_basket_knn_graph: {len(knn_edges)} edges, all within-group, "
+                  f"ids preserved through .to_numpy() — OK")
+
+    # normalize(copy=False) must not reach back into the caller's DataFrame.
+    # pipeline_main.py hands the SAME embeddings frame to Leiden and then to
+    # GMM, so an in-place normalise that escaped would leave Stage 2b fitting
+    # on already-unit-length vectors — silently, and only at full scale.
+    before = np.stack(embeddings["gnn_embedding"].values).copy()
+    with redirect_stdout(io.StringIO()):
+        cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=True, use_cache=False)
+    after = np.stack(embeddings["gnn_embedding"].values)
+    if not np.array_equal(before, after):
+        changed = int((~np.isclose(before, after)).any(axis=1).sum())
+        ok = _fail(f"normalize(copy=False) mutated the caller's embeddings "
+                   f"({changed} of {len(before)} rows changed)")
+    else:
+        print("  normalize(copy=False): caller's embedding frame is untouched — OK")
+
+    # ── integer-key dedupe == drop_duplicates on the string ids ──────────
+    # build_basket_knn_graph stopped deduping two object columns (~193M Python
+    # string hashes at full scale) and now dedupes one int64 key. That is only
+    # a speedup if it selects exactly the same rows, including which duplicate
+    # survives, so the two are compared directly here on inputs built to be
+    # duplicate-heavy.
+    dedupe_bad = []
+    for trial in range(200):
+        n_v = int(rng.integers(2, 12))
+        m = int(rng.integers(1, 50))
+        ea = rng.integers(0, n_v, m)
+        eb = rng.integers(0, n_v, m)
+        esim = rng.random(m)
+        ids = np.array([f"v{i}" for i in range(n_v)], dtype=object)
+
+        # Reference: exactly what the function used to do.
+        want = pd.DataFrame({
+            "basket_a": ids[ea], "basket_b": ids[eb], "similarity": esim,
+        }).drop_duplicates(subset=["basket_a", "basket_b"]).reset_index(drop=True)
+
+        # New path.
+        pair_key = ea.astype(np.int64, copy=False) * n_v + eb
+        _, first_seen = np.unique(pair_key, return_index=True)
+        first_seen.sort()
+        got = pd.DataFrame({
+            "basket_a": ids[ea[first_seen]], "basket_b": ids[eb[first_seen]],
+            "similarity": esim[first_seen],
+        })
+
+        if list(got["basket_a"]) != list(want["basket_a"]) \
+                or list(got["basket_b"]) != list(want["basket_b"]):
+            dedupe_bad.append((trial, "different rows or row order"))
+            break
+        # Which duplicate survives matters: keep="first" carries the first
+        # occurrence's similarity, and that becomes the edge weight.
+        if not np.allclose(got["similarity"].to_numpy(), want["similarity"].to_numpy()):
+            dedupe_bad.append((trial, "kept a different duplicate's similarity"))
+            break
+
+    if dedupe_bad:
+        ok = _fail(f"integer-key dedupe diverged from drop_duplicates: {dedupe_bad}")
+    else:
+        print("  edge dedupe: int64-key dedupe picks the same rows, order and "
+              "kept-duplicate as drop_duplicates on string ids (200 cases) — OK")
+
+    # One-directional mode collapses (i,j) and (j,i) onto the same pair, so it
+    # is the mode that actually produces duplicates to remove.
+    with redirect_stdout(io.StringIO()):
+        one_way = cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=False,
+                                             use_cache=False)
+    dup_count = one_way.duplicated(subset=["basket_a", "basket_b"]).sum()
+    if dup_count:
+        ok = _fail(f"{dup_count} duplicate edge(s) survived in one-directional mode")
+    else:
+        print(f"  edge dedupe: one-directional mode leaves 0 duplicate pairs "
+              f"({len(one_way)} edges) — OK")
+
+    # ── kNN edge-list cache: reuse when valid, REBUILD when not ──────────
+    # The reuse half saves hours. The invalidation half is the one that can
+    # silently corrupt a run, so most of what is checked here is the cases
+    # where the cache must NOT be trusted.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = str(Path(tmp) / "edges.parquet")
+        manifest = str(Path(tmp) / "edges.manifest.json")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            first = cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=True,
+                                               use_cache=True, cache_path=cache)
+        wrote = buf.getvalue()
+
+        if not Path(cache).exists():
+            ok = _fail("edge cache parquet was not written")
+        elif not Path(manifest).exists():
+            ok = _fail("edge cache manifest was not written")
+        elif "Cached" not in wrote:
+            ok = _fail(f"cache write was not reported: {wrote!r}")
+        else:
+            print(f"  edge cache: wrote {Path(cache).name} + "
+                  f"{Path(manifest).name} — OK")
+
+        # Identical inputs -> reuse, and byte-identical edges back.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            second = cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=True,
+                                                use_cache=True, cache_path=cache)
+        reused = buf.getvalue()
+        if "REUSING cached basket kNN graph" not in reused:
+            ok = _fail(f"identical inputs did not hit the cache: {reused!r}")
+        elif "kNN method" in reused:
+            ok = _fail("cache hit still ran the neighbour search")
+        elif not _same_edges(first, second):
+            ok = _fail("cached edges differ from the edges that were cached")
+        else:
+            print("  edge cache: identical inputs reuse it and skip the kNN "
+                  "search, same edges back — OK")
+
+        # Different k must NOT reuse.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cbe.build_basket_knn_graph(embeddings, k=6, use_mutual=True,
+                                       use_cache=True, cache_path=cache)
+        if "REUSING" in buf.getvalue():
+            ok = _fail("cache was reused after k changed")
+        else:
+            print("  edge cache: invalidated by a different k — OK")
+
+        # Same basket ids, same row count, DIFFERENT embedding values — the
+        # retrained-model case. Row count alone would happily reuse here.
+        moved = embeddings.copy()
+        moved["gnn_embedding"] = [np.asarray(v) + 0.5 for v in moved["gnn_embedding"]]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cbe.build_basket_knn_graph(moved, k=4, use_mutual=True,
+                                       use_cache=True, cache_path=cache)
+        if "REUSING" in buf.getvalue():
+            ok = _fail("cache was reused after the embeddings themselves changed — "
+                       "a retrained model would silently cluster the old geometry")
+        else:
+            print("  edge cache: invalidated when embedding VALUES change at the "
+                  "same row count — OK")
+
+        # A parquet with no manifest must not be trusted (the crash-between-
+        # writes case _write_edge_cache is ordered to produce).
+        Path(cbe._cache_manifest_path(cache)).unlink()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=True,
+                                       use_cache=True, cache_path=cache)
+        if "REUSING" in buf.getvalue():
+            ok = _fail("cache was reused with its manifest missing")
+        else:
+            print("  edge cache: a manifest-less parquet is rebuilt, not trusted — OK")
+
+        # use_cache=False must neither read nor write.
+        fresh = str(Path(tmp) / "unused.parquet")
+        with redirect_stdout(io.StringIO()):
+            cbe.build_basket_knn_graph(embeddings, k=4, use_mutual=True,
+                                       use_cache=False, cache_path=fresh)
+        if Path(fresh).exists():
+            ok = _fail("use_cache=False still wrote a cache file")
+        else:
+            print("  edge cache: use_cache=False writes nothing — OK")
+
+    # ── GMM still runs with verbose output turned on ─────────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        model_path = str(Path(tmp) / "gmm_test.pkl")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            gmm_result = cbe.cluster_basket_embeddings_gmm(
+                embeddings, n_components=3, save_path=model_path)
+        gmm_out = buf.getvalue()
+
+        if list(gmm_result.columns) != ["basket_id", "need_state_cluster_gmm", "gmm_confidence"]:
+            ok = _fail(f"GMM result columns changed: {list(gmm_result.columns)}")
+        elif len(gmm_result) != len(embeddings):
+            ok = _fail(f"GMM returned {len(gmm_result)} rows for {len(embeddings)} baskets")
+        elif not ((gmm_result["gmm_confidence"] >= 0).all()
+                  and (gmm_result["gmm_confidence"] <= 1).all()):
+            ok = _fail("gmm_confidence outside [0, 1]")
+        elif not Path(model_path).exists():
+            ok = _fail("fitted GMM was not saved — score_new_baskets.py depends on it")
+        elif "fitting GMM" not in gmm_out:
+            ok = _fail(f"GMM fit did not report progress: {gmm_out!r}")
+        else:
+            print("  cluster_basket_embeddings_gmm: runs with verbose EM output, "
+                  "saves model, confidence in [0,1] — OK")
+
+    # ── the new config knobs ─────────────────────────────────────────────
+    knob_problems = []
+    if not isinstance(getattr(config, "LEIDEN_N_ITERATIONS", None), int):
+        knob_problems.append("LEIDEN_N_ITERATIONS missing or not an int")
+    if not isinstance(getattr(config, "PROGRESS_HEARTBEAT_SECS", None), int):
+        knob_problems.append("PROGRESS_HEARTBEAT_SECS missing or not an int")
+    if not isinstance(getattr(config, "CACHE_BASKET_EDGES", None), bool):
+        knob_problems.append("CACHE_BASKET_EDGES missing or not a bool")
+    # Only this one var disables the default check — an unrelated PIPELINE_*
+    # override (PIPELINE_SEED, say) should not silently skip it.
+    if "PIPELINE_LEIDEN_N_ITERATIONS" not in _os.environ:
+        # leidenalg's own find_partition default is 2 — drifting from it would
+        # silently change every clustering result.
+        if getattr(config, "LEIDEN_N_ITERATIONS", None) != 2:
+            knob_problems.append(f"LEIDEN_N_ITERATIONS default is "
+                                 f"{config.LEIDEN_N_ITERATIONS}, leidenalg's is 2")
+    if knob_problems:
+        ok = _fail(f"config knobs: {knob_problems}")
+    else:
+        print(f"  config: LEIDEN_N_ITERATIONS={config.LEIDEN_N_ITERATIONS}, "
+              f"PROGRESS_HEARTBEAT_SECS={config.PROGRESS_HEARTBEAT_SECS}s, "
+              f"CACHE_BASKET_EDGES={config.CACHE_BASKET_EDGES} — OK")
+
+    return ok
+
+
+# ─────────────────────────────────────────────
 # RUNNER
 # ─────────────────────────────────────────────
 
@@ -1373,6 +1992,7 @@ def main():
         ("graph primitives", check_graph_primitives),
         ("co-purchase additivity", check_copurchase_chunk_additivity),
         ("need-state graph", check_need_state_graph),
+        ("clustering progress / graph build / Leiden parity", check_clustering_progress),
     ]
     if not args.fast:
         checks.append(("functional / parity / basket store", check_functional))

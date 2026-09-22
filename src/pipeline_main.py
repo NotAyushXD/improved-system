@@ -69,10 +69,11 @@ definition:
 product_subclusters.pkl and product_embeddings.parquet do NOT need deleting
 for a basket-grain change — both are derived purely from product text
 attributes, never from basket/purchase data. The co-purchase-matrix build's
-own checkpoint (copurchase_sparse.checkpoint.npz + .progress.txt) and the
-LMDB training-graph cache are both self-protecting: they fingerprint what
-they were built from and rebuild automatically on mismatch, rather than
-silently resuming into stale data. The DuckDB `baskets_train` table and
+own checkpoint (copurchase_sparse.checkpoint.npz + .progress.txt), the
+LMDB training-graph cache, and the Stage 2 kNN edge cache
+(basket_knn_edges.parquet + .manifest.json) are all self-protecting: they
+fingerprint what they were built from and rebuild automatically on mismatch,
+rather than silently resuming into stale data. The DuckDB `baskets_train` table and
 `inference_chunks_train` chunk-plan table are NOT fingerprinted — if you
 change the source export or basket definition, drop them manually
 (`basket_store.drop_all(con, "train")`) or just delete
@@ -124,6 +125,7 @@ import json
 import os
 import pickle
 import gc
+import time
 
 import numpy as np
 import pandas as pd
@@ -140,6 +142,7 @@ from cluster_basket_embeddings import (
     run_leiden_on_basket_graph,
     cluster_basket_embeddings_gmm,
     compare_leiden_gmm,
+    fmt_duration,
     GMM_MODEL_PATH,
 )
 import need_state_graph
@@ -390,6 +393,7 @@ def main():
     # Stage 2: cluster the basket embeddings into need-states — Leiden AND GMM
     # ─────────────────────────────────────────────
 
+    stage2_started = time.perf_counter()
     print("\n[Stage 2a] Leiden clustering...")
     # Called as two steps rather than via cluster_basket_embeddings(), which
     # builds `edges` internally and then drops it on return. The basket-level
@@ -399,13 +403,17 @@ def main():
     # the edge list just stays in scope now.
     basket_edges   = build_basket_knn_graph(basket_gnn_embeddings)
     leiden_clusters = run_leiden_on_basket_graph(basket_edges)
+    leiden_done = time.perf_counter()
     print(f"\nNeed-state clusters found: {leiden_clusters['need_state_cluster'].nunique()}")
+    print(f"[Stage 2a] done in {fmt_duration(leiden_done - stage2_started)}")
 
     print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
     gmm_clusters = cluster_basket_embeddings_gmm(basket_gnn_embeddings, n_components=GMM_N_COMPONENTS)
+    print(f"[Stage 2b] done in {fmt_duration(time.perf_counter() - leiden_done)}")
 
     print("\n[Stage 2c] Comparing the two methods...")
     compare_leiden_gmm(leiden_clusters, gmm_clusters)
+    print(f"[Stage 2] total {fmt_duration(time.perf_counter() - stage2_started)}")
 
     # Both label sets kept side by side — need_state_cluster (Leiden) and
     # need_state_cluster_gmm (GMM) — rather than collapsing to one, since the

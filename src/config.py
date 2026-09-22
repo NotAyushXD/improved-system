@@ -360,6 +360,10 @@ LMDB_MAP_SIZE_GB = _int("PIPELINE_LMDB_MAP_SIZE_GB", 200, minimum=1)
 BASKET_KNN_K = _int("PIPELINE_BASKET_KNN_K", 15, minimum=1)
 USE_MUTUAL_KNN = _bool("PIPELINE_USE_MUTUAL_KNN", True)
 LEIDEN_RESOLUTION = _float("PIPELINE_LEIDEN_RESOLUTION", 1.0, minimum=0.0)
+# leidenalg.find_partition()'s own default is 2. Named here because
+# run_leiden_on_basket_graph() drives the optimiser one iteration at a time so
+# each one can report progress, which needs the count to be explicit.
+LEIDEN_N_ITERATIONS = _int("PIPELINE_LEIDEN_N_ITERATIONS", 2, minimum=1)
 
 GMM_N_COMPONENTS = _int("PIPELINE_GMM_N_COMPONENTS", 30, minimum=1)
 GMM_K_MIN = _int("PIPELINE_GMM_K_MIN", 5, minimum=1)
@@ -370,6 +374,24 @@ GMM_COVARIANCE = _str("PIPELINE_GMM_COVARIANCE", "diag",
                       choices={"full", "tied", "diag", "spherical"})
 
 ASSIGN_NEW_BASKET_K = _int("PIPELINE_ASSIGN_NEW_BASKET_K", 15, minimum=1)
+
+# The basket kNN graph is the most expensive artifact in Stage 2 (hours of
+# approximate-NN search over the full basket population) and was the only one
+# never written to disk — a Stage 2 that died in Leiden or GMM rebuilt it from
+# scratch on the next run. Cached to parquet with a fingerprint sidecar, so a
+# rerun resumes from the edge list instead. Costs a few GB of disk; set false
+# if that drive is tight.
+CACHE_BASKET_EDGES = _bool("PIPELINE_CACHE_BASKET_EDGES", True)
+
+# ═════════════════════════════════════════════
+# PROGRESS REPORTING  (cluster_basket_embeddings.py)
+# ═════════════════════════════════════════════
+
+# How often a long-running clustering step reports that it is still alive.
+# Stage 2's steps are single opaque calls that can run for a long time with no
+# output; this is the interval of the "still running, N elapsed" line. Raise it
+# if it makes a captured log noisy.
+PROGRESS_HEARTBEAT_SECS = _int("PIPELINE_PROGRESS_HEARTBEAT_SECS", 30, minimum=1)
 
 # ═════════════════════════════════════════════
 # NEED-STATE GRAPHS  (need_state_graph.py)
