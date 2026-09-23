@@ -1408,6 +1408,148 @@ def _reference_build_igraph(edges):
     return baskets, pairs, edges["weight"].tolist()
 
 
+def check_graph_coverage():
+    """
+    Every basket must come out of Stage 2 with a label, or a loud error.
+
+    The bug this pins: mutual-kNN keeps an edge only when both baskets rank
+    each other in their top-K, and _build_igraph derives its vertex set from
+    the edge endpoints — so a basket with no surviving edge is not a vertex,
+    gets no community, and is simply absent from run_leiden_on_basket_graph's
+    output. pipeline_main then outer-merges that with the GMM labels, which DO
+    cover everyone, so the saved parquet had the right row count with half its
+    need_state_cluster column NaN. A real run clustered 28,692,907 of
+    57,115,804 baskets and said nothing.
+
+    Three things are verified:
+      * _mutual_coverage_mask agrees with a hand-computed mutual structure;
+      * _check_graph_coverage raises below the threshold and passes above it;
+      * run_leiden_on_basket_graph given all_basket_ids returns EVERY basket,
+        with UNCLUSTERED (not NaN, not a dropped row) for the isolated ones.
+    """
+    print()
+    print("=" * 70)
+    print("GRAPH COVERAGE — no basket silently loses its label")
+    print("=" * 70)
+    ok = True
+
+    import cluster_basket_embeddings as cbe
+
+    # ── 1. _mutual_coverage_mask against a hand-built neighbour table ──
+    # Column 0 is each row's self-match, as pynndescent returns it.
+    #   0 <-> 1 mutual.  2 -> 0 but 0 does not list 2 back, so 2 is isolated.
+    #   3 <-> 4 mutual.
+    indices = np.array([
+        [0, 1, 3],   # 0 lists 1, 3
+        [1, 0, 4],   # 1 lists 0  -> mutual with 0
+        [2, 0, 1],   # 2 lists 0, 1 -> neither lists 2 back
+        [3, 4, 0],   # 3 lists 4, 0 -> 0 lists 3 back at k=2
+        [4, 3, 1],   # 4 lists 3  -> mutual with 3
+    ], dtype=np.int32)
+
+    got = cbe._mutual_coverage_mask(indices, k=2)
+    expected = np.array([True, True, False, True, True])
+    if not np.array_equal(got, expected):
+        ok = _fail(f"_mutual_coverage_mask(k=2) = {got.tolist()}, expected {expected.tolist()}")
+    else:
+        print("  _mutual_coverage_mask k=2 — OK (4 of 5 covered, basket 2 isolated)")
+
+    # At k=1 only the first neighbour counts: 0->1 and 1->0 still mutual,
+    # 3->4 and 4->3 still mutual, 2->0 still unreciprocated.
+    got_k1 = cbe._mutual_coverage_mask(indices, k=1)
+    expected_k1 = np.array([True, True, False, True, True])
+    if not np.array_equal(got_k1, expected_k1):
+        ok = _fail(f"_mutual_coverage_mask(k=1) = {got_k1.tolist()}, "
+                   f"expected {expected_k1.tolist()}")
+    else:
+        print("  _mutual_coverage_mask k=1 — OK")
+
+    # A row whose only "neighbour" is itself must not count as mutual.
+    self_only = np.array([[0, 0], [1, 1]], dtype=np.int32)
+    if cbe._mutual_coverage_mask(self_only, k=1).any():
+        ok = _fail("_mutual_coverage_mask counted a self-match as a mutual neighbour")
+    else:
+        print("  _mutual_coverage_mask ignores self-matches — OK")
+
+    # ── 2. the coverage gate ──
+    universe = np.array([f"b{i}" for i in range(10)], dtype=object)
+    in_graph = universe[:5]
+
+    try:
+        cbe._check_graph_coverage(in_graph, universe, min_coverage=0.95)
+        ok = _fail("_check_graph_coverage accepted 50% coverage against a 0.95 floor")
+    except ValueError as e:
+        if "50.0%" not in str(e):
+            ok = _fail(f"coverage error should state the actual coverage, got: {e}")
+        else:
+            print("  _check_graph_coverage raises at 50% vs floor 0.95 — OK")
+
+    try:
+        returned = cbe._check_graph_coverage(universe, universe, min_coverage=0.95)
+        if len(returned) != 10:
+            ok = _fail(f"_check_graph_coverage returned {len(returned)} ids, expected 10")
+        else:
+            print("  _check_graph_coverage passes at 100% and returns the universe — OK")
+    except ValueError as e:
+        ok = _fail(f"_check_graph_coverage rejected full coverage: {e}")
+
+    # min_coverage=0 is the documented escape hatch and must never raise.
+    try:
+        cbe._check_graph_coverage(in_graph, universe, min_coverage=0.0)
+        print("  _check_graph_coverage honours the min_coverage=0 escape hatch — OK")
+    except ValueError as e:
+        ok = _fail(f"min_coverage=0 should allow any coverage, but raised: {e}")
+
+    # ── 3. end to end: isolated baskets come back as UNCLUSTERED ──
+    # Two well-separated triangles plus three baskets with no edges at all.
+    edges = pd.DataFrame({
+        "basket_a": ["b0", "b1", "b0", "b3", "b4", "b3"],
+        "basket_b": ["b1", "b2", "b2", "b4", "b5", "b5"],
+        "weight":   [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    })
+    full_universe = np.array([f"b{i}" for i in range(9)], dtype=object)
+
+    clusters = cbe.run_leiden_on_basket_graph(
+        edges, all_basket_ids=full_universe, min_coverage=0.0,
+    )
+
+    if len(clusters) != 9:
+        ok = _fail(f"Leiden returned {len(clusters)} rows for a 9-basket population — "
+                   f"every basket must appear")
+    elif clusters["need_state_cluster"].isna().any():
+        ok = _fail("Leiden output contains NaN need_state_cluster — the isolated "
+                   "baskets must be UNCLUSTERED, not missing")
+    else:
+        isolated = set(clusters.loc[
+            clusters["need_state_cluster"] == cbe.UNCLUSTERED, "basket_id"
+        ])
+        if isolated != {"b6", "b7", "b8"}:
+            ok = _fail(f"expected b6,b7,b8 to be UNCLUSTERED, got {sorted(isolated)}")
+        else:
+            print("  run_leiden_on_basket_graph returns all 9 baskets, 3 UNCLUSTERED — OK")
+
+        # The two triangles are disconnected, so they must not share a cluster.
+        c0 = clusters.loc[clusters["basket_id"] == "b0", "need_state_cluster"].iloc[0]
+        c3 = clusters.loc[clusters["basket_id"] == "b3", "need_state_cluster"].iloc[0]
+        if c0 == c3:
+            ok = _fail("two disconnected triangles landed in the same cluster")
+        elif cbe.UNCLUSTERED in (c0, c3):
+            ok = _fail("a connected basket was labelled UNCLUSTERED")
+        else:
+            print("  disconnected components get distinct clusters — OK")
+
+    # Without all_basket_ids the old shape is preserved: only graph vertices.
+    legacy = cbe.run_leiden_on_basket_graph(edges)
+    if len(legacy) != 6:
+        ok = _fail(f"without all_basket_ids Leiden should return only the 6 graph "
+                   f"vertices, got {len(legacy)}")
+    else:
+        print("  omitting all_basket_ids still returns graph vertices only — OK")
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
 def check_clustering_progress():
     """
     Stage 2's progress reporting, and the vectorised graph build it exposed.
@@ -1993,6 +2135,7 @@ def main():
         ("co-purchase additivity", check_copurchase_chunk_additivity),
         ("need-state graph", check_need_state_graph),
         ("clustering progress / graph build / Leiden parity", check_clustering_progress),
+        ("graph coverage / no silent label loss", check_graph_coverage),
     ]
     if not args.fast:
         checks.append(("functional / parity / basket store", check_functional))

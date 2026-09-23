@@ -76,6 +76,15 @@ PROGRESS_HEARTBEAT_SECS = config.PROGRESS_HEARTBEAT_SECS
 CACHE_BASKET_EDGES = config.CACHE_BASKET_EDGES
 BASKET_EDGES_PATH  = os.path.join(OUTPUT_DIR, "basket_knn_edges.parquet")
 
+MIN_GRAPH_COVERAGE = config.MIN_GRAPH_COVERAGE
+
+# need_state_cluster for a basket that never entered the graph. Leiden cannot
+# place a vertex it never saw, so these are not "cluster 0" and not a missing
+# value to be imputed — they are baskets the mutual-kNN filter left with no
+# edges. An explicit sentinel keeps them countable downstream; NaN from an
+# outer merge is what previously hid 28.4M of them.
+UNCLUSTERED = -1
+
 # Rows per predict_proba call when collapsing posteriors to a confidence
 # column — bounds a n_baskets x n_components intermediate. Matches the batch
 # size need_state_graph.build_gmm_overlap uses for the same call.
@@ -407,9 +416,21 @@ def build_basket_knn_graph(
         first_seen.sort()
         del pair_key
 
+        kept_a, kept_b = edge_a[first_seen], edge_b[first_seen]
+
+        # Counted here, while the endpoints are still integer indices: a
+        # one-byte-per-basket mask is ~57MB at full scale, where uniquing the
+        # 193M string ids after the fact is the expensive thing this whole
+        # function already goes out of its way to avoid.
+        in_graph = np.zeros(n, dtype=bool)
+        in_graph[kept_a] = True
+        in_graph[kept_b] = True
+        n_in_graph = int(in_graph.sum())
+        del in_graph
+
         edges = pd.DataFrame({
-            "basket_a": basket_id_arr[edge_a[first_seen]],
-            "basket_b": basket_id_arr[edge_b[first_seen]],
+            "basket_a": basket_id_arr[kept_a],
+            "basket_b": basket_id_arr[kept_b],
             "similarity": edge_sim[first_seen],
         })
         edges["weight"] = minmax_scale(edges["similarity"])
@@ -428,6 +449,21 @@ def build_basket_knn_graph(
     print(f"Basket kNN graph ({'mutual' if use_mutual else 'one-directional'}): "
           f"{len(edges):,} edges over {n:,} baskets "
           f"(~{est_mb:,.0f} MB as a DataFrame, before igraph's own edge-list overhead)")
+
+    # Coverage, not just edge count. A basket with no surviving edge is not a
+    # vertex at all (the vertex set is derived from the edge endpoints), so it
+    # gets no community — Leiden has nothing to place. Printed on every build
+    # because this was invisible: a k=15 mutual run over 57.1M baskets built a
+    # 28.7M-vertex graph and nothing in the log said the other half was gone.
+    isolated = n - n_in_graph
+    print(f"  Coverage: {n_in_graph:,} of {n:,} baskets have at least one edge "
+          f"({n_in_graph / n:.1%})")
+    if isolated:
+        print(f"  {isolated:,} baskets ({isolated / n:.1%}) have NO edge and cannot be "
+              f"assigned a Leiden community. Raise PIPELINE_BASKET_KNN_K or set "
+              f"PIPELINE_USE_MUTUAL_KNN=false to cover more of the population; "
+              f"cluster_basket_embeddings.coverage_probe() measures the trade-off "
+              f"without running Leiden.")
 
     result = edges[["basket_a", "basket_b", "weight"]]
 
@@ -495,6 +531,111 @@ def _build_igraph(edges: pd.DataFrame):
     return g, baskets
 
 
+def _mutual_coverage_mask(indices: np.ndarray, k: int) -> np.ndarray:
+    """
+    Boolean mask: which rows keep at least one MUTUAL neighbour among their
+    first k, i.e. which baskets would still be vertices under mutual-kNN.
+
+    `indices` is pynndescent/sklearn's neighbour table INCLUDING each row's
+    self-match at column 0, exactly as build_basket_knn_graph receives it.
+
+    Column-at-a-time rather than the sorted-key join build_basket_knn_graph
+    uses, because this only needs the vertex set and not the edges. Each
+    iteration gathers one (n, k) table, so peak memory is ~n*k*itemsize rather
+    than the several multiples of n*k the key sort needs — that difference is
+    what makes probing k=50 over 57M baskets affordable.
+
+    Deliberate approximation: the production rule also drops pairs whose
+    averaged similarity is <= 0, which this ignores. That makes the number
+    reported here an UPPER BOUND on real coverage. Cosine similarities between
+    these embeddings are positive in practice, so the gap should be small —
+    but treat a probe result near the threshold as "not proven", not "passed".
+    """
+    n = indices.shape[0]
+    neighbours = indices[:, 1:k + 1]
+    # Compared in the neighbour table's own dtype (int32 from pynndescent)
+    # rather than promoting to int64: the gather below is the single largest
+    # allocation in this function and widening it would double that for
+    # nothing. Basket counts are nowhere near int32's 2.1B ceiling.
+    self_id = np.arange(n, dtype=indices.dtype)[:, None]
+
+    has_mutual = np.zeros(n, dtype=bool)
+    for column in range(neighbours.shape[1]):
+        j = neighbours[:, column]
+        # j's own neighbour list, gathered per row; does it list me back?
+        listed_back = (neighbours[j] == self_id).any(axis=1)
+        # A self-match sitting at a column other than 0 would otherwise count
+        # as its own mutual neighbour — build_basket_knn_graph drops those
+        # too (the `dst != src` filter).
+        has_mutual |= listed_back & (j != self_id[:, 0])
+    return has_mutual
+
+
+def coverage_probe(
+    basket_gnn_embeddings: pd.DataFrame,
+    k_values=(10, 15, 20, 30, 50),
+) -> pd.DataFrame:
+    """
+    How much of the basket population survives mutual-kNN, as a function of k.
+
+    Answers "which k do I need" with ONE neighbour search instead of one full
+    Stage 2 per candidate: the search runs at max(k_values), and every smaller
+    k is evaluated as a prefix of the same neighbour table. At full scale that
+    is ~30 minutes total rather than ~30 minutes per setting, and it never
+    builds an edge table, writes a cache, or runs Leiden.
+
+    Only the mutual case is swept. With use_mutual=False every basket emits k
+    directed edges by construction, so coverage is 100% by definition and
+    there is nothing to measure — the question there is edge count and Leiden
+    runtime, not coverage.
+
+    Returns
+    -------
+    DataFrame: k, n_covered, n_isolated, coverage
+    """
+    k_values = sorted(set(int(k) for k in k_values))
+    k_max = k_values[-1]
+
+    n = len(basket_gnn_embeddings)
+    with progress_step(f"normalising {n:,} embeddings", 1, 3):
+        X = normalize(np.stack(basket_gnn_embeddings["gnn_embedding"].values), copy=False)
+
+    with progress_step(f"kNN search, k={k_max} over {n:,} baskets", 2, 3):
+        if HAVE_PYNNDESCENT:
+            index = NNDescent(X, n_neighbors=k_max + 1, metric="cosine",
+                              random_state=SAMPLE_SEED, verbose=True)
+            indices, _ = index.neighbor_graph
+        else:
+            nn = NearestNeighbors(n_neighbors=k_max + 1, metric="cosine")
+            nn.fit(X)
+            _, indices = nn.kneighbors(X)
+    del X
+
+    rows = []
+    with progress_step(f"evaluating coverage at k={k_values}", 3, 3):
+        for k in k_values:
+            covered = int(_mutual_coverage_mask(indices, k).sum())
+            rows.append({
+                "k": k,
+                "n_covered": covered,
+                "n_isolated": n - covered,
+                "coverage": covered / n if n else 1.0,
+            })
+            print(f"    k={k:>3}: {covered:,} of {n:,} covered "
+                  f"({covered / n:.1%}), {n - covered:,} isolated")
+
+    result = pd.DataFrame(rows)
+    print()
+    print("Mutual-kNN coverage by k (upper bound — the similarity>0 filter is "
+          "not applied here):")
+    print(result.to_string(index=False))
+    print(f"\nPIPELINE_MIN_GRAPH_COVERAGE is currently {MIN_GRAPH_COVERAGE:.2f}. "
+          f"If no k here clears it, use PIPELINE_USE_MUTUAL_KNN=false — that "
+          f"covers every basket by construction, at the cost of a much denser "
+          f"graph and a slower Leiden.")
+    return result
+
+
 def diagnose_connectivity(edges: pd.DataFrame) -> pd.Series:
     """Same check as multiview_clustering_v5.py — run before trusting a resolution sweep."""
     g, baskets = _build_igraph(edges)
@@ -538,13 +679,62 @@ def sweep_resolution(edges: pd.DataFrame, resolutions=(0.2, 0.3, 0.5, 0.8, 1.0, 
     return pd.DataFrame(results)
 
 
+def _check_graph_coverage(baskets, all_basket_ids, min_coverage: float):
+    """
+    Refuse to spend hours of Leiden on a graph that is missing most of its
+    baskets. Returns the de-duplicated universe of basket ids.
+
+    Checked BEFORE the optimiser starts, deliberately. The failure this exists
+    for cost a full run: mutual-kNN at k=15 over 57,115,804 baskets produced a
+    28,692,907-vertex graph, Leiden ran for hours on that half, and the
+    shortfall only became visible as NaN in the output parquet — by which
+    point the cheap fix (raise k, or drop the mutual filter, then redo a
+    ~30-minute neighbour search) had cost a day.
+    """
+    universe = pd.Index(pd.unique(np.asarray(all_basket_ids)))
+    n_total = len(universe)
+    n_in_graph = len(baskets)
+    coverage = n_in_graph / n_total if n_total else 1.0
+
+    print(f"  Graph coverage: {n_in_graph:,} of {n_total:,} baskets "
+          f"({coverage:.1%}), {n_total - n_in_graph:,} with no edge")
+
+    if coverage < min_coverage:
+        raise ValueError(
+            f"kNN graph covers only {coverage:.1%} of baskets "
+            f"({n_in_graph:,} of {n_total:,}) — below PIPELINE_MIN_GRAPH_COVERAGE="
+            f"{min_coverage:.2f}. The {n_total - n_in_graph:,} baskets with no edge "
+            f"cannot be given a Leiden community, so clustering now would silently "
+            f"produce labels for a subset of the population.\n"
+            f"  Fix the graph:  raise PIPELINE_BASKET_KNN_K, or set "
+            f"PIPELINE_USE_MUTUAL_KNN=false\n"
+            f"  Measure first:  cluster_basket_embeddings.coverage_probe() reports "
+            f"coverage per k without running Leiden\n"
+            f"  Accept it:      set PIPELINE_MIN_GRAPH_COVERAGE=0 to cluster the "
+            f"covered subset anyway (uncovered baskets get need_state_cluster="
+            f"{UNCLUSTERED})"
+        )
+    return universe
+
+
 def run_leiden_on_basket_graph(
     edges: pd.DataFrame,
     resolution: float = LEIDEN_RESOLUTION,
     n_iterations: int = LEIDEN_N_ITERATIONS,
+    all_basket_ids=None,
+    min_coverage: float = MIN_GRAPH_COVERAGE,
 ) -> pd.DataFrame:
     """
     Leiden over the basket kNN graph.
+
+    all_basket_ids : the full basket population this graph was built from.
+        Pass it. Without it there is no way to tell a graph covering every
+        basket from one covering half of them — the edge list alone only
+        knows about baskets that survived the mutual-kNN filter. When given,
+        coverage is checked against min_coverage before the optimiser runs,
+        and every basket appears in the returned frame: those absent from the
+        graph get need_state_cluster=-1 rather than being dropped and later
+        resurfacing as NaN in an outer merge.
 
     Drives the optimiser one iteration at a time instead of handing the whole
     thing to leidenalg.find_partition(). This is NOT a change of algorithm:
@@ -568,6 +758,10 @@ def run_leiden_on_basket_graph(
     """
     g, baskets = _build_igraph(edges)
 
+    universe = None
+    if all_basket_ids is not None:
+        universe = _check_graph_coverage(baskets, all_basket_ids, min_coverage)
+
     partition = leidenalg.RBConfigurationVertexPartition(
         g, weights="weight", resolution_parameter=resolution,
     )
@@ -587,7 +781,24 @@ def run_leiden_on_basket_graph(
                   f"iteration {iteration} of {n_iterations}")
             break
 
-    return pd.DataFrame({"basket_id": baskets, "need_state_cluster": partition.membership})
+    clustered = pd.DataFrame({"basket_id": baskets, "need_state_cluster": partition.membership})
+    if universe is None:
+        return clustered
+
+    # Every basket comes back, labelled or explicitly UNCLUSTERED. Returning
+    # only the clustered ones is what let the shortfall travel downstream as
+    # NaN: pipeline_main outer-merges this with the GMM labels, which DO cover
+    # the whole population, so the row count looked right while half the
+    # Leiden column was empty.
+    result = pd.DataFrame({"basket_id": universe}).merge(clustered, on="basket_id", how="left")
+    n_missing = int(result["need_state_cluster"].isna().sum())
+    result["need_state_cluster"] = (
+        result["need_state_cluster"].fillna(UNCLUSTERED).astype(np.int64)
+    )
+    if n_missing:
+        print(f"  {n_missing:,} baskets had no vertex in the graph — "
+              f"need_state_cluster={UNCLUSTERED} (not a cluster; no edges to place them by)")
+    return result
 
 
 def cluster_basket_embeddings(
@@ -597,11 +808,16 @@ def cluster_basket_embeddings(
     """Convenience wrapper: build graph -> Leiden -> per-basket need-state cluster."""
     started = time.perf_counter()
     edges = build_basket_knn_graph(basket_gnn_embeddings)
-    clusters = run_leiden_on_basket_graph(edges, resolution=resolution)
+    clusters = run_leiden_on_basket_graph(
+        edges,
+        resolution=resolution,
+        all_basket_ids=basket_gnn_embeddings["basket_id"].to_numpy(),
+    )
     print(f"  Leiden clustering total: {fmt_duration(time.perf_counter() - started)}")
 
-    print(f"\nNeed-state clusters found: {clusters['need_state_cluster'].nunique()}")
-    print(clusters["need_state_cluster"].value_counts().describe())
+    real = clusters[clusters["need_state_cluster"] != UNCLUSTERED]
+    print(f"\nNeed-state clusters found: {real['need_state_cluster'].nunique()}")
+    print(real["need_state_cluster"].value_counts().describe())
     return clusters
 
 
@@ -792,9 +1008,51 @@ def compare_leiden_gmm(leiden_clusters: pd.DataFrame, gmm_clusters: pd.DataFrame
     whether Leiden and GMM are finding roughly the same structure (ARI close
     to 1) or something meaningfully different (ARI close to 0), which is
     itself a useful diagnostic regardless of which method you end up trusting.
+
+    Baskets Leiden could not place (UNCLUSTERED) are excluded. GMM assigns
+    every basket, so keeping them would compare a real GMM partition against
+    one enormous pseudo-cluster and drive the ARI toward 0 for a reason that
+    has nothing to do with the two methods disagreeing.
     """
-    merged = leiden_clusters.merge(gmm_clusters, on="basket_id", how="inner")
+    comparable = leiden_clusters[leiden_clusters["need_state_cluster"] != UNCLUSTERED]
+    n_skipped = len(leiden_clusters) - len(comparable)
+    if n_skipped:
+        print(f"  Excluding {n_skipped:,} UNCLUSTERED baskets from the comparison "
+              f"({n_skipped / len(leiden_clusters):.1%} of the population had no "
+              f"Leiden community)")
+    merged = comparable.merge(gmm_clusters, on="basket_id", how="inner")
     ari = adjusted_rand_score(merged["need_state_cluster"], merged["need_state_cluster_gmm"])
     print(f"Leiden vs GMM Adjusted Rand Index: {ari:.3f}  "
           f"(1.0 = identical groupings, ~0.0 = no better than random agreement)")
     return {"n_compared": len(merged), "adjusted_rand_index": ari}
+
+
+if __name__ == "__main__":
+    # Runs the coverage probe standalone, so choosing k does not mean editing
+    # config and launching the whole pipeline to find out.
+    #
+    #     python -u cluster_basket_embeddings.py --k 15 30 50
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Measure what fraction of baskets survive mutual-kNN, per k. "
+                    "Runs ONE neighbour search at max(--k) and evaluates every "
+                    "smaller k against it; never builds an edge table or runs Leiden."
+    )
+    parser.add_argument("--k", type=int, nargs="+", default=[10, 15, 20, 30, 50],
+                        help="k values to evaluate (default: 10 15 20 30 50)")
+    parser.add_argument("--embeddings",
+                        default=os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet"),
+                        help="basket embeddings parquet produced by Stage 1")
+    parser.add_argument("--out",
+                        default=os.path.join(OUTPUT_DIR, "coverage_probe.csv"),
+                        help="where to write the results table")
+    args = parser.parse_args()
+
+    with progress_step(f"loading {args.embeddings}"):
+        _frame = pd.read_parquet(args.embeddings)
+    print(f"  {len(_frame):,} baskets")
+
+    _table = coverage_probe(_frame, k_values=args.k)
+    _table.to_csv(args.out, index=False)
+    print(f"\nSaved {args.out}")

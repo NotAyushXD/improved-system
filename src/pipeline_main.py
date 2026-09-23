@@ -144,6 +144,7 @@ from cluster_basket_embeddings import (
     compare_leiden_gmm,
     fmt_duration,
     GMM_MODEL_PATH,
+    UNCLUSTERED,
 )
 import need_state_graph
 import config
@@ -402,9 +403,22 @@ def main():
     # Stage 2.5 below needs it. Same graph, same Leiden call, same result;
     # the edge list just stays in scope now.
     basket_edges   = build_basket_knn_graph(basket_gnn_embeddings)
-    leiden_clusters = run_leiden_on_basket_graph(basket_edges)
+    # all_basket_ids is what lets Leiden tell "clustered everything" from
+    # "clustered whatever survived mutual-kNN". Without it a graph missing half
+    # the population runs to completion and the shortfall only shows up as NaN
+    # after the outer merge below, which the GMM labels pad out to the right
+    # row count.
+    leiden_clusters = run_leiden_on_basket_graph(
+        basket_edges,
+        all_basket_ids=basket_gnn_embeddings["basket_id"].to_numpy(),
+    )
     leiden_done = time.perf_counter()
-    print(f"\nNeed-state clusters found: {leiden_clusters['need_state_cluster'].nunique()}")
+    # UNCLUSTERED (-1) is "no edges, Leiden never saw it", not a need-state —
+    # counting it would inflate the headline number by one.
+    _real_clusters = leiden_clusters.loc[
+        leiden_clusters["need_state_cluster"] != UNCLUSTERED, "need_state_cluster"
+    ]
+    print(f"\nNeed-state clusters found: {_real_clusters.nunique()}")
     print(f"[Stage 2a] done in {fmt_duration(leiden_done - stage2_started)}")
 
     print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
@@ -437,7 +451,15 @@ def main():
     _gmm_model = joblib.load(GMM_MODEL_PATH) if os.path.exists(GMM_MODEL_PATH) else None
     need_state_graph.build_and_save_all(
         edges                 = basket_edges,
-        leiden_clusters       = leiden_clusters,
+        # UNCLUSTERED rows are excluded here, not passed through: "-1" is the
+        # absence of a need-state, and letting it reach adjacency/transition
+        # analysis would invent a need-state that every uncovered basket
+        # appears to belong to, complete with its own edges and journeys.
+        # These baskets were simply not in leiden_clusters before it started
+        # returning the full population, so this preserves what Stage 2.5 sees.
+        leiden_clusters       = leiden_clusters[
+            leiden_clusters["need_state_cluster"] != UNCLUSTERED
+        ],
         basket_gnn_embeddings = basket_gnn_embeddings,
         gmm                   = _gmm_model,
     )

@@ -383,6 +383,23 @@ ASSIGN_NEW_BASKET_K = _int("PIPELINE_ASSIGN_NEW_BASKET_K", 15, minimum=1)
 # if that drive is tight.
 CACHE_BASKET_EDGES = _bool("PIPELINE_CACHE_BASKET_EDGES", True)
 
+# Smallest fraction of baskets that must appear in the kNN graph before Leiden
+# is allowed to run.
+#
+# Mutual-kNN keeps an edge only when BOTH baskets rank each other in their
+# top-K, so a basket whose neighbours all rank it lower survives with no edges
+# at all — and _build_igraph derives its vertices from the edge endpoints, so
+# such a basket silently never becomes a vertex. A k=15 mutual run over
+# 57,115,804 baskets built a graph of 28,692,907 vertices: 49.8% of the
+# population was absent, Leiden never saw it, and pipeline_main's outer merge
+# with the GMM labels wrote those baskets out as NaN need_state_cluster with
+# nothing in the log saying so.
+#
+# Checked BEFORE the optimiser starts, so an unusable graph costs the kNN
+# search rather than the hours of Leiden that would follow it. Set 0 to allow
+# any coverage (and get a warning instead of an error).
+MIN_GRAPH_COVERAGE = _float("PIPELINE_MIN_GRAPH_COVERAGE", 0.95, minimum=0.0, maximum=1.0)
+
 # ═════════════════════════════════════════════
 # PROGRESS REPORTING  (cluster_basket_embeddings.py)
 # ═════════════════════════════════════════════
