@@ -371,10 +371,29 @@ def build_basket_knn_graph(
         dst = neighbor_idx.reshape(-1)
         sim = (1 - neighbor_dist).reshape(-1).astype(np.float64)
 
-        # Defensive: drop any self-match that slipped in at a position other
-        # than 0 (e.g. duplicate embeddings) — same as the old loop's `j != i`.
-        not_self = dst != src
-        src, dst, sim = src[not_self], dst[not_self], sim[not_self]
+        # Drop any self-match that slipped in at a position other than 0
+        # (e.g. duplicate embeddings) — same as the old loop's `j != i` — and
+        # any slot the approximate search could not fill.
+        #
+        # The unfilled slots matter more than they look. pynndescent pads a
+        # row it cannot complete with an out-of-range index and an infinite
+        # distance; that is what its "Failed to correctly find n_neighbors for
+        # some samples" warning means, and it fires on every full-scale run
+        # here. An out-of-range dst makes the key below alias a DIFFERENT
+        # legitimate pair: src*n + n is exactly (src+1)*n + 0, so a padded row
+        # from basket src can answer the reverse-edge lookup for the real pair
+        # (0, src+1). Those rows were previously removed further down by the
+        # `avg_sim > 0` filter (padding has similarity -inf), which is to say
+        # the aliasing was survivable only by accident. Removing them here
+        # keeps the key space honest.
+        in_range = (dst >= 0) & (dst < n)
+        usable = (dst != src) & in_range
+        n_padded = int((~in_range).sum())
+        if n_padded:
+            print(f"  Dropped {n_padded:,} unfilled neighbour slots "
+                  f"({n_padded / len(dst):.2%} of candidates) — the approximate "
+                  f"search could not find {k} neighbours for every basket")
+        src, dst, sim = src[usable], dst[usable], sim[usable]
 
         # Mutual-kNN check: "does the reverse edge (j, i) also exist among the
         # edges above" — done via one integer key per directed pair and a sorted
@@ -531,13 +550,21 @@ def _build_igraph(edges: pd.DataFrame):
     return g, baskets
 
 
-def _mutual_coverage_mask(indices: np.ndarray, k: int) -> np.ndarray:
+def _mutual_coverage_mask(indices: np.ndarray, distances: np.ndarray, k: int) -> np.ndarray:
     """
     Boolean mask: which rows keep at least one MUTUAL neighbour among their
     first k, i.e. which baskets would still be vertices under mutual-kNN.
 
-    `indices` is pynndescent/sklearn's neighbour table INCLUDING each row's
-    self-match at column 0, exactly as build_basket_knn_graph receives it.
+    `indices` / `distances` are pynndescent's or sklearn's neighbour tables
+    INCLUDING each row's self-match at column 0, exactly as
+    build_basket_knn_graph receives them.
+
+    NOT every entry in `indices` is a vertex. When the approximate search
+    cannot fill a row — the "Failed to correctly find n_neighbors for some
+    samples" warning pynndescent emits at this scale — it pads the row with
+    out-of-range sentinels and infinite distances. Following one of those as
+    an index raises IndexError (observed: index 57,115,804 in a table of
+    57,115,804 rows), so they are masked out here rather than assumed away.
 
     Column-at-a-time rather than the sorted-key join build_basket_knn_graph
     uses, because this only needs the vertex set and not the edges. Each
@@ -545,29 +572,39 @@ def _mutual_coverage_mask(indices: np.ndarray, k: int) -> np.ndarray:
     than the several multiples of n*k the key sort needs — that difference is
     what makes probing k=50 over 57M baskets affordable.
 
-    Deliberate approximation: the production rule also drops pairs whose
-    averaged similarity is <= 0, which this ignores. That makes the number
-    reported here an UPPER BOUND on real coverage. Cosine similarities between
-    these embeddings are positive in practice, so the gap should be small —
-    but treat a probe result near the threshold as "not proven", not "passed".
+    Remaining difference from production, small and deliberate: the real rule
+    keeps a pair when the AVERAGE of the two directions' similarities is > 0,
+    where this requires each direction to be > 0 on its own. They differ only
+    when one direction is positive and the other negative by more — which the
+    sentinel handling above already covers, since those are -inf.
     """
     n = indices.shape[0]
     neighbours = indices[:, 1:k + 1]
+    similarities = 1.0 - distances[:, 1:k + 1]
+
     # Compared in the neighbour table's own dtype (int32 from pynndescent)
     # rather than promoting to int64: the gather below is the single largest
     # allocation in this function and widening it would double that for
     # nothing. Basket counts are nowhere near int32's 2.1B ceiling.
     self_id = np.arange(n, dtype=indices.dtype)[:, None]
 
+    valid = (neighbours >= 0) & (neighbours < n) & (similarities > 0)
+    # Invalid slots still have to point somewhere for the gather; row 0 is
+    # arbitrary and safe because `valid` masks the result out afterwards.
+    # Copying preserves the int32 dtype that np.where would widen.
+    safe = neighbours.copy()
+    safe[~valid] = 0
+
     has_mutual = np.zeros(n, dtype=bool)
     for column in range(neighbours.shape[1]):
-        j = neighbours[:, column]
-        # j's own neighbour list, gathered per row; does it list me back?
-        listed_back = (neighbours[j] == self_id).any(axis=1)
+        j = safe[:, column]
+        # j's own neighbour list, gathered per row; does it list me back, in a
+        # slot that is itself a real neighbour rather than padding?
+        listed_back = ((safe[j] == self_id) & valid[j]).any(axis=1)
         # A self-match sitting at a column other than 0 would otherwise count
         # as its own mutual neighbour — build_basket_knn_graph drops those
         # too (the `dst != src` filter).
-        has_mutual |= listed_back & (j != self_id[:, 0])
+        has_mutual |= listed_back & valid[:, column] & (j != self_id[:, 0])
     return has_mutual
 
 
@@ -604,17 +641,17 @@ def coverage_probe(
         if HAVE_PYNNDESCENT:
             index = NNDescent(X, n_neighbors=k_max + 1, metric="cosine",
                               random_state=SAMPLE_SEED, verbose=True)
-            indices, _ = index.neighbor_graph
+            indices, distances = index.neighbor_graph
         else:
             nn = NearestNeighbors(n_neighbors=k_max + 1, metric="cosine")
             nn.fit(X)
-            _, indices = nn.kneighbors(X)
+            distances, indices = nn.kneighbors(X)
     del X
 
     rows = []
     with progress_step(f"evaluating coverage at k={k_values}", 3, 3):
         for k in k_values:
-            covered = int(_mutual_coverage_mask(indices, k).sum())
+            covered = int(_mutual_coverage_mask(indices, distances, k).sum())
             rows.append({
                 "k": k,
                 "n_covered": covered,

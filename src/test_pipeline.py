@@ -1447,7 +1447,10 @@ def check_graph_coverage():
         [4, 3, 1],   # 4 lists 3  -> mutual with 3
     ], dtype=np.int32)
 
-    got = cbe._mutual_coverage_mask(indices, k=2)
+    # Every pair genuinely similar (distance 0.1 -> similarity 0.9).
+    dists = np.full(indices.shape, 0.1, dtype=np.float32)
+
+    got = cbe._mutual_coverage_mask(indices, dists, k=2)
     expected = np.array([True, True, False, True, True])
     if not np.array_equal(got, expected):
         ok = _fail(f"_mutual_coverage_mask(k=2) = {got.tolist()}, expected {expected.tolist()}")
@@ -1456,7 +1459,7 @@ def check_graph_coverage():
 
     # At k=1 only the first neighbour counts: 0->1 and 1->0 still mutual,
     # 3->4 and 4->3 still mutual, 2->0 still unreciprocated.
-    got_k1 = cbe._mutual_coverage_mask(indices, k=1)
+    got_k1 = cbe._mutual_coverage_mask(indices, dists, k=1)
     expected_k1 = np.array([True, True, False, True, True])
     if not np.array_equal(got_k1, expected_k1):
         ok = _fail(f"_mutual_coverage_mask(k=1) = {got_k1.tolist()}, "
@@ -1466,10 +1469,42 @@ def check_graph_coverage():
 
     # A row whose only "neighbour" is itself must not count as mutual.
     self_only = np.array([[0, 0], [1, 1]], dtype=np.int32)
-    if cbe._mutual_coverage_mask(self_only, k=1).any():
+    if cbe._mutual_coverage_mask(self_only, np.full((2, 2), 0.1, np.float32), k=1).any():
         ok = _fail("_mutual_coverage_mask counted a self-match as a mutual neighbour")
     else:
         print("  _mutual_coverage_mask ignores self-matches — OK")
+
+    # ── unfilled neighbour slots ──
+    # pynndescent pads rows it cannot complete with an out-of-range index and
+    # an infinite distance. Following one as an index raises IndexError — the
+    # failure that killed the first full-scale probe run at k=50.
+    padded_idx = np.array([
+        [0, 1],
+        [1, 0],
+        [2, 5],   # 5 == n: sentinel, not a vertex
+    ], dtype=np.int32)
+    padded_dist = np.array([
+        [0.0, 0.1],
+        [0.0, 0.1],
+        [0.0, np.inf],
+    ], dtype=np.float32)
+    try:
+        got_pad = cbe._mutual_coverage_mask(padded_idx, padded_dist, k=1)
+        if not np.array_equal(got_pad, np.array([True, True, False])):
+            ok = _fail(f"_mutual_coverage_mask with an out-of-range sentinel = "
+                       f"{got_pad.tolist()}, expected [True, True, False]")
+        else:
+            print("  _mutual_coverage_mask survives out-of-range padding — OK")
+    except IndexError as e:
+        ok = _fail(f"_mutual_coverage_mask followed an out-of-range sentinel: {e}")
+
+    # A real index but a non-positive similarity is not an edge either.
+    neg_sim = np.array([[0, 1], [1, 0]], dtype=np.int32)
+    neg_dist = np.array([[0.0, 1.5], [0.0, 1.5]], dtype=np.float32)  # similarity -0.5
+    if cbe._mutual_coverage_mask(neg_sim, neg_dist, k=1).any():
+        ok = _fail("_mutual_coverage_mask counted a non-positive-similarity pair")
+    else:
+        print("  _mutual_coverage_mask drops non-positive similarities — OK")
 
     # ── 2. the coverage gate ──
     universe = np.array([f"b{i}" for i in range(10)], dtype=object)
