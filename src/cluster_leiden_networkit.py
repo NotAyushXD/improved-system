@@ -106,14 +106,20 @@ def build_networkit_graph(edges: pd.DataFrame):
     return graph, baskets
 
 
-def run_parallel_leiden(graph, resolution: float, iterations: int):
-    """ParallelLeiden over the whole graph, timed, with modularity reported."""
+def run_parallel_leiden(graph, resolution: float, iterations: int, want_membership=True):
+    """
+    ParallelLeiden over the whole graph, timed, with modularity reported.
+
+    want_membership=False skips materialising the partition vector, which at
+    28.7M vertices is a Python list of 28.7M ints — pure waste during a
+    resolution sweep, where only the community count and modularity matter.
+    """
     print(f"  ParallelLeiden: gamma={resolution}, up to {iterations} iteration(s), "
           f"{nk.getMaxNumberOfThreads()} threads over {graph.numberOfNodes():,} "
           f"vertices / {graph.numberOfEdges():,} edges")
 
     started = time.perf_counter()
-    with progress_step("ParallelLeiden"):
+    with progress_step(f"ParallelLeiden (gamma={resolution})"):
         algorithm = nk.community.ParallelLeiden(
             graph, randomize=True, iterations=iterations, gamma=resolution,
         )
@@ -121,12 +127,36 @@ def run_parallel_leiden(graph, resolution: float, iterations: int):
         partition = algorithm.getPartition()
     elapsed = time.perf_counter() - started
 
-    membership = np.asarray(partition.getVector(), dtype=np.int64)
+    n_communities = partition.numberOfSubsets()
     modularity = nk.community.Modularity().getQuality(partition, graph)
 
-    print(f"  -> {partition.numberOfSubsets():,} communities, "
+    # Community SIZES, from subsetSizes() rather than the membership vector:
+    # one entry per community (tens of thousands) instead of one per vertex
+    # (tens of millions), so this is affordable even mid-sweep.
+    #
+    # The headline count alone cannot tell a real partition from a collapsed
+    # one. Dropping the mutual-kNN filter lets generic "hub" baskets bridge
+    # unrelated need-states, and the way that failure shows up is not a bad
+    # modularity score — it is one community swallowing most of the
+    # population while a long tail of singletons makes the count still look
+    # healthy. largest_share is the number that exposes it.
+    sizes = np.sort(np.asarray(partition.subsetSizes(), dtype=np.int64))[::-1]
+    largest_share = sizes[0] / sizes.sum() if len(sizes) else 0.0
+
+    membership = (np.asarray(partition.getVector(), dtype=np.int64)
+                  if want_membership else None)
+
+    print(f"  -> {n_communities:,} communities, "
           f"modularity={modularity:.4f}, in {fmt_duration(elapsed)}")
-    return membership, modularity, elapsed
+    print(f"     sizes: largest={sizes[0]:,} ({largest_share:.1%} of clustered baskets), "
+          f"median={int(np.median(sizes)):,}, "
+          f"top5={[int(s) for s in sizes[:5]]}")
+    if largest_share > 0.5:
+        print(f"     WARNING: one community holds {largest_share:.1%} of all clustered "
+              f"baskets. That is hub collapse, not a need-state — unrelated groups have "
+              f"been bridged into one. Raise the resolution, or cap in-degree so no "
+              f"single basket can absorb thousands of one-directional edges.")
+    return membership, n_communities, modularity, elapsed, largest_share
 
 
 def main():
@@ -141,6 +171,12 @@ def main():
                              "coverage can be checked and uncovered baskets labelled")
     parser.add_argument("--out", default=NETWORKIT_CLUSTERS_PATH)
     parser.add_argument("--resolution", type=float, default=LEIDEN_RESOLUTION)
+    parser.add_argument("--sweep", type=float, nargs="+", default=None, metavar="GAMMA",
+                        help="try several resolutions against one graph load and print a "
+                             "comparison table. Writes no cluster labels — pick a value "
+                             "from the table, then rerun with --resolution. Exists because "
+                             "gamma=1.0 produced 94,845 communities on this graph, which "
+                             "is a micro-clustering rather than a set of need-states.")
     parser.add_argument("--iterations", type=int, default=LEIDEN_N_ITERATIONS)
     parser.add_argument("--threads", type=int, default=None,
                         help="OpenMP threads (default: all available)")
@@ -168,6 +204,31 @@ def main():
     graph, baskets = build_networkit_graph(edges)
     del edges
 
+    if args.sweep:
+        sweep_rows = []
+        for gamma in args.sweep:
+            _, n_communities, modularity, elapsed, largest_share = run_parallel_leiden(
+                graph, gamma, args.iterations, want_membership=False,
+            )
+            sweep_rows.append({
+                "resolution": gamma,
+                "n_communities": n_communities,
+                "modularity": modularity,
+                "largest_share": round(largest_share, 4),
+                "seconds": round(elapsed, 1),
+            })
+        table = pd.DataFrame(sweep_rows)
+        sweep_path = os.path.join(OUTPUT_DIR, "networkit_resolution_sweep.csv")
+        table.to_csv(sweep_path, index=False)
+        print()
+        print("Resolution sweep (no labels written — rerun with --resolution <value>):")
+        print(table.to_string(index=False))
+        print(f"\nSaved {sweep_path}")
+        print("\nLower gamma = fewer, larger communities. Modularity alone does not "
+              "pick the answer: it tends to favour the fine-grained end, so read it "
+              "alongside the community count you can actually act on.")
+        return
+
     universe = None
     if args.embeddings and os.path.exists(args.embeddings) and not args.smoke_test:
         with progress_step(f"reading basket ids from {args.embeddings}"):
@@ -178,7 +239,7 @@ def main():
         print(f"  NOTE: {args.embeddings} not found — skipping the coverage check. "
               f"Only baskets present in the edge list will appear in the output.")
 
-    membership, modularity, elapsed = run_parallel_leiden(
+    membership, n_communities, modularity, elapsed, largest_share = run_parallel_leiden(
         graph, args.resolution, args.iterations,
     )
     del graph

@@ -395,19 +395,27 @@ def build_basket_knn_graph(
                   f"search could not find {k} neighbours for every basket")
         src, dst, sim = src[usable], dst[usable], sim[usable]
 
-        # Mutual-kNN check: "does the reverse edge (j, i) also exist among the
-        # edges above" — done via one integer key per directed pair and a sorted
-        # search, instead of hundreds of millions of dict lookups.
-        keys = src * n + dst
-        order = np.argsort(keys)
-        sorted_keys = keys[order]
-
-        rev_keys   = dst * n + src
-        pos        = np.clip(np.searchsorted(sorted_keys, rev_keys), 0, len(sorted_keys) - 1)
-        rev_exists = sorted_keys[pos] == rev_keys
-        rev_sim    = sim[order[pos]]
-
         if use_mutual:
+            # Mutual-kNN check: "does the reverse edge (j, i) also exist among
+            # the edges above" — done via one integer key per directed pair and
+            # a sorted search, instead of hundreds of millions of dict lookups.
+            #
+            # Computed inside this branch, not before it. The one-directional
+            # path below never reads rev_exists or rev_sim, and at full
+            # population without the mutual filter there are ~857M directed
+            # pairs: the argsort alone allocates a second int64 array that size
+            # and the surrounding key/position arrays several more. That was
+            # tens of GB and a long sort spent on values nothing would consume.
+            keys = src * n + dst
+            order = np.argsort(keys)
+            sorted_keys = keys[order]
+
+            rev_keys   = dst * n + src
+            pos        = np.clip(np.searchsorted(sorted_keys, rev_keys), 0, len(sorted_keys) - 1)
+            rev_exists = sorted_keys[pos] == rev_keys
+            rev_sim    = sim[order[pos]]
+            del keys, order, sorted_keys, rev_keys, pos
+
             # Reverse direction must exist (mutual), and each undirected pair is
             # kept exactly once via src < dst — same as the old `i < j` check.
             avg_sim = (sim + rev_sim) / 2.0
@@ -663,8 +671,16 @@ def coverage_probe(
 
     result = pd.DataFrame(rows)
     print()
-    print("Mutual-kNN coverage by k (upper bound — the similarity>0 filter is "
-          "not applied here):")
+    # Not exact, and not a bound in either direction. Every k here is read off
+    # ONE search configured for k_max neighbours, but production runs its own
+    # search at its own k — and an approximate index explores differently when
+    # asked for 51 neighbours than when asked for 16, so the first 15 columns
+    # of a k=50 search are not the 15 columns a k=15 search would return.
+    # Measured gap: this reported 41.0% at k=15 where a real k=15 build
+    # covered 50.2%. Trust the SHAPE of the curve (where the returns flatten),
+    # not the absolute numbers.
+    print("Mutual-kNN coverage by k (approximate — each k is read off a single "
+          f"k={k_max} search, not its own):")
     print(result.to_string(index=False))
     print(f"\nPIPELINE_MIN_GRAPH_COVERAGE is currently {MIN_GRAPH_COVERAGE:.2f}. "
           f"If no k here clears it, use PIPELINE_USE_MUTUAL_KNN=false — that "
@@ -1065,31 +1081,58 @@ def compare_leiden_gmm(leiden_clusters: pd.DataFrame, gmm_clusters: pd.DataFrame
 
 
 if __name__ == "__main__":
-    # Runs the coverage probe standalone, so choosing k does not mean editing
-    # config and launching the whole pipeline to find out.
+    # Two standalone modes, both so that Stage 2 decisions do not require
+    # launching pipeline_main and its single-threaded Leiden:
     #
-    #     python -u cluster_basket_embeddings.py --k 15 30 50
+    #   python -u cluster_basket_embeddings.py --k 15 30 50   # coverage probe
+    #   python -u cluster_basket_embeddings.py --build-edges  # write edge cache
+    #
+    # --build-edges exists because rebuilding the kNN graph and CLUSTERING it
+    # are separate decisions once clustering moved to cluster_leiden_networkit.
+    # Running pipeline_main to refresh the edge cache would also run leidenalg
+    # over the result, single-threaded, which is the thing that does not finish.
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Measure what fraction of baskets survive mutual-kNN, per k. "
-                    "Runs ONE neighbour search at max(--k) and evaluates every "
-                    "smaller k against it; never builds an edge table or runs Leiden."
+        description="Stage 2 tools: measure mutual-kNN coverage per k, or rebuild "
+                    "the cached kNN edge list, without running Leiden."
     )
+    parser.add_argument("--build-edges", action="store_true",
+                        help="build and cache the kNN edge list for the CURRENT "
+                             "config (k, mutual on/off), then stop. Cluster it with "
+                             "cluster_leiden_networkit.py.")
     parser.add_argument("--k", type=int, nargs="+", default=[10, 15, 20, 30, 50],
-                        help="k values to evaluate (default: 10 15 20 30 50)")
+                        help="coverage-probe mode: k values to evaluate. In "
+                             "--build-edges mode, the first value overrides "
+                             "PIPELINE_BASKET_KNN_K.")
+    parser.add_argument("--mutual", choices=["true", "false"], default=None,
+                        help="--build-edges mode: override PIPELINE_USE_MUTUAL_KNN")
     parser.add_argument("--embeddings",
                         default=os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet"),
                         help="basket embeddings parquet produced by Stage 1")
     parser.add_argument("--out",
                         default=os.path.join(OUTPUT_DIR, "coverage_probe.csv"),
-                        help="where to write the results table")
+                        help="coverage-probe mode: where to write the results table")
     args = parser.parse_args()
 
     with progress_step(f"loading {args.embeddings}"):
         _frame = pd.read_parquet(args.embeddings)
     print(f"  {len(_frame):,} baskets")
 
-    _table = coverage_probe(_frame, k_values=args.k)
-    _table.to_csv(args.out, index=False)
-    print(f"\nSaved {args.out}")
+    if args.build_edges:
+        _k = args.k[0] if args.k else BASKET_KNN_K
+        _mutual = USE_MUTUAL_KNN if args.mutual is None else (args.mutual == "true")
+        print(f"\nBuilding edge list: k={_k}, mutual={_mutual}")
+        if not _mutual:
+            print(f"  One-directional: every basket keeps its {_k} neighbours whether "
+                  f"or not they are returned, so coverage is 100% by construction. "
+                  f"Expect roughly {len(_frame) * _k / 1e6:,.0f}M candidate pairs before "
+                  f"deduplication — several times the mutual graph.")
+        _edges = build_basket_knn_graph(_frame, k=_k, use_mutual=_mutual)
+        print(f"\nEdge list ready: {len(_edges):,} edges.")
+        print(f"Cluster it with:\n"
+              f"  python -u cluster_leiden_networkit.py --sweep 1.0 0.5 0.2 0.05")
+    else:
+        _table = coverage_probe(_frame, k_values=args.k)
+        _table.to_csv(args.out, index=False)
+        print(f"\nSaved {args.out}")
