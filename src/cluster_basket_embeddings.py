@@ -1101,10 +1101,16 @@ if __name__ == "__main__":
                         help="build and cache the kNN edge list for the CURRENT "
                              "config (k, mutual on/off), then stop. Cluster it with "
                              "cluster_leiden_networkit.py.")
-    parser.add_argument("--k", type=int, nargs="+", default=[10, 15, 20, 30, 50],
-                        help="coverage-probe mode: k values to evaluate. In "
-                             "--build-edges mode, the first value overrides "
-                             "PIPELINE_BASKET_KNN_K.")
+    # default=None, not a list: in --build-edges mode an unpassed --k has to
+    # fall through to PIPELINE_BASKET_KNN_K. With a list default it never did —
+    # args.k[0] silently picked the first PROBE value (10) regardless of config,
+    # so a build could be fingerprinted at a k nobody chose and pipeline_main
+    # would then rebuild the whole edge list to reach the k config asked for.
+    parser.add_argument("--k", type=int, nargs="+", default=None,
+                        help="coverage-probe mode: k values to evaluate "
+                             "(default: 10 15 20 30 50). In --build-edges mode, the "
+                             "first value overrides PIPELINE_BASKET_KNN_K; omit it to "
+                             "use the configured value.")
     parser.add_argument("--mutual", choices=["true", "false"], default=None,
                         help="--build-edges mode: override PIPELINE_USE_MUTUAL_KNN")
     parser.add_argument("--embeddings",
@@ -1122,7 +1128,15 @@ if __name__ == "__main__":
     if args.build_edges:
         _k = args.k[0] if args.k else BASKET_KNN_K
         _mutual = USE_MUTUAL_KNN if args.mutual is None else (args.mutual == "true")
-        print(f"\nBuilding edge list: k={_k}, mutual={_mutual}")
+        _k_src = "--k" if args.k else "PIPELINE_BASKET_KNN_K"
+        _m_src = "--mutual" if args.mutual is not None else "PIPELINE_USE_MUTUAL_KNN"
+        print(f"\nBuilding edge list: k={_k} (from {_k_src}), "
+              f"mutual={_mutual} (from {_m_src})")
+        if _k != BASKET_KNN_K:
+            print(f"  WARNING: this builds a k={_k} graph while PIPELINE_BASKET_KNN_K="
+                  f"{BASKET_KNN_K}. pipeline_main reads the config value, so it would "
+                  f"see a fingerprint mismatch and rebuild the whole edge list. Set "
+                  f"PIPELINE_BASKET_KNN_K={_k} in .env before running it.")
         if not _mutual:
             print(f"  One-directional: every basket keeps its {_k} neighbours whether "
                   f"or not they are returned, so coverage is 100% by construction. "
