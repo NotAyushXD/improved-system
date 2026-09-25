@@ -170,19 +170,33 @@ def check_config():
         "COPURCHASE_CHUNK_BASKETS": 500_000, "INFERENCE_CHUNK_BASKETS": 50_000,
         "SUBCL_K_CANDIDATES": [50, 100, 200, 400],
     }
-    # Only meaningful when nothing is overriding them in this shell.
-    overriding = [k for k in _os.environ if k.startswith("PIPELINE_")]
-    if overriding:
-        print(f"  SKIP default-value check — {len(overriding)} PIPELINE_* var(s) set "
-              f"in this shell: {sorted(overriding)}")
+    # Checked per key, and only for keys actually sitting at their default.
+    #
+    # config supports THREE sources — environment variable, .env file, baked-in
+    # default — and records which one each value came from. This used to consult
+    # os.environ alone, which misses the .env file entirely: a run configured
+    # the documented way (PIPELINE_BASKET_KNN_K=10 in .env) was reported as
+    # "defaults drifted from the original hardcoded values", pointing at
+    # config.py when nothing there had changed.
+    #
+    # Per key rather than all-or-nothing, too: the old version skipped every
+    # default the moment any single PIPELINE_* var was set, so the check
+    # silently stopped covering anything as soon as the .env grew.
+    sources = {k: config._USED[k][1] for k in expected_defaults if k in config._USED}
+    overridden = sorted(k for k, src in sources.items() if src != "default")
+    checkable = {k: v for k, v in expected_defaults.items() if k not in overridden}
+
+    if overridden:
+        print(f"  {len(overridden)} key(s) overridden by env/.env, so not compared "
+              f"against defaults: {overridden}")
+    wrong = {k: (getattr(config, k), v) for k, v in checkable.items()
+             if getattr(config, k) != v}
+    if wrong:
+        ok = _fail(f"defaults drifted from the original hardcoded values "
+                   f"(effective, expected): {wrong}")
     else:
-        wrong = {k: (getattr(config, k), v) for k, v in expected_defaults.items()
-                 if getattr(config, k) != v}
-        if wrong:
-            ok = _fail(f"defaults drifted from the original hardcoded values: {wrong}")
-        else:
-            print(f"  defaults match the original hardcoded values "
-                  f"({len(expected_defaults)} checked) — OK")
+        print(f"  defaults match the original hardcoded values "
+              f"({len(checkable)} checked, {len(overridden)} overridden) — OK")
 
     # Types must be real Python types, not strings off the environment.
     type_expect = [("TOP_K", int), ("LR", float), ("USE_MUTUAL_KNN", bool),
