@@ -139,13 +139,18 @@ import basket_store
 from GNN_Train import train_and_embed
 from cluster_basket_embeddings import (
     build_basket_knn_graph,
-    run_leiden_on_basket_graph,
     cluster_basket_embeddings_gmm,
     compare_leiden_gmm,
     fmt_duration,
     GMM_MODEL_PATH,
     UNCLUSTERED,
+    BASKET_EDGES_PATH,
+    LEIDEN_RESOLUTION,
+    LEIDEN_N_ITERATIONS,
+    _cache_manifest_path,
+    _read_manifest,
 )
+from cluster_leiden_networkit import load_cached_labels
 import need_state_graph
 import config
 
@@ -402,16 +407,38 @@ def main():
     # land in different communities is a boundary between two need-states — and
     # Stage 2.5 below needs it. Same graph, same Leiden call, same result;
     # the edge list just stays in scope now.
-    basket_edges   = build_basket_knn_graph(basket_gnn_embeddings)
-    # all_basket_ids is what lets Leiden tell "clustered everything" from
-    # "clustered whatever survived mutual-kNN". Without it a graph missing half
-    # the population runs to completion and the shortfall only shows up as NaN
-    # after the outer merge below, which the GMM labels pad out to the right
-    # row count.
-    leiden_clusters = run_leiden_on_basket_graph(
-        basket_edges,
-        all_basket_ids=basket_gnn_embeddings["basket_id"].to_numpy(),
+    basket_edges = build_basket_knn_graph(basket_gnn_embeddings)
+
+    # Labels come from cluster_leiden_networkit, not from leidenalg.
+    #
+    # leidenalg is single-threaded and does not finish at this scale — it ran
+    # overnight on a 28.7M-vertex graph without completing one optimiser
+    # iteration, while NetworKit's ParallelLeiden clustered the larger 57.1M
+    # vertex / 508M edge graph in 40 minutes across 64 threads. So Stage 2a is
+    # its own process, and this reads what it produced.
+    #
+    # Refused rather than recomputed when the fingerprint does not match: the
+    # alternative is a pipeline that quietly starts a clustering run nobody
+    # asked for, at the end of an already-long pipeline, using whichever
+    # backend happened to be wired in. Better to stop and name the command.
+    edge_manifest = _read_manifest(_cache_manifest_path(BASKET_EDGES_PATH))
+    leiden_clusters = load_cached_labels(
+        edge_manifest, LEIDEN_RESOLUTION, LEIDEN_N_ITERATIONS,
     )
+    if leiden_clusters is None:
+        raise RuntimeError(
+            "No Leiden labels matching this graph and resolution.\n"
+            f"  graph:      {BASKET_EDGES_PATH}\n"
+            f"  resolution: {LEIDEN_RESOLUTION}, iterations: {LEIDEN_N_ITERATIONS}\n"
+            "Stage 2a runs as its own process because leidenalg cannot finish at "
+            "this scale. Produce the labels first:\n"
+            f"  python -u cluster_leiden_networkit.py --resolution {LEIDEN_RESOLUTION}\n"
+            "then rerun this. If you changed PIPELINE_BASKET_KNN_K, "
+            "PIPELINE_USE_MUTUAL_KNN or PIPELINE_LEIDEN_RESOLUTION since clustering, "
+            "the saved labels describe a different graph and are correctly refused."
+        )
+    print(f"  Reusing Leiden labels for {len(leiden_clusters):,} baskets "
+          f"(fingerprint matches this graph at resolution={LEIDEN_RESOLUTION})")
     leiden_done = time.perf_counter()
     # UNCLUSTERED (-1) is "no edges, Leiden never saw it", not a need-state —
     # counting it would inflate the headline number by one.

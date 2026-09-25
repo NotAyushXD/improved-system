@@ -40,6 +40,7 @@ diffing assignments.
 """
 
 import argparse
+import json
 import os
 import time
 
@@ -56,12 +57,75 @@ from cluster_basket_embeddings import (
     LEIDEN_N_ITERATIONS,
     MIN_GRAPH_COVERAGE,
     OUTPUT_DIR,
+    _cache_manifest_path,
     _check_graph_coverage,
+    _read_manifest,
     fmt_duration,
     progress_step,
 )
 
 NETWORKIT_CLUSTERS_PATH = os.path.join(OUTPUT_DIR, "basket_need_state_clusters_networkit.parquet")
+
+
+# ─────────────────────────────────────────────
+# Label cache — so a downstream rerun does not re-cluster
+# ─────────────────────────────────────────────
+#
+# Clustering is now 40 minutes rather than never-finishing, but that is still
+# 40 minutes to repeat for nothing when pipeline_main only wants the labels so
+# it can run the GMM and the need-state graphs. Fingerprinted rather than
+# "file exists", for the same reason the edge cache is: ParallelLeiden
+# randomises, so silently reusing labels grown from a different graph or a
+# different gamma would produce need-state graphs describing a partition
+# nobody can reproduce.
+
+
+def label_manifest(edge_manifest, resolution: float, iterations: int) -> dict:
+    """
+    Everything that changes which labels come out.
+
+    The edge manifest is embedded whole rather than re-derived: it already
+    fingerprints k, mutual-kNN, seed, basket count, backend and a digest of
+    the embeddings, and it is sitting on disk next to the edge list. Recomputing
+    an embedding digest here would mean loading the 15GB embeddings frame to
+    re-answer a question already answered.
+    """
+    return {
+        "edges": edge_manifest,
+        "resolution": float(resolution),
+        "iterations": int(iterations),
+        "cluster_backend": "networkit-parallelleiden",
+    }
+
+
+def write_labels(labels: pd.DataFrame, manifest: dict, path: str = NETWORKIT_CLUSTERS_PATH):
+    """Parquet first, manifest second, each replaced atomically — as _write_edge_cache."""
+    tmp = path + ".tmp"
+    labels.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+    manifest_path = _cache_manifest_path(path)
+    tmp_manifest = manifest_path + ".tmp"
+    with open(tmp_manifest, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    os.replace(tmp_manifest, manifest_path)
+
+
+def load_cached_labels(edge_manifest, resolution: float, iterations: int,
+                       path: str = NETWORKIT_CLUSTERS_PATH):
+    """
+    Saved labels if they were grown from exactly this graph and gamma, else None.
+
+    A None edge_manifest (no edge cache written) can never match a stored one,
+    so unverifiable labels are refused rather than trusted — the safe direction.
+    """
+    if not os.path.exists(path):
+        return None
+    if _read_manifest(_cache_manifest_path(path)) != label_manifest(
+        edge_manifest, resolution, iterations
+    ):
+        return None
+    return pd.read_parquet(path)
 
 
 def build_networkit_graph(edges: pd.DataFrame):
@@ -260,7 +324,13 @@ def main():
     else:
         result = clustered
 
-    result.to_parquet(args.out, index=False)
+    edge_manifest = _read_manifest(_cache_manifest_path(args.edges))
+    if edge_manifest is None:
+        print(f"  NOTE: no manifest beside {args.edges}, so these labels cannot be "
+              f"fingerprinted. pipeline_main will refuse to reuse them and will ask "
+              f"you to re-cluster.")
+    write_labels(result, label_manifest(edge_manifest, args.resolution, args.iterations),
+                 path=args.out)
     print(f"\nSaved {args.out} ({len(result):,} rows)")
     print(f"  communities: {result.loc[result['need_state_cluster'] != UNCLUSTERED, 'need_state_cluster'].nunique():,}")
     print(f"  modularity : {modularity:.4f}")

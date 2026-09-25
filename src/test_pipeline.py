@@ -1408,6 +1408,103 @@ def _reference_build_igraph(edges):
     return baskets, pairs, edges["weight"].tolist()
 
 
+def check_label_cache():
+    """
+    pipeline_main reuses saved Leiden labels instead of re-clustering. This
+    pins the conditions under which it must REFUSE to.
+
+    Stage 2a runs as its own process now, so its output is an artifact on disk
+    that something else trusts — the same shape as the edge cache, and the same
+    hazard. ParallelLeiden randomises, so labels grown from a different graph
+    or a different gamma are not merely stale, they are unreproducible: the
+    need-state graphs built on top of them would describe a partition nobody
+    can regenerate. Anything short of an exact fingerprint match has to be a
+    miss.
+    """
+    print()
+    print("=" * 70)
+    print("LABEL CACHE — saved Leiden labels are reused only for the same graph")
+    print("=" * 70)
+
+    try:
+        import cluster_leiden_networkit as cln
+    except ImportError as e:
+        print(f"  SKIP — cluster_leiden_networkit not importable here ({e})")
+        print("PASSED")
+        return True
+
+    ok = True
+    tmp = Path("test_labels_cache.parquet")
+    tmp_manifest = Path(cln._cache_manifest_path(str(tmp)))
+
+    edge_manifest = {
+        "k": 10, "use_mutual": False, "seed": 42, "n_baskets": 6,
+        "embedding_digest": "deadbeefdeadbeef", "knn_backend": "pynndescent",
+    }
+    labels = pd.DataFrame({
+        "basket_id": [f"b{i}" for i in range(6)],
+        "need_state_cluster": [0, 0, 1, 1, 2, 2],
+    })
+
+    try:
+        cln.write_labels(labels, cln.label_manifest(edge_manifest, 1.0, 2), path=str(tmp))
+
+        got = cln.load_cached_labels(edge_manifest, 1.0, 2, path=str(tmp))
+        if got is None or len(got) != 6:
+            ok = _fail("labels written with a matching fingerprint were not reused")
+        else:
+            print("  exact fingerprint match -> labels reused — OK")
+
+        if cln.load_cached_labels(edge_manifest, 0.5, 2, path=str(tmp)) is not None:
+            ok = _fail("labels reused at a DIFFERENT resolution — gamma changes the partition")
+        else:
+            print("  different resolution -> refused — OK")
+
+        if cln.load_cached_labels(edge_manifest, 1.0, 5, path=str(tmp)) is not None:
+            ok = _fail("labels reused with a different iteration count")
+        else:
+            print("  different iteration count -> refused — OK")
+
+        other_graph = dict(edge_manifest, use_mutual=True)
+        if cln.load_cached_labels(other_graph, 1.0, 2, path=str(tmp)) is not None:
+            ok = _fail("labels from the one-directional graph reused for a mutual one — "
+                       "this is the 50%-coverage graph being clustered by mistake")
+        else:
+            print("  different graph (mutual flipped) -> refused — OK")
+
+        if cln.load_cached_labels(dict(edge_manifest, k=15), 1.0, 2, path=str(tmp)) is not None:
+            ok = _fail("labels reused after k changed")
+        else:
+            print("  different k -> refused — OK")
+
+        retrained = dict(edge_manifest, embedding_digest="0000000000000000")
+        if cln.load_cached_labels(retrained, 1.0, 2, path=str(tmp)) is not None:
+            ok = _fail("labels reused after the EMBEDDINGS changed — a retrained GNN "
+                       "gives different vectors for the same baskets")
+        else:
+            print("  retrained embeddings -> refused — OK")
+
+        # No edge manifest at all means the labels cannot be vouched for.
+        if cln.load_cached_labels(None, 1.0, 2, path=str(tmp)) is not None:
+            ok = _fail("unverifiable labels (no edge manifest) were reused")
+        else:
+            print("  no edge manifest -> refused — OK")
+
+        # A labels parquet with no manifest beside it must not be trusted.
+        tmp_manifest.unlink()
+        if cln.load_cached_labels(edge_manifest, 1.0, 2, path=str(tmp)) is not None:
+            ok = _fail("a manifest-less labels parquet was trusted")
+        else:
+            print("  manifest-less parquet -> refused — OK")
+    finally:
+        for p in (tmp, tmp_manifest):
+            if p.exists():
+                p.unlink()
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
 def check_graph_coverage():
     """
     Every basket must come out of Stage 2 with a label, or a loud error.
@@ -2171,6 +2268,7 @@ def main():
         ("need-state graph", check_need_state_graph),
         ("clustering progress / graph build / Leiden parity", check_clustering_progress),
         ("graph coverage / no silent label loss", check_graph_coverage),
+        ("label cache / no stale Leiden labels", check_label_cache),
     ]
     if not args.fast:
         checks.append(("functional / parity / basket store", check_functional))
