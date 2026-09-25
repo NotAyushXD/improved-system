@@ -182,21 +182,56 @@ def check_config():
     # Per key rather than all-or-nothing, too: the old version skipped every
     # default the moment any single PIPELINE_* var was set, so the check
     # silently stopped covering anything as soon as the .env grew.
-    sources = {k: config._USED[k][1] for k in expected_defaults if k in config._USED}
-    overridden = sorted(k for k, src in sources.items() if src != "default")
-    checkable = {k: v for k, v in expected_defaults.items() if k not in overridden}
+    # Read the DEFAULTS OUT OF config.py's SOURCE, not off the imported module.
+    #
+    # getattr(config, "TOP_K") is the EFFECTIVE value — whatever .env or the
+    # environment resolved to — which is a different question entirely. Asking
+    # it here had two failure modes, both seen on prod: a .env configured the
+    # documented way was reported as "defaults drifted" and blamed config.py;
+    # and once the .env grew to set every key (as the real one does), every
+    # key counted as overridden and the check silently verified nothing.
+    #
+    # Parsing `_int("PIPELINE_TOP_K", 10, ...)` out of the AST answers the
+    # question this check exists for — has anyone edited the baked-in defaults
+    # — and answers it identically whatever the deployment's .env contains.
+    baked = {}
+    for node in ast.parse(Path("config.py").read_text(encoding="utf-8")).body:
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        fn = node.value.func
+        if not (isinstance(fn, ast.Name)
+                and fn.id in {"_int", "_float", "_bool", "_str", "_int_list"}):
+            continue
+        if len(node.value.args) < 2:
+            continue
+        try:
+            default = ast.literal_eval(node.value.args[1])
+        except ValueError:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                baked[target.id] = default
 
-    if overridden:
-        print(f"  {len(overridden)} key(s) overridden by env/.env, so not compared "
-              f"against defaults: {overridden}")
-    wrong = {k: (getattr(config, k), v) for k, v in checkable.items()
-             if getattr(config, k) != v}
+    absent = sorted(k for k in expected_defaults if k not in baked)
+    if absent:
+        ok = _fail(f"could not read a baked-in default out of config.py for {absent} — "
+                   f"either the parameter is gone or it is no longer declared via the "
+                   f"_int/_float/_bool/_str/_int_list helpers")
+    wrong = {k: (baked[k], v) for k, v in expected_defaults.items()
+             if k in baked and baked[k] != v}
     if wrong:
-        ok = _fail(f"defaults drifted from the original hardcoded values "
-                   f"(effective, expected): {wrong}")
+        ok = _fail(f"config.py's baked-in defaults drifted from the original hardcoded "
+                   f"values (found, expected): {wrong}")
     else:
-        print(f"  defaults match the original hardcoded values "
-              f"({len(checkable)} checked, {len(overridden)} overridden) — OK")
+        print(f"  config.py's baked-in defaults match the original hardcoded values "
+              f"({len(expected_defaults) - len(absent)} checked) — OK")
+
+    # Separately, and for information only: what is actually in force right now.
+    overridden = sorted(k for k in expected_defaults
+                        if config._USED.get("PIPELINE_" + k, (None, "default"))[1] != "default")
+    if overridden:
+        print(f"  {len(overridden)} of these are overridden by env/.env in this run "
+              f"(effective values differ from the defaults above): {overridden}")
 
     # Types must be real Python types, not strings off the environment.
     type_expect = [("TOP_K", int), ("LR", float), ("USE_MUTUAL_KNN", bool),
