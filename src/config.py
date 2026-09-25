@@ -373,6 +373,25 @@ GMM_N_INIT = _int("PIPELINE_GMM_N_INIT", 3, minimum=1)
 GMM_COVARIANCE = _str("PIPELINE_GMM_COVARIANCE", "diag",
                       choices={"full", "tied", "diag", "spherical"})
 
+# How GaussianMixture picks its starting parameters, BEFORE any EM iteration.
+#
+# sklearn's default is "kmeans", which fits a complete k-means over the whole
+# population first. At 57,115,804 x 64 that ran for over 40 minutes without
+# reaching EM iteration 1 — and n_init restarts pay it again each time, so
+# n_init=3 means three full k-means fits before the model starts learning.
+# "k-means++" does the seeding step only, and "random_from_data" just samples
+# real points; both reach EM in a fraction of the time.
+#
+# Left at sklearn's default so behaviour is unchanged unless asked for, but at
+# full population "k-means++" is the sane setting.
+GMM_INIT_PARAMS = _str("PIPELINE_GMM_INIT_PARAMS", "kmeans",
+                       choices={"kmeans", "k-means++", "random", "random_from_data"})
+
+# Hard cap on EM iterations per restart. sklearn's default is 100, which at
+# full scale is a commitment of unknown length — each iteration is minutes,
+# and nothing reports the total up front.
+GMM_MAX_ITER = _int("PIPELINE_GMM_MAX_ITER", 100, minimum=1)
+
 ASSIGN_NEW_BASKET_K = _int("PIPELINE_ASSIGN_NEW_BASKET_K", 15, minimum=1)
 
 # The basket kNN graph is the most expensive artifact in Stage 2 (hours of

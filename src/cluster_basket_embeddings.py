@@ -64,6 +64,8 @@ GMM_K_MAX          = config.GMM_K_MAX
 GMM_K_STEP         = config.GMM_K_STEP
 GMM_N_INIT         = config.GMM_N_INIT
 GMM_COVARIANCE     = config.GMM_COVARIANCE   # "diag" scales to more dimensions than "full"
+GMM_INIT_PARAMS    = config.GMM_INIT_PARAMS  # "kmeans" fits a whole k-means before EM starts
+GMM_MAX_ITER       = config.GMM_MAX_ITER
 
 # All pipeline-produced artifacts land here, not the working directory.
 OUTPUT_DIR         = config.OUTPUT_DIR
@@ -1024,10 +1026,21 @@ def cluster_basket_embeddings_gmm(
     gmm = GaussianMixture(
         n_components=n_components, n_init=GMM_N_INIT,
         covariance_type=covariance_type, random_state=SAMPLE_SEED,
+        init_params=GMM_INIT_PARAMS, max_iter=GMM_MAX_ITER,
         verbose=2, verbose_interval=1,
     )
     print(f"  GMM: k={n_components}, covariance={covariance_type}, "
+          f"init={GMM_INIT_PARAMS}, max_iter={GMM_MAX_ITER}, "
           f"n_init={GMM_N_INIT} restart(s) over {len(basket_ids):,} baskets")
+    if GMM_INIT_PARAMS == "kmeans":
+        # Announced before the silence, not after it. sklearn prints
+        # "Initialization N" and then runs this with no further output, so an
+        # unexplained gap of tens of minutes between that line and "Iteration 1"
+        # reads exactly like a hang.
+        print(f"  init='kmeans' fits a FULL k-means over all {len(basket_ids):,} "
+              f"baskets before EM iteration 1, once per restart ({GMM_N_INIT}x). "
+              f"Expect a long silent gap after each 'Initialization' line. "
+              f"PIPELINE_GMM_INIT_PARAMS=k-means++ skips it.")
     with progress_step(f"fitting GMM (k={n_components})", 2, GMM_STEPS):
         labels = gmm.fit_predict(X)
 
