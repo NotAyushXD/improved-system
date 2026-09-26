@@ -64,7 +64,32 @@ from cluster_basket_embeddings import (
     progress_step,
 )
 
-NETWORKIT_CLUSTERS_PATH = os.path.join(OUTPUT_DIR, "basket_need_state_clusters_networkit.parquet")
+def labels_path_for(edges_path: str, resolution: float) -> str:
+    """
+    One label file per (graph, resolution), named after the graph it came from.
+
+    `basket_knn_edges_k10_onedir.parquet` at gamma 1.5 gives
+    `basket_need_state_clusters_k10_onedir_r1p5.parquet`.
+
+    Same reasoning as _edge_cache_path: the manifest already refuses a
+    mismatch, but a single fixed filename means a run at a different
+    resolution overwrites the labels before anything checks. At 36 minutes a
+    run, and with a resolution sweep being the normal way to choose one, that
+    is worth avoiding structurally rather than remembering to avoid.
+
+    The decimal point becomes 'p' deliberately: os.path.splitext on
+    "..._r1.5.parquet" splits at the FIRST dot from the right of the final
+    component — giving ".5.parquet" as the extension — which would put the
+    manifest sidecar somewhere unrelated to the file it describes.
+    """
+    stem = os.path.splitext(os.path.basename(edges_path))[0]
+    stem = stem.replace("basket_knn_edges", "basket_need_state_clusters")
+    return os.path.join(
+        OUTPUT_DIR, f"{stem}_r{str(float(resolution)).replace('.', 'p')}.parquet"
+    )
+
+
+NETWORKIT_CLUSTERS_PATH = labels_path_for(BASKET_EDGES_PATH, LEIDEN_RESOLUTION)
 
 
 # ─────────────────────────────────────────────
@@ -233,7 +258,13 @@ def main():
                         default=os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet"),
                         help="basket embeddings, read only for its basket_id column so "
                              "coverage can be checked and uncovered baskets labelled")
-    parser.add_argument("--out", default=NETWORKIT_CLUSTERS_PATH)
+    # default=None so the name follows the --edges and --resolution ACTUALLY
+    # given. Binding it to config's resolution at import meant
+    # `--resolution 2.0` wrote its labels over the file belonging to whatever
+    # resolution .env happened to name.
+    parser.add_argument("--out", default=None,
+                        help="default: named after the graph and resolution in use, "
+                             "e.g. basket_need_state_clusters_k10_onedir_r1p5.parquet")
     parser.add_argument("--resolution", type=float, default=LEIDEN_RESOLUTION)
     parser.add_argument("--sweep", type=float, nargs="+", default=None, metavar="GAMMA",
                         help="try several resolutions against one graph load and print a "
@@ -251,6 +282,8 @@ def main():
                              "result, because truncating an edge list is not a "
                              "meaningful subgraph.")
     args = parser.parse_args()
+    if args.out is None:
+        args.out = labels_path_for(args.edges, args.resolution)
 
     if args.threads is not None:
         nk.setNumberOfThreads(args.threads)

@@ -345,8 +345,11 @@ feeding them to the model:
 > It sat alongside the co-purchase matrix, which at this data size is about
 > 11.8GB. Peak was ~15.5GB **before a single basket had been encoded**.
 
-On a memory-constrained machine that is enough for the operating system to
-kill the process outright, which on Windows leaves no Python error behind.
+That was enough for the operating system to kill the process outright on the
+machine this ran on at the time, which on Windows leaves no Python error
+behind. (The current box has 512 GB, so this particular peak would no longer
+be fatal — but the streaming fix stands on its own, and the *invisibility* of
+the failure is the part worth remembering.)
 
 It also meant nothing could be printed until an entire chunk had finished, so
 a run that was silently dying looked exactly like a run that was working.
@@ -413,40 +416,67 @@ rebuilds automatically rather than silently reusing something incompatible.
 
 ---
 
-## Stage 2 — Still open: clustering at 57 million baskets
+## Stage 2 — Resolved, but not by any of the means predicted here
 
-This one is **not fixed**, and is flagged here so it isn't discovered the
-hard way after a long inference run finally completes.
+**Status: Stage 2a runs at full scale.** 57,115,804 baskets, 100% coverage,
+356 need-states, ~36 minutes. Updated 2026-09-26.
 
-**Problem:** The memory fixes above all concern getting *to* the basket
-embeddings. Stage 2 then has to cluster them, and at 57 million baskets the
-arithmetic is uncomfortable on a memory-constrained CPU machine:
+This section previously predicted that Stage 2 would not fit in memory, and
+proposed clustering a sample and assigning the rest. **Both the diagnosis and
+the prescription were wrong**, and the error is worth recording because it
+sent a round of work in the wrong direction.
+
+### What the prediction got wrong
+
+The figures below were the estimate, and they are roughly accurate as
+arithmetic:
 
 | what | rough size at 57M baskets |
 |---|---|
 | the embeddings themselves | ~15 GB |
 | ...while being normalised (makes a copy) | ~29 GB at peak |
-| the nearest-neighbour graph | a few hundred million connections, several GB as a table, more once handed to the clustering library |
-| GMM's internal working array | ~14 GB **per iteration**, and it runs many iterations, three times over |
+| the nearest-neighbour graph | several GB as a table |
+| GMM's internal working array | ~14 GB **per iteration** |
 
-The nearest-neighbour search itself is already handled (#9 — an approximate
-method built for this scale), and the code prints the graph size before
-clustering so it shows up as a number rather than a silent crash. But the
-normalisation copy and the GMM working array are new at this volume.
+What was wrong was the word *"memory-constrained"*. Nobody had written down
+the machine's actual RAM. It has **512 GB**. A complete Stage 2 run peaks near
+78 GB — about 15%. None of the numbers above were ever a problem.
 
-**The likely fix, not yet implemented:** cluster a sample rather than the
-whole population, then assign everything else. Fit Leiden and GMM on a few
-million baskets, then label the remaining tens of millions by asking which
-already-found group each one falls nearest to. Both halves of this already
-exist in the codebase — it's exactly what `score_new_baskets.py` does for
-newly arriving baskets (`assign_new_baskets_to_clusters` for the Leiden
-side, the saved GMM model's own prediction for the other). What's missing is
-wiring that path into the main run so the full population never has to be
-clustered in one go.
+The cost of that assumption was real: a plan to shrink memory was drafted,
+and abandoned only after the figure was finally measured.
 
-This turns an intractable 57-million-point clustering into a tractable
-few-million-point one plus a cheap streaming assignment pass, and it is the
-next thing to build.
+### What was actually wrong
+
+Two things, neither of them memory:
+
+**1. A mutual-kNN filter silently discarding half the population.** Graph
+vertices are derived from edge endpoints, so a basket left with no
+reciprocated edge never became a vertex at all. A k=15 run built a graph of
+28,692,907 vertices from 57,115,804 baskets. The shortfall then travelled
+downstream as NaN through an outer merge with the GMM labels, producing an
+output file with the correct row count and half its cluster column empty —
+no error, no warning, nothing in the log. Measured coverage: 41.0% at k=15,
+50.2% at k=30, 53.3% at k=50. Fixed by switching to a one-directional graph
+(100% coverage by construction) and by counting coverage on every build and
+refusing to cluster below `PIPELINE_MIN_GRAPH_COVERAGE`.
+
+**2. A single-threaded clustering library on a 64-core machine.**
+`leidenalg` pinned exactly one core and did not finish a single optimiser
+iteration overnight. Replaced with NetworKit's `ParallelLeiden`
+(`cluster_leiden_networkit.py`), which clusters the *larger* full-coverage
+graph — 57.1M vertices, 508M edges — in 36 minutes across all 64 threads.
+
+The sample-then-assign path was never needed and was not built.
+`assign_new_baskets_to_clusters()` still exists for its original purpose in
+`score_new_baskets.py`.
+
+### The lesson worth keeping
+
+Every other entry in this document describes a memory problem that was
+measured and then fixed. This one describes a memory problem that was
+*assumed* and never existed, while two real problems — silent data loss and
+single-threaded compute — went unnoticed underneath it. **Measure the machine
+before optimising for it**, and count anything a filter throws away.
 
 ---
 
@@ -502,5 +532,6 @@ hiding inside it stops being a rounding error and becomes the whole runtime.
 
 | Stage | Issue | Status |
 |---|---|---|
-| Stage 2 | Clustering 57M embeddings: ~29 GB peak during normalisation, ~14 GB per GMM iteration, several GB for the neighbour graph | **Not fixed.** Likely approach — cluster a few-million-basket sample, then assign the rest using the already-existing `assign_new_baskets_to_clusters` / saved-GMM prediction path. Next thing to build. |
-| Stage 1 | Multi-process inference would cut wall clock further, but each worker needs its own copy of the embedding matrix and co-purchase matrix | **Not built.** Viable on Linux/macOS, where `fork` shares those pages copy-on-write. On Windows each worker gets a full copy, which may not fit — check the platform before launching workers. |
+| Stage 2a | Clustering 57M embeddings | **Fixed, and not for the predicted reason.** Memory was never the constraint (512 GB box; run peaks ~78 GB). The real faults were a mutual-kNN filter silently dropping half the baskets, and single-threaded `leidenalg`. Now one-directional kNN + NetworKit `ParallelLeiden`: 100% coverage, 356 need-states, ~36 min. See the Stage 2 section above. |
+| Stage 2b | GMM over 57M embeddings has not completed | **Open.** Not memory — sklearn's default `init_params='kmeans'` fits a full k-means over all 57.1M points before EM iteration 1, once per `n_init` restart, and ran 40+ minutes without reaching it. `PIPELINE_GMM_INIT_PARAMS=k-means++` exists to skip that; `n_init=3` on an unvalidated placeholder K is poor value. |
+| Stage 1 | Multi-process inference would cut wall clock further, but each worker needs its own copy of the embedding matrix and co-purchase matrix | **Not built.** Viable on Linux/macOS, where `fork` shares those pages copy-on-write. On Windows each worker gets a full copy — though with 512 GB that is far less of a barrier than this document originally assumed. |

@@ -76,14 +76,14 @@ project/
   week grain — expect roughly the same row count at week grain too, since
   the source table `cltv_hh_metrics_tpnb_base` is already at week grain and
   the period version was just summing weeks together)
-- **21,978,316 baskets** at the OLD period grain (~4 weeks/basket) — expect
-  meaningfully MORE, smaller baskets now that basket construction groups by
-  week instead of period (roughly 4x more baskets, each ~4x smaller, is a
-  reasonable first guess, not yet confirmed against a real run)
-- **~47 products/basket on average at period grain** (expect noticeably
-  fewer per basket at week grain, since each basket now spans 1 week instead
-  of ~4)
-- Running on a Windows machine (`D:\cie\src`, PowerShell, a `.venv`)
+- **21,978,316 baskets** at the OLD period grain (~4 weeks/basket). The
+  week-grain rebuild was predicted to give "roughly 4x more baskets"; the
+  measured figure is **57,115,804**, so ~2.6x. Confirmed against a real run,
+  not a guess.
+- **~47 products/basket on average at period grain** (noticeably fewer per
+  basket at week grain, since each basket now spans 1 week instead of ~4)
+- Running on a Windows machine: `E:\ayp\improved-system`, PowerShell, venv at
+  `src\.venv`, **Python 3.13, 64 logical cores, 512 GB RAM, no GPU**
 
 ## Basket grain — WEEK, not a true single-visit basket
 
@@ -159,6 +159,9 @@ environment was available in the environment these fixes were made in):
    sorted-array `np.searchsorted` lookup replacing the dict-based mutual-kNN
    membership check) — same neighbors, same similarities, same mutual-kNN
    rule, just computed as arrays instead of per-pair Python.
+   *(Superseded in scope: the mutual-kNN rule itself is no longer used — see
+   item 15 below — and the basket count is now 57.1M, not 22M. The
+   vectorisation described here still stands and still runs.)*
 6. **All output paths consolidated** to `data/output/` (previously
    scattered across the working directory with one path mismatch between
    what `build_product_embeddings.py` wrote and what `pipeline_main.py` /
@@ -169,12 +172,19 @@ environment was available in the environment these fixes were made in):
 **Measured production scale** (this supersedes any earlier numbers in this
 document): 57,115,804 baskets; 154,597 products in the co-purchase matrix
 with 1,474,348,846 non-zeros (mean 9,537 per product row); 198,652 products
-with embeddings; global product sub-clustering selected k=400. CPU-only
-Windows box, memory-constrained.
+with embeddings; global product sub-clustering selected k=400.
+
+**The machine:** CPU-only Windows box, **64 logical cores, 512 GB RAM**,
+Python 3.13. Earlier revisions of this document called it
+"memory-constrained" — that was wrong, and it misdirected a round of work. A
+full Stage 2 run peaks near 78 GB, about 15% of the box. The binding
+constraints are single-threaded libraries and graph construction, not RAM.
 
 **Reached end to end:** Stage 0 (basket build), Stage 1a (co-purchase
 matrix), product sub-clustering, LMDB training-graph cache (299,999 graphs),
-and 20 epochs of GNN training (2h25m, final avg_loss 3.2e-5).
+20 epochs of GNN training (2h25m, final avg_loss 3.2e-5), **the full inference
+pass embedding all 57,115,804 baskets** (1,143 chunks), and **Stage 2a
+clustering**.
 
 **`test_pipeline.py` passes all six groups on the target machine**, including
 checks that are not toy-scale in nature: the per-basket submatrix rewrite is
@@ -211,17 +221,35 @@ when a graph-affecting parameter changes and stay put otherwise.
 14. **Stage 2.5 added** (`need_state_graph.py`): need-state adjacency,
     household transition graph, and journey queries — recovering edge
     structure the pipeline previously computed and discarded.
+15. **Mutual-kNN was silently discarding half the population.** Graph vertices
+    are derived from edge endpoints, so a basket left with no reciprocated
+    edge never became a vertex. A k=15 run built a 28,692,907-vertex graph
+    from 57,115,804 baskets and wrote the missing half out as NaN after an
+    outer merge with the GMM labels — correct row count, half the column
+    empty, nothing in the log. Coverage is now counted and printed on every
+    build, checked against `PIPELINE_MIN_GRAPH_COVERAGE` **before** Leiden
+    runs, and uncovered baskets get an explicit `-1` rather than a blank.
+    Measured coverage under mutual-kNN: 41.0% at k=15, 50.2% at k=30, 53.3%
+    at k=50 — it never approaches usable, so the graph is now one-directional.
+16. **Leiden moved to NetworKit** (`cluster_leiden_networkit.py`). `leidenalg`
+    is single-threaded and did not complete one optimiser iteration overnight
+    on 28.7M vertices. `ParallelLeiden` clusters the larger 57.1M-vertex /
+    508M-edge graph in ~36 minutes across 64 threads. Stage 2a therefore runs
+    as its own process; `pipeline_main.py` loads its fingerprinted output and
+    refuses to proceed on a mismatch rather than silently re-clustering.
+17. **pynndescent's unfilled neighbour slots** — the "Failed to correctly find
+    n_neighbors" warning that fires on every full-scale run — are padded with
+    an out-of-range index and an infinite distance. Those indices alias onto
+    real pairs under `src * n + dst` key arithmetic. Now filtered explicitly.
 
 ## What has NOT been verified yet
 
-- **The full inference pass has never completed.** Training finishes; the
-  embedding pass over all 57M baskets has not yet run to completion since
-  the streaming/memory fix.
-- **Stage 2 has never run at this scale, and is expected not to fit**:
-  ~29GB peak while normalising 57M × 64 embeddings, ~14GB per GMM EM
-  iteration, several GB for the kNN edge list. The intended fix — cluster a
-  sample, then assign the rest via the existing `assign_new_baskets_to_clusters`
-  / saved-GMM `predict` path — is **not yet wired into the main run**.
+- **Stage 2b (GMM) has not completed at full scale.** `init_params='kmeans'`,
+  sklearn's default, fits a complete k-means over all 57.1M points before EM
+  iteration 1 and repeats it per `n_init` restart; it ran 40+ minutes without
+  reaching the first iteration. `PIPELINE_GMM_INIT_PARAMS` now exists to skip
+  that. `PIPELINE_GMM_N_COMPONENTS=30` remains an unvalidated placeholder.
+- **Stages 2c and 2.5 have not run at full scale**, being downstream of 2b.
 - **Embedding quality is unchecked.** Training loss is very low (3.2e-5),
   which is consistent with either a good autoencoder or a collapsed one.
   `test_pipeline.py --prod-outputs` has a collapse check that cannot run

@@ -100,6 +100,15 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 ADJACENCY_PATH   = os.path.join(OUTPUT_DIR, "need_state_adjacency.parquet")
 TRANSITIONS_PATH = os.path.join(OUTPUT_DIR, "need_state_transitions.parquet")
 OVERLAP_PATH     = os.path.join(OUTPUT_DIR, "need_state_gmm_overlap.parquet")
+# Stage 2.5's own drill-down artifact — NOT cluster_basket_embeddings' Stage 2a
+# cache, which is now basket_knn_edges_k<K>_<mutual|onedir>.parquet.
+#
+# The two shared this exact filename until 2026-09-26, so a Stage 2.5 write
+# would land on top of the Stage 2a cache while its .manifest.json sidecar
+# stayed behind, still vouching for a file a different writer had replaced.
+# It never fired in production only because BASKET_EDGE_WRITE_CAP refuses
+# anything over 50M edges and the real graph has ~508M. Below the cap it
+# would have. Keep these names distinct.
 BASKET_EDGES_PATH = os.path.join(OUTPUT_DIR, "basket_knn_edges.parquet")
 
 # Writing the raw basket-level edge list is opt-in and capped — see MEMORY above.

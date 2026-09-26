@@ -1483,6 +1483,46 @@ def check_label_cache():
         return True
 
     ok = True
+    import cluster_basket_embeddings as cbe
+
+    # ── cache paths must encode the settings that produced them ──
+    # One fixed filename meant a run at different settings silently
+    # overwrote the previous graph, and the fingerprint only reported the
+    # mismatch afterwards — twice costing a 35-minute rebuild.
+    edges_a = cbe._edge_cache_path(10, False)
+    edges_b = cbe._edge_cache_path(15, True)
+    if edges_a == edges_b:
+        ok = _fail("k=10/one-directional and k=15/mutual share a cache file — "
+                   "one configuration will silently overwrite the other")
+    elif "k10_onedir" not in edges_a or "k15_mutual" not in edges_b:
+        ok = _fail(f"edge cache names do not carry their settings: "
+                   f"{Path(edges_a).name}, {Path(edges_b).name}")
+    else:
+        print(f"  edge cache path encodes k and mutual — OK ({Path(edges_a).name})")
+
+    labels_a = cln.labels_path_for(edges_a, 1.5)
+    labels_b = cln.labels_path_for(edges_a, 2.0)
+    labels_c = cln.labels_path_for(edges_b, 1.5)
+    if len({labels_a, labels_b, labels_c}) != 3:
+        ok = _fail("label files collide across resolution or graph: "
+                   f"{sorted({Path(p).name for p in (labels_a, labels_b, labels_c)})}")
+    else:
+        print(f"  label path encodes graph and resolution — OK ({Path(labels_a).name})")
+
+    # The decimal point MUST NOT survive into the filename: splitext would
+    # treat "..._r1.5.parquet" as extension ".5.parquet" and put the manifest
+    # sidecar somewhere unrelated to the file it describes.
+    if "." in Path(labels_a).stem:
+        ok = _fail(f"label filename contains a dot before the extension "
+                   f"({Path(labels_a).name}) — splitext will mis-split it and the "
+                   f"manifest sidecar will not sit beside its parquet")
+    elif not cln._cache_manifest_path(labels_a).endswith(".manifest.json"):
+        ok = _fail(f"manifest sidecar path is malformed: "
+                   f"{cln._cache_manifest_path(labels_a)}")
+    else:
+        print(f"  manifest sidecar resolves correctly — OK "
+              f"({Path(cln._cache_manifest_path(labels_a)).name})")
+
     tmp = Path("test_labels_cache.parquet")
     tmp_manifest = Path(cln._cache_manifest_path(str(tmp)))
 

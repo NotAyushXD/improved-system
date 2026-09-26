@@ -76,7 +76,35 @@ GMM_MODEL_PATH     = os.path.join(OUTPUT_DIR, "gmm_basket_model.pkl")   # fitted
 PROGRESS_HEARTBEAT_SECS = config.PROGRESS_HEARTBEAT_SECS
 
 CACHE_BASKET_EDGES = config.CACHE_BASKET_EDGES
-BASKET_EDGES_PATH  = os.path.join(OUTPUT_DIR, "basket_knn_edges.parquet")
+
+
+def _edge_cache_path(k: int, use_mutual: bool) -> str:
+    """
+    One cache file per (k, mutual) setting, rather than one fixed filename.
+
+    The fingerprint manifest already REFUSES a mismatched graph, but refusing
+    happens after the fact — a run at different settings had already
+    overwritten the file by then. That cost the same 35-minute rebuild twice:
+    a `pipeline_main` run picked up k=15/mutual=True from a reverted .env,
+    rebuilt over a k=10 one-directional graph, and only then reported the
+    mismatch it had just caused.
+
+    Encoding the settings in the name makes that impossible. A wrong-config
+    run builds a DIFFERENT file, leaves yours alone, and flipping between two
+    configurations costs one build each instead of one build per flip.
+
+    Only k and mutual are in the name. The other fingerprint dimensions
+    (seed, basket count, embedding digest, backend) still invalidate via the
+    manifest — correctly, since a graph built from retrained embeddings is
+    not something you want to keep alongside the new one.
+    """
+    return os.path.join(
+        OUTPUT_DIR,
+        f"basket_knn_edges_k{int(k)}_{'mutual' if use_mutual else 'onedir'}.parquet",
+    )
+
+
+BASKET_EDGES_PATH  = _edge_cache_path(BASKET_KNN_K, USE_MUTUAL_KNN)
 
 MIN_GRAPH_COVERAGE = config.MIN_GRAPH_COVERAGE
 
@@ -273,7 +301,7 @@ def build_basket_knn_graph(
     k: int = BASKET_KNN_K,
     use_mutual: bool = USE_MUTUAL_KNN,
     use_cache: bool = CACHE_BASKET_EDGES,
-    cache_path: str = BASKET_EDGES_PATH,
+    cache_path: str = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -301,6 +329,13 @@ def build_basket_knn_graph(
     rule, just computed over arrays instead of one basket-pair at a time.
     """
     KNN_STEPS = 4
+
+    # Derived from the k/use_mutual ACTUALLY in use, not from a default bound
+    # at import. A caller passing k=30 to a function whose cache_path default
+    # was fixed at config's k would read and overwrite the wrong file — the
+    # precise failure _edge_cache_path exists to prevent.
+    if cache_path is None:
+        cache_path = _edge_cache_path(k, use_mutual)
 
     manifest = _edge_cache_manifest(basket_gnn_embeddings, k, use_mutual) if use_cache else None
     if use_cache and os.path.exists(cache_path):

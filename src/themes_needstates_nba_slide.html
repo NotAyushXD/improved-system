@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Themes → Need States → Next Best Action</title>
+<style>
+  :root {
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6; /* blue    */
+    --series-2:       #eb6834; /* orange  */
+    --series-3:       #1baf7a; /* aqua    */
+    --series-1-fill:  rgba(42,120,214,0.12);
+    --series-2-fill:  rgba(235,104,52,0.12);
+    --series-3-fill:  rgba(27,175,122,0.12);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--page);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+  }
+  .slide {
+    width: 1280px;
+    height: 720px;
+    margin: 24px auto;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 3px rgba(11,11,11,0.08);
+    display: flex;
+    flex-direction: column;
+    padding: 28px 36px 20px 36px;
+  }
+  .header { margin-bottom: 6px; }
+  .eyebrow {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--series-1);
+  }
+  h1 {
+    font-size: 22px; font-weight: 700; margin: 4px 0 2px 0; color: var(--text-primary);
+  }
+  .subtitle {
+    font-size: 12.5px; color: var(--text-secondary); margin: 0 0 10px 0;
+  }
+  .row {
+    flex: 1;
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+  }
+  .panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 14px 16px;
+    border: 1px solid var(--gridline);
+    border-radius: 6px;
+    background: var(--surface-1);
+  }
+  .arrow-col {
+    width: 46px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+  }
+  .arrow-col svg { display:block; }
+  .arrow-label {
+    font-size: 9.5px; color: var(--text-muted); text-align: center; margin-top: 2px;
+    max-width: 46px; line-height: 1.2;
+  }
+  .panel-tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .tag-dot { width: 9px; height: 9px; border-radius: 50%; display:inline-block; }
+  .panel h2 {
+    font-size: 15.5px; margin: 0 0 3px 0; font-weight: 700;
+  }
+  .panel .desc {
+    font-size: 11px; color: var(--text-secondary); margin: 0 0 8px 0; line-height: 1.35;
+  }
+  .viz-box {
+    flex: 1;
+    background: var(--page);
+    border: 1px solid var(--gridline);
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px;
+  }
+  ul.bullets {
+    list-style: none; margin: 8px 0 0 0; padding: 0;
+  }
+  ul.bullets li {
+    font-size: 10.5px; color: var(--text-secondary); line-height: 1.4;
+    padding-left: 12px; position: relative; margin-bottom: 4px;
+  }
+  ul.bullets li::before {
+    content: "—"; position: absolute; left: 0; color: var(--text-muted);
+  }
+  .footnote {
+    font-size: 9.5px; color: var(--text-muted); margin-top: 10px; text-align: right;
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+</style>
+</head>
+<body>
+<div class="slide">
+
+  <div class="header">
+    <div class="eyebrow">Need-state architecture</div>
+    <h1>From Themes to Need States to Next Best Action</h1>
+    <p class="subtitle">Each stage builds a graph over the previous stage's output — subcategories become Themes, purchase graphs become Need States, and Need-State journeys become the Next Best Action.</p>
+  </div>
+
+  <div class="row">
+
+    <!-- PANEL 1 : THEMES -->
+    <div class="panel">
+      <div class="panel-tag" style="color:var(--series-1)">
+        <span class="tag-dot" style="background:var(--series-1)"></span> STAGE 1 · THEMES
+      </div>
+      <h2>Subcategory graph → Leiden → Themes</h2>
+      <p class="desc">Every subcategory is a node. Edges connect subcategories using PPMI (pointwise mutual information) co-occurrence strength. Leiden community detection then clusters tightly-linked subcategories into Themes.</p>
+      <div class="viz-box">
+        <svg width="330" height="230" viewBox="0 0 330 230">
+          <!-- cluster hulls -->
+          <ellipse cx="115" cy="95" rx="88" ry="68" fill="var(--series-1-fill)" stroke="var(--series-1)" stroke-width="1.5" stroke-dasharray="3 3"/>
+          <ellipse cx="235" cy="155" rx="78" ry="58" fill="var(--series-2-fill)" stroke="var(--series-2)" stroke-width="1.5" stroke-dasharray="3 3"/>
+
+          <!-- intra-cluster A edges (thick = high PPMI) -->
+          <g stroke="var(--series-1)" stroke-linecap="round">
+            <line x1="80" y1="60" x2="140" y2="55" stroke-width="3"/>
+            <line x1="80" y1="60" x2="70" y2="120" stroke-width="2.5"/>
+            <line x1="140" y1="55" x2="150" y2="110" stroke-width="3.5"/>
+            <line x1="70" y1="120" x2="150" y2="110" stroke-width="2"/>
+            <line x1="150" y1="110" x2="120" y2="140" stroke-width="2.5"/>
+            <line x1="70" y1="120" x2="120" y2="140" stroke-width="1.5"/>
+          </g>
+          <!-- intra-cluster B edges -->
+          <g stroke="var(--series-2)" stroke-linecap="round">
+            <line x1="210" y1="120" x2="265" y2="130" stroke-width="3"/>
+            <line x1="210" y1="120" x2="220" y2="180" stroke-width="2"/>
+            <line x1="265" y1="130" x2="255" y2="185" stroke-width="3.5"/>
+            <line x1="220" y1="180" x2="255" y2="185" stroke-width="2.5"/>
+          </g>
+          <!-- sparse cross-cluster edges -->
+          <g stroke="var(--text-muted)" stroke-linecap="round" opacity="0.6">
+            <line x1="150" y1="110" x2="210" y2="120" stroke-width="1"/>
+            <line x1="120" y1="140" x2="220" y2="180" stroke-width="1"/>
+          </g>
+
+          <!-- nodes cluster A -->
+          <g>
+            <circle cx="80" cy="60" r="9" fill="var(--series-1)"/>
+            <circle cx="140" cy="55" r="9" fill="var(--series-1)"/>
+            <circle cx="70" cy="120" r="9" fill="var(--series-1)"/>
+            <circle cx="150" cy="110" r="9" fill="var(--series-1)"/>
+            <circle cx="120" cy="140" r="9" fill="var(--series-1)"/>
+          </g>
+          <g font-size="9" fill="var(--text-primary)" text-anchor="middle">
+            <text x="80" y="45">Milk</text>
+            <text x="140" y="42">Cheese</text>
+            <text x="70" y="105">Bread</text>
+            <text x="150" y="96">Butter</text>
+            <text x="120" y="126">Yoghurt</text>
+          </g>
+
+          <!-- nodes cluster B -->
+          <g>
+            <circle cx="210" cy="120" r="9" fill="var(--series-2)"/>
+            <circle cx="265" cy="130" r="9" fill="var(--series-2)"/>
+            <circle cx="220" cy="180" r="9" fill="var(--series-2)"/>
+            <circle cx="255" cy="185" r="9" fill="var(--series-2)"/>
+          </g>
+          <g font-size="9" fill="var(--text-primary)" text-anchor="middle">
+            <text x="210" y="106">Crisps</text>
+            <text x="278" y="128">Soda</text>
+            <text x="220" y="199">Chocolate</text>
+            <text x="255" y="203">Beer</text>
+          </g>
+
+          <!-- cluster labels -->
+          <text x="60" y="24" font-size="10.5" font-weight="700" fill="var(--series-1)">Theme: "Breakfast staples"</text>
+          <text x="180" y="222" font-size="10.5" font-weight="700" fill="var(--series-2)">Theme: "Snacking &amp; social"</text>
+        </svg>
+      </div>
+      <ul class="bullets">
+        <li>Node = one subcategory (catalog-wide)</li>
+        <li>Edge weight = PPMI between subcategory pairs</li>
+        <li>Leiden partitions the subcategory graph into Themes</li>
+      </ul>
+    </div>
+
+    <!-- ARROW 1 -->
+    <div class="arrow-col">
+      <svg width="34" height="34" viewBox="0 0 34 34">
+        <line x1="2" y1="17" x2="26" y2="17" stroke="var(--text-muted)" stroke-width="2" stroke-linecap="round"/>
+        <polygon points="26,11 34,17 26,23" fill="var(--text-muted)"/>
+      </svg>
+      <div class="arrow-label">drill into one Theme</div>
+    </div>
+
+    <!-- PANEL 2 : NEED STATES -->
+    <div class="panel">
+      <div class="panel-tag" style="color:var(--series-2)">
+        <span class="tag-dot" style="background:var(--series-2)"></span> STAGE 2 · NEED STATES
+      </div>
+      <h2>Basket graph → GNN embedding → Leiden</h2>
+      <p class="desc">Inside a Theme, each household-week basket is its own graph: nodes are products bought together, edges are co-purchase strength. A GNN compresses each basket's graph into one embedding; plotting every basket in that feature space and running Leiden clustering yields Need States.</p>
+      <div class="viz-box">
+        <svg width="330" height="230" viewBox="0 0 330 230">
+          <!-- mini basket graph (top-left) -->
+          <g>
+            <line x1="35" y1="35" x2="80" y2="30" stroke="var(--series-2)" stroke-width="2" stroke-linecap="round"/>
+            <line x1="35" y1="35" x2="40" y2="75" stroke="var(--series-2)" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="80" y1="30" x2="85" y2="72" stroke="var(--series-2)" stroke-width="2.5" stroke-linecap="round"/>
+            <line x1="40" y1="75" x2="85" y2="72" stroke="var(--series-2)" stroke-width="1.5" stroke-linecap="round"/>
+            <circle cx="35" cy="35" r="7" fill="var(--series-2)"/>
+            <circle cx="80" cy="30" r="7" fill="var(--series-2)"/>
+            <circle cx="40" cy="75" r="7" fill="var(--series-2)"/>
+            <circle cx="85" cy="72" r="7" fill="var(--series-2)"/>
+          </g>
+          <text x="60" y="98" font-size="8.5" fill="var(--text-secondary)" text-anchor="middle">1 basket = 1 household's week</text>
+          <text x="60" y="110" font-size="8" fill="var(--text-muted)" text-anchor="middle">(products + co-purchase edges)</text>
+
+          <!-- arrow to GNN -->
+          <line x1="118" y1="55" x2="150" y2="55" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round"/>
+          <polygon points="150,50 158,55 150,60" fill="var(--text-muted)"/>
+          <text x="134" y="46" font-size="8.5" fill="var(--text-secondary)" text-anchor="middle" font-weight="600">GNN</text>
+
+          <!-- feature space scatter -->
+          <rect x="165" y="10" width="150" height="150" fill="none" stroke="var(--gridline)" stroke-width="1"/>
+          <text x="240" y="8" font-size="8" fill="var(--text-muted)" text-anchor="middle">need-state embedding space</text>
+
+          <!-- cluster of dots - need state 1 -->
+          <g fill="var(--series-1)">
+            <circle cx="195" cy="40" r="4"/><circle cx="205" cy="50" r="4"/><circle cx="190" cy="55" r="4"/>
+            <circle cx="210" cy="35" r="4"/><circle cx="200" cy="60" r="4"/><circle cx="215" cy="55" r="4"/>
+          </g>
+          <!-- need state 2 -->
+          <g fill="var(--series-2)">
+            <circle cx="255" cy="45" r="4"/><circle cx="270" cy="55" r="4"/><circle cx="260" cy="65" r="4"/>
+            <circle cx="280" cy="45" r="4"/><circle cx="275" cy="70" r="4"/>
+          </g>
+          <!-- need state 3 -->
+          <g fill="var(--series-3)">
+            <circle cx="210" cy="110" r="4"/><circle cx="225" cy="120" r="4"/><circle cx="205" cy="130" r="4"/>
+            <circle cx="230" cy="105" r="4"/><circle cx="220" cy="135" r="4"/><circle cx="240" cy="120" r="4"/>
+          </g>
+          <!-- need state 4 (scattered) -->
+          <g fill="var(--text-muted)" opacity="0.7">
+            <circle cx="285" cy="120" r="3.5"/><circle cx="295" cy="105" r="3.5"/><circle cx="270" cy="135" r="3.5"/>
+          </g>
+
+          <g font-size="8" fill="var(--text-primary)">
+            <text x="203" y="30">NS-1</text>
+            <text x="268" y="34">NS-2</text>
+            <text x="222" y="150">NS-3</text>
+          </g>
+
+          <!-- legend row -->
+          <g font-size="8.5" fill="var(--text-secondary)">
+            <circle cx="170" cy="178" r="4" fill="var(--series-1)"/><text x="178" y="181">Need state</text>
+            <circle cx="170" cy="192" r="4" fill="var(--series-3)"/><text x="178" y="195">(Leiden community</text>
+            <text x="178" y="208">on kNN graph)</text>
+          </g>
+
+          <text x="240" y="222" font-size="8.5" fill="var(--text-muted)" text-anchor="middle">each dot = one household-week basket, plotted by its 64-dim GNN embedding</text>
+        </svg>
+      </div>
+      <ul class="bullets">
+        <li>Node = one product, as it appears in one basket</li>
+        <li>Edge weight = co-purchase strength within that basket</li>
+        <li>GNN compresses each basket's graph to one embedding</li>
+        <li>Leiden clusters embeddings across all baskets → Need States</li>
+      </ul>
+    </div>
+
+    <!-- ARROW 2 -->
+    <div class="arrow-col">
+      <svg width="34" height="34" viewBox="0 0 34 34">
+        <line x1="2" y1="17" x2="26" y2="17" stroke="var(--text-muted)" stroke-width="2" stroke-linecap="round"/>
+        <polygon points="26,11 34,17 26,23" fill="var(--text-muted)"/>
+      </svg>
+      <div class="arrow-label">score a new basket</div>
+    </div>
+
+    <!-- PANEL 3 : NEXT BEST ACTION -->
+    <div class="panel">
+      <div class="panel-tag" style="color:var(--series-3)">
+        <span class="tag-dot" style="background:var(--series-3)"></span> STAGE 3 · NEXT BEST ACTION
+      </div>
+      <h2>Lookalike journeys → Next Best Action</h2>
+      <p class="desc">Households move between Need States week to week. A new customer's basket is embedded the same way and placed in this space; its nearest lookalike households reveal which journeys are common from here — surfacing the Next Best Action.</p>
+      <div class="viz-box">
+        <svg width="330" height="230" viewBox="0 0 330 230">
+          <rect x="10" y="10" width="310" height="175" fill="none" stroke="var(--gridline)" stroke-width="1"/>
+          <text x="165" y="8" font-size="8" fill="var(--text-muted)" text-anchor="middle">need-state embedding space</text>
+
+          <!-- region blobs -->
+          <ellipse cx="70" cy="60" rx="45" ry="35" fill="var(--series-1-fill)" stroke="var(--series-1)" stroke-width="1" stroke-dasharray="2 2"/>
+          <ellipse cx="170" cy="130" rx="50" ry="38" fill="var(--series-2-fill)" stroke="var(--series-2)" stroke-width="1" stroke-dasharray="2 2"/>
+          <ellipse cx="270" cy="55" rx="42" ry="32" fill="var(--series-3-fill)" stroke="var(--series-3)" stroke-width="1" stroke-dasharray="2 2"/>
+
+          <text x="70" y="30" font-size="8.5" font-weight="700" fill="var(--series-1)" text-anchor="middle">NS: Quick top-up</text>
+          <text x="170" y="185" font-size="8.5" font-weight="700" fill="var(--series-2)" text-anchor="middle">NS: Big weekly shop</text>
+          <text x="270" y="30" font-size="8.5" font-weight="700" fill="var(--series-3)" text-anchor="middle">NS: Date night</text>
+
+          <!-- household journey (dashed path across weeks) -->
+          <g stroke="var(--text-primary)" stroke-width="1.5" fill="none" stroke-dasharray="4 3">
+            <path d="M 65 55 L 165 125 L 260 60"/>
+          </g>
+          <circle cx="65" cy="55" r="5" fill="var(--text-primary)"/>
+          <circle cx="165" cy="125" r="5" fill="var(--text-primary)"/>
+          <circle cx="260" cy="60" r="5" fill="var(--text-primary)"/>
+          <text x="65" y="45" font-size="7.5" text-anchor="middle" fill="var(--text-secondary)">wk 1</text>
+          <text x="165" y="145" font-size="7.5" text-anchor="middle" fill="var(--text-secondary)">wk 2</text>
+          <text x="260" y="45" font-size="7.5" text-anchor="middle" fill="var(--text-secondary)">wk 3</text>
+
+          <!-- new customer basket (star) -->
+          <g transform="translate(150,100)">
+            <path d="M0,-9 L2.6,-2.8 L9,-2.8 L3.7,1.1 L5.7,8 L0,3.6 L-5.7,8 L-3.7,1.1 L-9,-2.8 L-2.6,-2.8 Z"
+                  fill="var(--series-2)" stroke="var(--text-primary)" stroke-width="1"/>
+          </g>
+          <text x="150" y="118" font-size="8" font-weight="700" fill="var(--text-primary)" text-anchor="middle">new customer basket</text>
+
+          <!-- nearest neighbours -->
+          <g stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="1 2">
+            <line x1="150" y1="100" x2="165" y2="125"/>
+            <line x1="150" y1="100" x2="185" y2="110"/>
+            <line x1="150" y1="100" x2="140" y2="135"/>
+          </g>
+          <circle cx="185" cy="110" r="4" fill="var(--series-2)" opacity="0.6"/>
+          <circle cx="140" cy="135" r="4" fill="var(--series-2)" opacity="0.6"/>
+          <text x="150" y="160" font-size="7.5" fill="var(--text-secondary)" text-anchor="middle">nearest lookalike households (kNN)</text>
+
+          <!-- NBA callout -->
+          <g>
+            <line x1="230" y1="95" x2="255" y2="70" stroke="var(--text-primary)" stroke-width="1.5"/>
+            <polygon points="252,65 262,68 255,76" fill="var(--text-primary)"/>
+          </g>
+          <text x="300" y="198" font-size="9" font-weight="700" fill="var(--text-primary)" text-anchor="middle">Next Best Action:</text>
+          <text x="300" y="210" font-size="8.5" fill="var(--text-secondary)" text-anchor="middle">nudge toward "Date night"</text>
+        </svg>
+      </div>
+      <ul class="bullets">
+        <li>Same embedding space as Stage 2, plus each household's path across weeks</li>
+        <li>New basket embedded via the identical GNN path, placed in the space</li>
+        <li>Nearest lookalike households show plausible next journeys → the recommended action</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <div class="footnote">Illustrative example — node counts, clusters and household paths are for explanation only, not real output.</div>
+</div>
+</body>
+</html>

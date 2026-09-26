@@ -20,6 +20,7 @@ numbers → cluster those → need-states → graphs showing how need-states rel
 | **Know why the code looks like it does** | [src/MEMORY_ISSUES.md](src/MEMORY_ISSUES.md) — every memory and speed problem hit at scale, and the fix |
 | **Know what the source tables contain** | [data/TABLE_REFERENCE.md](data/TABLE_REFERENCE.md) |
 | **Brief someone (or an AI) on this codebase** | [GPT_CONTEXT_PROMPT.md](GPT_CONTEXT_PROMPT.md) — current state, what's verified, what isn't |
+| **Work on this codebase** | [CLAUDE.md](CLAUDE.md) — the machine, the testing rules, the working configuration, and every trap that has already cost time |
 
 ---
 
@@ -31,13 +32,25 @@ copy ..\.env.example ..\.env     # first time only, then edit
 python .\config.py               # confirm what will actually be used
 python .\test_pipeline.py        # verify before spending hours
 python .\build_product_embeddings.py
-python .\pipeline_main.py 2>&1 | Tee-Object -FilePath run.log
+
+# Stage 2a runs as its own two steps — see the note below
+python -u .\cluster_basket_embeddings.py --build-edges  *> edges.log
+python -u .\cluster_leiden_networkit.py --resolution 1.5 *> labels.log
+
+python -u .\pipeline_main.py *> run.log
 python .\test_pipeline.py --fast --prod-outputs   # confirm the output means something
 ```
 
 The SQL in `data/*.sql` must be run against your warehouse first, with each
 result downloaded as parquet into the matching `data/` subfolder. There is no
 live warehouse connection anywhere in the Python code.
+
+**Why clustering is separate from `pipeline_main.py`:** `leidenalg` is
+single-threaded and does not finish at production scale — it ran overnight on a
+28.7M-vertex graph without completing one optimiser iteration. NetworKit's
+`ParallelLeiden` clusters the larger 57.1M-vertex graph in ~36 minutes across
+64 threads. `pipeline_main.py` loads the labels that step produces, and stops
+with the exact command to run if they are missing or don't match the graph.
 
 ---
 
@@ -67,12 +80,23 @@ rebuild automatically.
 
 ## Current state
 
-Verified at production scale: 57.1M baskets, 154,597 products, 1.47B
-co-purchase non-zeros. Stage 0, Stage 1a, sub-clustering and GNN training all
-complete; `test_pipeline.py` passes all six groups on the target machine.
+*Last updated 2026-09-26.*
 
-**Not yet complete:** the full inference pass over 57M baskets, and Stage 2
-clustering — which at this scale needs ~29GB peak and is expected not to fit
-on a memory-constrained box. The sample-then-assign fix is designed but not
-wired in. See [GPT_CONTEXT_PROMPT.md](GPT_CONTEXT_PROMPT.md) for the full
-verified/unverified split.
+Run at production scale on a **64-core, 512 GB** Windows box: 57,115,804
+baskets, 154,597 products, 1.47B co-purchase non-zeros.
+
+**Complete:** Stage 0, Stage 1 (co-purchase matrix, sub-clustering, GNN
+training, and the full inference pass embedding all 57.1M baskets), and
+Stage 2a — which now produces **356 need-states covering 100% of baskets**,
+at k=10 / one-directional kNN / resolution 1.5.
+
+**In progress:** Stage 2b (GMM). Stages 2c and 2.5 not yet reached at full
+scale.
+
+**Memory is no longer the constraint.** Earlier versions of this document and
+of [src/MEMORY_ISSUES.md](src/MEMORY_ISSUES.md) described a memory-constrained
+box and put Stage 2 at ~29 GB peak, expected not to fit. The machine has 512 GB
+and a full Stage 2 run peaks around 78 GB. The real constraints turned out to
+be single-threaded libraries and a mutual-kNN filter that was silently dropping
+half the population. Both are fixed; see [CLAUDE.md](CLAUDE.md) for the
+measured detail.

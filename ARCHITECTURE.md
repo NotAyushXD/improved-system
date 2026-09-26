@@ -38,7 +38,7 @@ actually is, and exactly what's packed inside it**.
                               GNN (BasketGNN, §5) → 64-dim basket embedding
                                                │
                                                ▼
-                         Leiden (mutual-kNN + community detection)
+                         Leiden (kNN graph + community detection)
                          AND
                          GMM (Gaussian Mixture)              (§6)
                                                │
@@ -389,13 +389,15 @@ run over these vectors (not over products, not over raw baskets):
                             │
               ┌─────────────┴─────────────┐
               ▼                            ▼
-   mutual-kNN graph (k=15,             GaussianMixture
-   cosine similarity)                  (n_components=30,
-              │                        diagonal covariance)
+   kNN graph (k=10,                    GaussianMixture
+   one-directional,                    (n_components=30,
+   cosine similarity)                   diagonal covariance)
+              │                            │
               ▼                            │
    Leiden community detection              ▼
-   (leidenalg, resolution=1.0)        need_state_cluster_gmm
-              │                        + gmm_confidence
+   (NetworKit ParallelLeiden,         need_state_cluster_gmm
+    gamma=1.5, 64 threads)             + gmm_confidence
+              │                            │
               ▼                            │
    need_state_cluster                      │
               └─────────────┬──────────────┘
@@ -423,7 +425,7 @@ embeddings/labels, to show the mechanics — not real cluster IDs):
 | `5540_202614` | 22-item big weekly shop | `4213_202615` (sim 0.61) — overlaps on milk/bread/eggs, but pulled in many directions |
 
 ```
-Leiden communities (mutual-kNN + community detection):
+Leiden communities (kNN graph + community detection):
   community 5  = { 4213_202615, 9954_202611, 5540_202614 }   "dairy / breakfast basics"
   community 12 = { 9021_202613, 2207_202609, 7788_202612 }   "pasta night + wine-adjacent"
 ```
@@ -487,10 +489,16 @@ the same value as "bought nothing". That is inherited behaviour, not a
 deliberate modelling decision. If returns are a meaningful share of your data,
 decide in SQL what should happen to them.
 
-**5. `GMM_N_COMPONENTS = 30` and `LEIDEN_RESOLUTION = 1.0` are placeholders**,
-explicitly labelled as such in the code. `sweep_resolution()` and
-`select_k_via_bic()` exist to inform the choice and deliberately do not
-auto-pick.
+**5. `GMM_N_COMPONENTS = 30` is still a placeholder**, explicitly labelled as
+such in the code; `select_k_via_bic()` exists to inform the choice and
+deliberately does not auto-pick.
+
+`LEIDEN_RESOLUTION` **is no longer a guess** — it is **1.5**, chosen from a
+measured sweep over the real graph. Below 1.0 the graph collapses into a
+single community; from 1.0 to 3.0 modularity varies only 3% while the
+community count rises smoothly. 1.5 gives 356 need-states, modularity 0.4145,
+largest community 1.5% of baskets. Sweep upward with
+`cluster_leiden_networkit.py --sweep`, never downward.
 
 **6. `orders` and `sales_inc_vat` are exported but never consumed** by any
 Python file. Need-states here are composition-driven only — no spend or

@@ -441,14 +441,39 @@ tables too.
 Both methods are run and compared/combined — this pipeline doesn't pick one
 upfront:
 
-- **2a — Leiden** (`cluster_basket_embeddings`): builds a mutual-kNN graph
-  over the L2-normalized basket embeddings (`BASKET_KNN_K = 15`, cosine
-  similarity via `pynndescent` if installed, else sklearn
-  `NearestNeighbors`; edge construction is fully vectorized with NumPy, not a
-  per-pair Python loop), then runs Leiden community detection
-  (`LEIDEN_RESOLUTION = 1.0` — described as a starting point; use
-  `sweep_resolution()` to check other values before trusting this one).
-  Output column: `need_state_cluster`.
+- **2a — Leiden**, and at production scale this runs as **two separate
+  commands, not inside `pipeline_main.py`**:
+
+  ```powershell
+  python -u .\cluster_basket_embeddings.py --build-edges   # kNN graph, ~35 min
+  python -u .\cluster_leiden_networkit.py --resolution 1.5 # clustering, ~36 min
+  ```
+
+  `pipeline_main.py` then *loads* those labels via a fingerprint, and stops
+  with the exact command to run if they are missing or belong to a different
+  graph. It does not cluster.
+
+  **Why separate:** `leidenalg` is single-threaded and does not finish here —
+  it ran overnight on a 28.7M-vertex graph without completing one optimiser
+  iteration. NetworKit's `ParallelLeiden` does the larger full-coverage graph
+  (57.1M vertices, 508M edges) in ~36 minutes across 64 threads.
+
+  **The graph is one-directional, not mutual** (`USE_MUTUAL_KNN=false`).
+  Mutual-kNN only keeps an edge when both baskets rank each other in their
+  top-K, and a basket left with no edge never becomes a graph vertex at all —
+  measured coverage was 41.0% at k=15, 50.2% at k=30, 53.3% at k=50. It never
+  reaches usable. One-directional gives 100% coverage by construction, and `k`
+  then controls density only. `PIPELINE_MIN_GRAPH_COVERAGE` (default 0.95)
+  refuses to cluster a graph that is missing baskets.
+
+  **Resolution has a cliff.** Below gamma 1.0 the graph collapses into a
+  single community (at 0.5, one community held 99.4% of baskets). From 1.0 to
+  3.0 there is a wide stable plateau. Sweep upward, never downward:
+  `cluster_leiden_networkit.py --sweep 1.0 1.5 2.0`. Current value 1.5 gives
+  356 need-states, modularity 0.4145, largest community 1.5%.
+
+  Output column: `need_state_cluster` (`-1` means the basket had no edges and
+  Leiden could not place it — not a cluster).
 - **2b — GMM** (`cluster_basket_embeddings_gmm`): fits a
   `GaussianMixture(n_components=GMM_N_COMPONENTS, covariance_type="diag")`
   directly on the normalized embeddings. `GMM_N_COMPONENTS = 30` in
@@ -755,20 +780,39 @@ is meaningless while appearing to succeed), degenerate clusters, and label
 coverage. Worth running the moment inference finishes — a low training loss
 does *not* rule collapse out.
 
-### ⚠ Stage 2 at 57M baskets is not solved
+### Stage 2 at 57M baskets — solved for 2a, open for 2b
 
-| | at 57M × 64 dims |
+*Updated 2026-09-26. This section previously said Stage 2 might not fit in
+memory. That was wrong: the machine has **512 GB** and a full run peaks near
+78 GB.*
+
+**Stage 2a is done at full scale:**
+
+| | measured |
 |---|---|
-| embeddings in memory | ~15 GB |
-| `normalize()` copy | **~29 GB peak** |
-| mutual-kNN edges | ~300M undirected, several GB |
-| GMM working array | **~14 GB per EM iteration**, ×3 inits |
+| baskets clustered | **57,115,804 (100%)** |
+| kNN edges (k=10, one-directional) | 508,168,451 |
+| need-states at gamma 1.5 | 356 |
+| modularity / largest community | 0.4145 / 1.5% |
+| wall clock | ~35 min edges + ~36 min clustering |
+| peak memory | ~78 GB of 512 GB |
 
-On a memory-constrained box Stage 2 may not complete. The intended fix —
-cluster a few-million-basket sample, then assign the rest with
-`assign_new_baskets_to_clusters` / the saved GMM's `predict` (both already
-exist, that is what `score_new_baskets.py` does) — **is not yet wired into
-the main run.**
+What actually blocked it was not memory but (1) mutual-kNN silently dropping
+half the baskets and (2) single-threaded `leidenalg`. Both fixed — see the
+Stage 2 section of [src/MEMORY_ISSUES.md](src/MEMORY_ISSUES.md).
+
+The sample-then-assign plan was never needed and was not built.
+`assign_new_baskets_to_clusters` remains for its original purpose in
+`score_new_baskets.py`.
+
+**Stage 2b (GMM) is still open**, and again not for memory reasons. sklearn's
+default `init_params='kmeans'` fits a complete k-means over all 57.1M points
+before EM iteration 1, repeated per `n_init` restart — it ran 40+ minutes
+without reaching the first iteration, printing nothing between
+`Initialization 0` and `Iteration 1`. Set
+`PIPELINE_GMM_INIT_PARAMS=k-means++` at this scale, and consider
+`PIPELINE_GMM_N_INIT=1` until the placeholder `GMM_N_COMPONENTS=30` has been
+validated with `select_k_via_bic()`.
 
 ### Known data nuance: returns
 

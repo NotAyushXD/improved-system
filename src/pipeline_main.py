@@ -150,7 +150,7 @@ from cluster_basket_embeddings import (
     _cache_manifest_path,
     _read_manifest,
 )
-from cluster_leiden_networkit import load_cached_labels
+from cluster_leiden_networkit import load_cached_labels, labels_path_for
 import need_state_graph
 import config
 
@@ -422,13 +422,15 @@ def main():
     # asked for, at the end of an already-long pipeline, using whichever
     # backend happened to be wired in. Better to stop and name the command.
     edge_manifest = _read_manifest(_cache_manifest_path(BASKET_EDGES_PATH))
+    labels_file = labels_path_for(BASKET_EDGES_PATH, LEIDEN_RESOLUTION)
     leiden_clusters = load_cached_labels(
-        edge_manifest, LEIDEN_RESOLUTION, LEIDEN_N_ITERATIONS,
+        edge_manifest, LEIDEN_RESOLUTION, LEIDEN_N_ITERATIONS, path=labels_file,
     )
     if leiden_clusters is None:
         raise RuntimeError(
             "No Leiden labels matching this graph and resolution.\n"
             f"  graph:      {BASKET_EDGES_PATH}\n"
+            f"  labels:     {labels_file}\n"
             f"  resolution: {LEIDEN_RESOLUTION}, iterations: {LEIDEN_N_ITERATIONS}\n"
             "Stage 2a runs as its own process because leidenalg cannot finish at "
             "this scale. Produce the labels first:\n"

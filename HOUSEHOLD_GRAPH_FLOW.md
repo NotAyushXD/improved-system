@@ -25,7 +25,7 @@ Households are nodes in neither of them.**
 │  GRAPH B — "between baskets"     cluster_basket_embeddings.build_basket_    │
 │                                   knn_graph()                               │
 │      NODES = BASKETS  (= one household × one week)                          │
-│      EDGES = mutual-kNN cosine similarity in 64-dim space                   │
+│      EDGES = kNN cosine similarity in 64-dim space (one-directional)        │
 │      ONE global graph over all baskets. ──────────► fed to Leiden           │
 │                                                                             │
 │      ◄── THIS is the only place two households ever touch each other.       │
@@ -298,28 +298,34 @@ cluster_basket_embeddings.py:72-183.
                                      ╲
                                       ● hh 7788, wk 12   (cos 0.58, weak)
 
-   STEP 1   k = 15 nearest neighbours per basket, COSINE            (line 105)
+   STEP 1   k = 10 nearest neighbours per basket, COSINE
             pynndescent (approximate) — sklearn brute-force fallback
             warns loudly above 100k baskets because it will never finish
-                                    (line 108-121)
 
-   STEP 2   MUTUAL-kNN filter                                (line 144-161)
+   STEP 2   ONE-DIRECTIONAL  (PIPELINE_USE_MUTUAL_KNN=false)
             ┌──────────────────────────────────────────────────────┐
-            │  An edge A—B survives ONLY IF A is in B's top-15      │
-            │  AND B is in A's top-15.                             │
-            │  One-directional "B is popular so everyone points     │
-            │  at it" links are discarded.                          │
+            │  An edge A—B survives if EITHER named the other.     │
+            │  Every basket therefore keeps its k edges, so every  │
+            │  basket is a vertex — 100% coverage by construction. │
             └──────────────────────────────────────────────────────┘
-            weight = minmax_scale( (sim_AB + sim_BA) / 2 )   (line 159, 173)
+            weight = minmax_scale( similarity )
+
+            ⚠ The mutual filter (both must name each other) is
+              available but MUST NOT be used at this scale. It left
+              41% of baskets with no edge at k=15, 50% at k=30, 53%
+              at k=50 — and a basket with no edge is not a vertex,
+              so it silently receives no need-state at all.
+              PIPELINE_MIN_GRAPH_COVERAGE now blocks that.
 
    STEP 3   → edges DataFrame: basket_a, basket_b, weight
+            (57,115,804 baskets → 508,168,451 edges at k=10)
 ```
 
 So, precisely:
 
 > **Two households are connected iff one household's single week of shopping
-> and another household's single week of shopping are mutual top-15 nearest
-> neighbours in the 64-dim GNN space.**
+> is among the other's 10 nearest neighbours in the 64-dim GNN space** — in
+> either direction.
 
 Not by demographics. Not by store. Not by category. Not by spend. Only by
 *how similarly the two weeks' baskets are structured* — which, by construction
@@ -346,14 +352,14 @@ kept** — `pipeline_main.py:349-365` deliberately does not pick one.
    │ 6a. LEIDEN            │                    │ 6b. GMM                  │
    │ (on Graph B, §5)      │                    │ (on the raw points)      │
    ├──────────────────────┤                    ├──────────────────────────┤
-   │ mutual-kNN graph      │                    │ n_components = 30        │
-   │       ↓               │                    │   ← PLACEHOLDER, flagged │
-   │ igraph, weighted      │                    │     in the code as not   │
-   │       ↓               │                    │     the team's real      │
-   │ leidenalg             │                    │     best_k logic         │
-   │ RBConfigurationVertex │                    │ covariance = "diag"      │
-   │ Partition             │                    │       ↓                  │
-   │ resolution = 1.0      │                    │ fit_predict              │
+   │ kNN graph, k=10       │                    │ n_components = 30        │
+   │ one-directional       │                    │   ← PLACEHOLDER, flagged │
+   │       ↓               │                    │     in the code as not   │
+   │ NetworKit, weighted   │                    │     the team's real      │
+   │       ↓               │                    │     best_k logic         │
+   │ ParallelLeiden        │                    │ covariance = "diag"      │
+   │ 64 threads            │                    │       ↓                  │
+   │ gamma = 1.5           │                    │ fit_predict              │
    │   ← also a starting   │                    │       ↓                  │
    │     point; sweep_     │                    │ predict_proba().max()    │
    │     resolution() is   │                    │       ↓                  │
@@ -378,7 +384,7 @@ kept** — `pipeline_main.py:349-365` deliberately does not pick one.
 
 | | Leiden | GMM |
 |---|---|---|
-| operates on | the mutual-kNN **graph** | the **points** directly |
+| operates on | the kNN **graph** | the **points** directly |
 | finds | arbitrary-shaped communities | ellipsoidal components |
 | picks k | emerges from resolution | fixed upfront (30) |
 | **new baskets** | **transductive — cannot** place a new point natively | **can** `.predict()` directly |
@@ -459,11 +465,11 @@ Both are run and both columns are written.
                       ▼
             ● 64-dim point per basket  ──── THE EMBEDDING SPACE
                       │
-                      │  k=15 cosine, MUTUAL-kNN
+                      │  k=10 cosine, one-directional
                       ▼
  ┌──────────────────────────────────────────┐
  │  GRAPH B  — nodes = BASKETS (hh × week)  │   ONE global graph
- │             edges = mutual similarity     │   ◄ households meet HERE
+ │             edges = cosine similarity     │   ◄ households meet HERE
  └──────┬─────────────────────────┬─────────┘
         │ Leiden                  │ GMM (on the points, not the graph)
         ▼                         ▼
@@ -560,11 +566,14 @@ plausible routes, not forecasts, and check `low_support_steps` first.
    `cp_score` as an absolute popularity signal — it's within-basket-relative
    only.
 
-3. **`GMM_N_COMPONENTS = 30` and `LEIDEN_RESOLUTION = 1.0` are placeholders**,
-   explicitly labelled as such (pipeline_main.py:145-148;
-   cluster_basket_embeddings.py:51, :22-23). `sweep_resolution()` and
-   `select_k_via_bic()` exist to inform the choice and deliberately do not
-   auto-pick.
+3. **`GMM_N_COMPONENTS = 30` is still a placeholder**, explicitly labelled as
+   such in the code. `select_k_via_bic()` exists to inform the choice and
+   deliberately does not auto-pick.
+
+   **`LEIDEN_RESOLUTION` is not** — it is **1.5**, chosen from a measured
+   sweep over the real 57.1M-vertex graph, giving 356 need-states at
+   modularity 0.4145. Below 1.0 the graph collapses into one community;
+   1.0–3.0 is a stable plateau. Sweep upward, never downward.
 
 4. **`orders` and `sales_inc_vat` are exported but never consumed** by any
    Python file (SQL lines 49-50). Need-states here are composition-driven
