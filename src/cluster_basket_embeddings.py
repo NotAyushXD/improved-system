@@ -1193,7 +1193,13 @@ if __name__ == "__main__":
         _edges = build_basket_knn_graph(_frame, k=_k, use_mutual=_mutual)
         print(f"\nEdge list ready: {len(_edges):,} edges.")
         print(f"Cluster it with:\n"
-              f"  python -u cluster_leiden_networkit.py --sweep 1.0 0.5 0.2 0.05")
+              f"  python -u cluster_leiden_networkit.py --resolution {LEIDEN_RESOLUTION}")
+        print(f"To explore other resolutions, sweep UPWARD from 1.0:\n"
+              f"  python -u cluster_leiden_networkit.py --sweep 1.0 1.5 2.0 3.0\n"
+              f"  Below gamma 1.0 this graph collapses — measured on the k=10\n"
+              f"  one-directional graph, gamma 0.5 put 99.4% of baskets in a single\n"
+              f"  community and 0.05 put 100% of them there. 1.0-3.0 is a stable\n"
+              f"  plateau where modularity varies only ~3%.")
     else:
         _table = coverage_probe(_frame, k_values=args.k)
         _table.to_csv(args.out, index=False)
