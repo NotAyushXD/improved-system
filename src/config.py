@@ -392,6 +392,20 @@ GMM_INIT_PARAMS = _str("PIPELINE_GMM_INIT_PARAMS", "kmeans",
 # and nothing reports the total up front.
 GMM_MAX_ITER = _int("PIPELINE_GMM_MAX_ITER", 100, minimum=1)
 
+# Floor added to every covariance diagonal, so a component that collapses onto
+# identical points cannot produce a singular covariance and abort the fit.
+#
+# sklearn's default is 1e-6. At full scale that was not enough: a 42-minute fit
+# died in _compute_precision_cholesky with "some components have ill-defined
+# empirical covariance (for instance caused by singleton or collapsed
+# samples)". Grocery baskets make this likely — any two baskets holding the
+# same product set produce the same graph and therefore the SAME embedding, so
+# exact duplicate points exist in large numbers, and a component landing on a
+# pile of duplicates has essentially zero variance.
+#
+# 1e-4 gives that floor real margin. Raise further if the fit still aborts.
+GMM_REG_COVAR = _float("PIPELINE_GMM_REG_COVAR", 1e-6, minimum=0.0)
+
 ASSIGN_NEW_BASKET_K = _int("PIPELINE_ASSIGN_NEW_BASKET_K", 15, minimum=1)
 
 # The basket kNN graph is the most expensive artifact in Stage 2 (hours of

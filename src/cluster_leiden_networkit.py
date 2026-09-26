@@ -57,6 +57,7 @@ from cluster_basket_embeddings import (
     LEIDEN_N_ITERATIONS,
     MIN_GRAPH_COVERAGE,
     OUTPUT_DIR,
+    _atomic_replace,
     _cache_manifest_path,
     _check_graph_coverage,
     _read_manifest,
@@ -127,13 +128,13 @@ def write_labels(labels: pd.DataFrame, manifest: dict, path: str = NETWORKIT_CLU
     """Parquet first, manifest second, each replaced atomically — as _write_edge_cache."""
     tmp = path + ".tmp"
     labels.to_parquet(tmp, index=False)
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
 
     manifest_path = _cache_manifest_path(path)
     tmp_manifest = manifest_path + ".tmp"
     with open(tmp_manifest, "w", encoding="utf-8") as f:
         json.dump(manifest, f)
-    os.replace(tmp_manifest, manifest_path)
+    _atomic_replace(tmp_manifest, manifest_path)
 
 
 def load_cached_labels(edge_manifest, resolution: float, iterations: int,

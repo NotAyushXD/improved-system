@@ -66,6 +66,7 @@ GMM_N_INIT         = config.GMM_N_INIT
 GMM_COVARIANCE     = config.GMM_COVARIANCE   # "diag" scales to more dimensions than "full"
 GMM_INIT_PARAMS    = config.GMM_INIT_PARAMS  # "kmeans" fits a whole k-means before EM starts
 GMM_MAX_ITER       = config.GMM_MAX_ITER
+GMM_REG_COVAR      = config.GMM_REG_COVAR    # floor on covariance diagonals
 
 # All pipeline-produced artifacts land here, not the working directory.
 OUTPUT_DIR         = config.OUTPUT_DIR
@@ -274,6 +275,29 @@ def _read_manifest(path: str):
         return None
 
 
+def _atomic_replace(src: str, dst: str, attempts: int = 6, delay: float = 0.25):
+    """
+    os.replace, retried briefly on a Windows sharing violation.
+
+    On Windows a replace raises PermissionError (WinError 5) when anything
+    else holds a handle to either path. An antivirus scanner or the search
+    indexer opening a file microseconds after it is written is the usual
+    cause, it is timing-dependent, and it clears on its own within a moment.
+    POSIX does not behave this way, so the retry costs nothing there.
+
+    Worth having because the alternative is losing a 35-minute edge build at
+    the very last step — the parquet is written, and only the rename fails.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
 def _write_edge_cache(edges: pd.DataFrame, cache_path: str, manifest: dict):
     """
     Parquet first, manifest second, each replaced atomically. A crash between
@@ -283,13 +307,13 @@ def _write_edge_cache(edges: pd.DataFrame, cache_path: str, manifest: dict):
     """
     tmp_edges = cache_path + ".tmp"
     edges.to_parquet(tmp_edges, index=False)
-    os.replace(tmp_edges, cache_path)
+    _atomic_replace(tmp_edges, cache_path)
 
     manifest_path = _cache_manifest_path(cache_path)
     tmp_manifest = manifest_path + ".tmp"
     with open(tmp_manifest, "w", encoding="utf-8") as f:
         json.dump(manifest, f)
-    os.replace(tmp_manifest, manifest_path)
+    _atomic_replace(tmp_manifest, manifest_path)
 
 
 # ─────────────────────────────────────────────
@@ -1051,7 +1075,22 @@ def cluster_basket_embeddings_gmm(
     basket_ids = basket_gnn_embeddings["basket_id"].to_numpy()
 
     with progress_step(f"normalising {len(basket_ids):,} embeddings", 1, GMM_STEPS):
-        X = normalize(np.stack(basket_gnn_embeddings["gnn_embedding"].values), copy=False)
+        # float64, not the float32 the embeddings are stored in.
+        #
+        # GMM's M-step forms each covariance as E[x^2] - E[x]^2. When a
+        # component sits on near-identical points those two terms are nearly
+        # equal, and in float32 (eps ~1.2e-7) the subtraction can cancel to a
+        # small NEGATIVE number larger in magnitude than reg_covar — at which
+        # point _compute_precision_cholesky refuses the covariance and the
+        # whole fit aborts. That killed a 42-minute run. sklearn's own error
+        # message recommends float64 for exactly this reason.
+        #
+        # Costs ~29GB instead of ~15GB at 57.1M x 64, plus a transient copy
+        # while converting. Unremarkable on a 512GB box.
+        X = normalize(
+            np.stack(basket_gnn_embeddings["gnn_embedding"].values).astype(np.float64),
+            copy=False,
+        )
 
     # verbose=2 / verbose_interval=1 is sklearn's own per-EM-iteration output
     # (iteration number, log-likelihood change, time per iteration) for each of
@@ -1062,10 +1101,12 @@ def cluster_basket_embeddings_gmm(
         n_components=n_components, n_init=GMM_N_INIT,
         covariance_type=covariance_type, random_state=SAMPLE_SEED,
         init_params=GMM_INIT_PARAMS, max_iter=GMM_MAX_ITER,
+        reg_covar=GMM_REG_COVAR,
         verbose=2, verbose_interval=1,
     )
     print(f"  GMM: k={n_components}, covariance={covariance_type}, "
           f"init={GMM_INIT_PARAMS}, max_iter={GMM_MAX_ITER}, "
+          f"reg_covar={GMM_REG_COVAR:g}, dtype={X.dtype}, "
           f"n_init={GMM_N_INIT} restart(s) over {len(basket_ids):,} baskets")
     if GMM_INIT_PARAMS == "kmeans":
         # Announced before the silence, not after it. sklearn prints
@@ -1077,7 +1118,28 @@ def cluster_basket_embeddings_gmm(
               f"Expect a long silent gap after each 'Initialization' line. "
               f"PIPELINE_GMM_INIT_PARAMS=k-means++ skips it.")
     with progress_step(f"fitting GMM (k={n_components})", 2, GMM_STEPS):
-        labels = gmm.fit_predict(X)
+        try:
+            labels = gmm.fit_predict(X)
+        except ValueError as e:
+            if "ill-defined empirical covariance" not in str(e):
+                raise
+            # sklearn's message lists four generic remedies and cannot know
+            # which applies. This one does: it names the settings actually in
+            # force and why this dataset provokes it.
+            raise ValueError(
+                f"GMM fit aborted: a component collapsed to a singular covariance.\n"
+                f"  settings: k={n_components}, reg_covar={GMM_REG_COVAR:g}, "
+                f"dtype={X.dtype}, covariance={covariance_type}\n"
+                f"  Why this dataset provokes it: two baskets holding the same "
+                f"product set produce the same graph and therefore the SAME 64-dim "
+                f"embedding, so exact duplicate points exist in large numbers. A "
+                f"component landing on a pile of duplicates has no variance to "
+                f"estimate, and its covariance goes singular.\n"
+                f"  Fix, in order: raise PIPELINE_GMM_REG_COVAR "
+                f"(now {GMM_REG_COVAR:g}, try {GMM_REG_COVAR * 100:g}); then lower "
+                f"PIPELINE_GMM_N_COMPONENTS (now {n_components}).\n"
+                f"  Original: {e}"
+            ) from e
 
     with progress_step("scoring posterior probabilities", 3, GMM_STEPS):
         # Chunked because only the row-wise max is wanted: a single
