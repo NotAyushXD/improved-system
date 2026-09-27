@@ -79,9 +79,9 @@ PROGRESS_HEARTBEAT_SECS = config.PROGRESS_HEARTBEAT_SECS
 CACHE_BASKET_EDGES = config.CACHE_BASKET_EDGES
 
 
-def _edge_cache_path(k: int, use_mutual: bool) -> str:
+def _edge_cache_path(k: int, use_mutual: bool, subset_tag: str = None) -> str:
     """
-    One cache file per (k, mutual) setting, rather than one fixed filename.
+    One cache file per (k, mutual, subset) setting, rather than one fixed filename.
 
     The fingerprint manifest already REFUSES a mismatched graph, but refusing
     happens after the fact — a run at different settings had already
@@ -94,14 +94,23 @@ def _edge_cache_path(k: int, use_mutual: bool) -> str:
     run builds a DIFFERENT file, leaves yours alone, and flipping between two
     configurations costs one build each instead of one build per flip.
 
-    Only k and mutual are in the name. The other fingerprint dimensions
-    (seed, basket count, embedding digest, backend) still invalidate via the
-    manifest — correctly, since a graph built from retrained embeddings is
-    not something you want to keep alongside the new one.
+    `subset_tag` names a restricted basket population (e.g. "max10" for
+    baskets of at most 10 products). It MUST be in the filename: a subset
+    graph and a full-population graph built at the same k and mutual setting
+    are different graphs, and the manifest alone would let the second
+    overwrite the first before reporting the mismatch.
+
+    Only k, mutual and the subset are in the name. The other fingerprint
+    dimensions (seed, basket count, embedding digest, backend) still
+    invalidate via the manifest — correctly, since a graph built from
+    retrained embeddings is not something you want to keep alongside the new
+    one.
     """
+    suffix = f"_{subset_tag}" if subset_tag else ""
     return os.path.join(
         OUTPUT_DIR,
-        f"basket_knn_edges_k{int(k)}_{'mutual' if use_mutual else 'onedir'}.parquet",
+        f"basket_knn_edges_k{int(k)}_"
+        f"{'mutual' if use_mutual else 'onedir'}{suffix}.parquet",
     )
 
 
@@ -1223,6 +1232,15 @@ if __name__ == "__main__":
                              "use the configured value.")
     parser.add_argument("--mutual", choices=["true", "false"], default=None,
                         help="--build-edges mode: override PIPELINE_USE_MUTUAL_KNN")
+    parser.add_argument("--max-products", type=int, default=None, metavar="N",
+                        help="--build-edges mode: restrict to baskets of at most N "
+                             "distinct products, and cache under a separate filename. "
+                             "A basket is a household's whole WEEK, so a large one is a "
+                             "blend of several shopping occasions and cannot be "
+                             "distinguished from any other blend — measured: product "
+                             "lift falls monotonically as basket size rises "
+                             "(Spearman -0.83). Restricting to small baskets isolates "
+                             "the weeks that are genuinely a single occasion.")
     parser.add_argument("--embeddings",
                         default=os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet"),
                         help="basket embeddings parquet produced by Stage 1")
@@ -1234,6 +1252,29 @@ if __name__ == "__main__":
     with progress_step(f"loading {args.embeddings}"):
         _frame = pd.read_parquet(args.embeddings)
     print(f"  {len(_frame):,} baskets")
+
+    if args.build_edges and args.max_products:
+        # Basket sizes come from DuckDB rather than being recomputed: it is
+        # where `products` lives, it is indexed, and it is the same source the
+        # basket_id keys were built from. An inner merge (not .isin) because
+        # the id set runs to tens of millions.
+        import duckdb_manager
+        _con = duckdb_manager.get_connection()
+        _table = "baskets_" + config.TRAIN_DATASET_TAG
+        with progress_step(f"selecting baskets with <= {args.max_products} products"):
+            _keep = _con.execute(
+                f"SELECT basket_id FROM {_table} WHERE len(products) <= ?",
+                [args.max_products],
+            ).df()
+        _before = len(_frame)
+        _frame = _frame.merge(_keep, on="basket_id", how="inner")
+        print(f"  {len(_frame):,} of {_before:,} baskets kept "
+              f"({len(_frame) / _before:.1%}) — the rest are multi-occasion weeks")
+        if len(_frame) < 1000:
+            raise SystemExit(
+                f"only {len(_frame):,} baskets have <= {args.max_products} products — "
+                f"too few to build a meaningful graph. Raise --max-products."
+            )
 
     if args.build_edges:
         _k = args.k[0] if args.k else BASKET_KNN_K
@@ -1252,10 +1293,14 @@ if __name__ == "__main__":
                   f"or not they are returned, so coverage is 100% by construction. "
                   f"Expect roughly {len(_frame) * _k / 1e6:,.0f}M candidate pairs before "
                   f"deduplication — several times the mutual graph.")
-        _edges = build_basket_knn_graph(_frame, k=_k, use_mutual=_mutual)
-        print(f"\nEdge list ready: {len(_edges):,} edges.")
+        _subset = f"max{args.max_products}" if args.max_products else None
+        _cache = _edge_cache_path(_k, _mutual, subset_tag=_subset)
+        _edges = build_basket_knn_graph(_frame, k=_k, use_mutual=_mutual,
+                                        cache_path=_cache)
+        print(f"\nEdge list ready: {len(_edges):,} edges at {_cache}")
         print(f"Cluster it with:\n"
-              f"  python -u cluster_leiden_networkit.py --resolution {LEIDEN_RESOLUTION}")
+              f"  python -u cluster_leiden_networkit.py --edges {_cache} "
+              f"--resolution {LEIDEN_RESOLUTION}")
         print(f"To explore other resolutions, sweep UPWARD from 1.0:\n"
               f"  python -u cluster_leiden_networkit.py --sweep 1.0 1.5 2.0 3.0\n"
               f"  Below gamma 1.0 this graph collapses — measured on the k=10\n"
