@@ -1241,6 +1241,12 @@ if __name__ == "__main__":
                              "lift falls monotonically as basket size rises "
                              "(Spearman -0.83). Restricting to small baskets isolates "
                              "the weeks that are genuinely a single occasion.")
+    parser.add_argument("--min-products", type=int, default=None, metavar="N",
+                        help="--build-edges mode: restrict to baskets of at least N "
+                             "distinct products. Combine with --max-products to build "
+                             "one band, e.g. --min-products 11 --max-products 20. Bands "
+                             "cache under distinct filenames and cannot overwrite each "
+                             "other.")
     parser.add_argument("--embeddings",
                         default=os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet"),
                         help="basket embeddings parquet produced by Stage 1")
@@ -1253,7 +1259,22 @@ if __name__ == "__main__":
         _frame = pd.read_parquet(args.embeddings)
     print(f"  {len(_frame):,} baskets")
 
-    if args.build_edges and args.max_products:
+    _band = None
+    if args.build_edges and (args.max_products or args.min_products):
+        lo, hi = args.min_products, args.max_products
+        if lo and hi and lo > hi:
+            raise SystemExit(f"--min-products {lo} is above --max-products {hi}")
+
+        # Both bounds in the tag, so bands cannot collide on disk:
+        #   max10  ·  min21  ·  min11max20
+        _band = (f"min{lo}" if lo else "") + (f"max{hi}" if hi else "")
+        where = " AND ".join(
+            ([f"len(products) >= {int(lo)}"] if lo else [])
+            + ([f"len(products) <= {int(hi)}"] if hi else [])
+        )
+        described = (f"{lo}-{hi}" if lo and hi else
+                     (f">= {lo}" if lo else f"<= {hi}")) + " products"
+
         # Basket sizes come from DuckDB rather than being recomputed: it is
         # where `products` lives, it is indexed, and it is the same source the
         # basket_id keys were built from. An inner merge (not .isin) because
@@ -1261,19 +1282,17 @@ if __name__ == "__main__":
         import duckdb_manager
         _con = duckdb_manager.get_connection()
         _table = "baskets_" + config.TRAIN_DATASET_TAG
-        with progress_step(f"selecting baskets with <= {args.max_products} products"):
+        with progress_step(f"selecting baskets with {described}"):
             _keep = _con.execute(
-                f"SELECT basket_id FROM {_table} WHERE len(products) <= ?",
-                [args.max_products],
+                f"SELECT basket_id FROM {_table} WHERE {where}"
             ).df()
         _before = len(_frame)
         _frame = _frame.merge(_keep, on="basket_id", how="inner")
-        print(f"  {len(_frame):,} of {_before:,} baskets kept "
-              f"({len(_frame) / _before:.1%}) — the rest are multi-occasion weeks")
+        print(f"  {len(_frame):,} of {_before:,} baskets kept ({len(_frame) / _before:.1%})")
         if len(_frame) < 1000:
             raise SystemExit(
-                f"only {len(_frame):,} baskets have <= {args.max_products} products — "
-                f"too few to build a meaningful graph. Raise --max-products."
+                f"only {len(_frame):,} baskets have {described} — too few to build a "
+                f"meaningful graph. Widen the band."
             )
 
     if args.build_edges:
@@ -1293,8 +1312,7 @@ if __name__ == "__main__":
                   f"or not they are returned, so coverage is 100% by construction. "
                   f"Expect roughly {len(_frame) * _k / 1e6:,.0f}M candidate pairs before "
                   f"deduplication — several times the mutual graph.")
-        _subset = f"max{args.max_products}" if args.max_products else None
-        _cache = _edge_cache_path(_k, _mutual, subset_tag=_subset)
+        _cache = _edge_cache_path(_k, _mutual, subset_tag=_band)
         _edges = build_basket_knn_graph(_frame, k=_k, use_mutual=_mutual,
                                         cache_path=_cache)
         print(f"\nEdge list ready: {len(_edges):,} edges at {_cache}")

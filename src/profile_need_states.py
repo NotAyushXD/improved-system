@@ -61,8 +61,27 @@ from cluster_basket_embeddings import UNCLUSTERED, fmt_duration, progress_step
 
 OUTPUT_DIR = config.OUTPUT_DIR
 CLUSTERS_PATH = os.path.join(OUTPUT_DIR, "basket_need_state_clusters.parquet")
-PROFILES_PATH = os.path.join(OUTPUT_DIR, "need_state_profiles.parquet")
-SUMMARY_PATH = os.path.join(OUTPUT_DIR, "need_state_summary.parquet")
+
+
+def outputs_for(clusters_path: str):
+    """
+    Profile outputs named after the label file they describe.
+
+    A fixed pair of filenames meant every run overwrote the last — the
+    full-population profiles were destroyed by the first <=10-item run, and the
+    only way to compare the two afterwards was numbers pasted into a chat. The
+    edge and label caches already encode their settings; these now match, so
+    runs accumulate instead of replacing each other.
+
+        basket_need_state_clusters_k10_onedir_max10_r1p5.parquet
+          -> need_state_profiles_k10_onedir_max10_r1p5.parquet
+          -> need_state_summary_k10_onedir_max10_r1p5.parquet
+    """
+    stem = os.path.splitext(os.path.basename(clusters_path))[0]
+    stem = stem.replace("basket_need_state_clusters", "").strip("_")
+    suffix = f"_{stem}" if stem else ""
+    return (os.path.join(OUTPUT_DIR, f"need_state_profiles{suffix}.parquet"),
+            os.path.join(OUTPUT_DIR, f"need_state_summary{suffix}.parquet"))
 
 
 def _glob(path: str) -> str:
@@ -279,10 +298,26 @@ def main():
     summary = summary.merge(labels, left_on="need_state", right_on="need_state", how="left")
     summary["share_of_baskets"] = summary["n_baskets"] / summary["n_baskets"].sum()
 
-    profiles.to_parquet(PROFILES_PATH, index=False)
-    summary.to_parquet(SUMMARY_PATH, index=False)
-    print(f"\nSaved {PROFILES_PATH} ({len(profiles):,} rows)")
-    print(f"Saved {SUMMARY_PATH} ({len(summary):,} need-states)")
+    # How many products actually cleared --min-product-baskets, per need-state.
+    # Without this there is no way to tell a real top-10 signature from a
+    # cluster that had exactly 10 eligible products and no choice about which.
+    # Those look identical in the profile and are not: comparing two
+    # low-support need-states found them sharing a Jaccard of 1.0, which read
+    # as catastrophic over-splitting and was actually the threshold leaking in.
+    counts = profiles.groupby("need_state").size().rename("n_products_profiled")
+    summary = summary.merge(counts, left_on="need_state", right_index=True, how="left")
+    summary["n_products_profiled"] = summary["n_products_profiled"].fillna(0).astype(int)
+    thin = int((summary["n_products_profiled"] < args.top_n).sum())
+
+    profiles_path, summary_path = outputs_for(args.clusters)
+    profiles.to_parquet(profiles_path, index=False)
+    summary.to_parquet(summary_path, index=False)
+    print(f"\nSaved {profiles_path} ({len(profiles):,} rows)")
+    print(f"Saved {summary_path} ({len(summary):,} need-states)")
+    if thin:
+        print(f"  NOTE: {thin:,} need-states have fewer than {args.top_n} products above "
+              f"the {args.min_product_baskets:,}-basket threshold. Their profiles are "
+              f"whatever qualified, not a ranking — treat those labels as weak.")
 
     print("\n" + "=" * 78)
     print(f"LARGEST {args.show} NEED-STATES")

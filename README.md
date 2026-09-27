@@ -21,6 +21,7 @@ numbers → cluster those → need-states → graphs showing how need-states rel
 | **Know what the source tables contain** | [data/TABLE_REFERENCE.md](data/TABLE_REFERENCE.md) |
 | **Brief someone (or an AI) on this codebase** | [GPT_CONTEXT_PROMPT.md](GPT_CONTEXT_PROMPT.md) — current state, what's verified, what isn't |
 | **Work on this codebase** | [CLAUDE.md](CLAUDE.md) — the machine, the testing rules, the working configuration, and every trap that has already cost time |
+| **Understand why need-states are clustered per basket-size band** | [BASKET_BANDING_DESIGN.md](BASKET_BANDING_DESIGN.md) — the measured evidence that basket size determines whether a cluster means anything, and the design that follows from it |
 
 ---
 
