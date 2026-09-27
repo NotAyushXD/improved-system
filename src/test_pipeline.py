@@ -1478,9 +1478,12 @@ def check_label_cache():
     try:
         import cluster_leiden_networkit as cln
     except ImportError as e:
+        # "SKIP", not True: a skipped check reporting PASS in the summary is
+        # how a run under the wrong interpreter looked like four failures and
+        # one success rather than one environment problem.
         print(f"  SKIP — cluster_leiden_networkit not importable here ({e})")
-        print("PASSED")
-        return True
+        print("SKIPPED")
+        return "SKIP"
 
     ok = True
     import cluster_basket_embeddings as cbe
@@ -2349,6 +2352,39 @@ def main():
                         help="Also sanity-check real artifacts under ../data/output")
     args = parser.parse_args()
 
+    # Wrong-interpreter guard.
+    #
+    # Running `python test_pipeline.py` instead of `.\.venv\Scripts\python.exe`
+    # picks up a system Python that has pandas but none of the pipeline's real
+    # dependencies. The suite then produces four unrelated-looking
+    # ModuleNotFoundError tracebacks plus one check that SKIPS and therefore
+    # reports PASS — which reads like five separate code problems rather than
+    # one wrong command. config.py is stdlib-only and runs fine either way,
+    # which removes the last clue.
+    #
+    # Fail once, early, naming the interpreter actually in use.
+    required = {
+        "numpy": "numpy", "pandas": "pandas", "pyarrow": "parquet I/O",
+        "igraph": "graph construction", "leidenalg": "Leiden parity checks",
+        "sklearn": "clustering and metrics",
+    }
+    import importlib.util
+    absent = [f"{mod} ({why})" for mod, why in required.items()
+              if importlib.util.find_spec(mod) is None]
+    if absent:
+        print("=" * 70)
+        print("WRONG PYTHON — this interpreter cannot run the test suite")
+        print("=" * 70)
+        print(f"  running under : {sys.executable}")
+        print(f"  missing       : {', '.join(absent)}")
+        venv = Path(__file__).resolve().parent / ".venv" / "Scripts" / "python.exe"
+        print(f"\n  Use the project venv instead:\n"
+              f"    {venv} .\\test_pipeline.py "
+              f"{' '.join(a for a in sys.argv[1:])}".rstrip())
+        print("\n  (`python config.py` works under any interpreter because config.py\n"
+              "   is stdlib-only — it is not evidence the environment is correct.)")
+        sys.exit(2)
+
     checks = [
         ("static", check_no_theme_identifiers),
         ("config", check_config),
@@ -2376,11 +2412,17 @@ def main():
 
     print()
     print("=" * 70)
+    skipped = [n for n, r in results.items() if r == "SKIP"]
     for name, passed in results.items():
-        print(f"  {'PASS' if passed else 'FAIL'}  {name}")
+        label = "SKIP" if passed == "SKIP" else ("PASS" if passed else "FAIL")
+        print(f"  {label}  {name}")
     print("=" * 70)
-    if all(results.values()):
-        print("ALL CHECKS PASSED")
+    if all(r is not False for r in results.values()):
+        if skipped:
+            print(f"CHECKS PASSED, but {len(skipped)} SKIPPED and therefore unverified: "
+                  f"{skipped}")
+        else:
+            print("ALL CHECKS PASSED")
         sys.exit(0)
     print("CHECKS FAILED — see above")
     sys.exit(1)
