@@ -175,23 +175,71 @@ weeks is exactly what dragged it into the generic mass and produced lift 1.5.
 
 ## 4. Proposed bands
 
-| band | items | baskets | share | expectation |
-|---|---|---|---|---|
-| **S** | ≤5 | 12,813,217 | 22.4% | sharpest — 3.6-item clusters reached lift 16–21 |
-| **M** | 6–15 | 17,518,443 | 30.7% | strong; most of the ≤10 result lives here |
-| **L** | 16–30 | 12,534,590 | 21.9% | weakening; expect lift 1.6–1.8 |
-| **XL** | 31+ | 14,249,554 | 24.9% | weekly-shop archetypes, expect lift ~1.5 |
+Three bands were run on 2026-09-28. **All results below are measured, not
+predicted.**
 
-Four substantial populations, none under 12M baskets.
+| band | items | baskets | share | communities | profiled | **median max lift** | **lift > 3** | thin profiles |
+|---|---|---|---|---|---|---|---|---|
+| *baseline* | *all* | *57,115,804* | *100%* | *356* | *284* | *1.949* | *15%* | *—* |
+| **S** | ≤10 | 23,341,615 | 40.9% | 2,090 | 225 | **5.032** | **97%** | **90%** |
+| **M** | 11–20 | 12,138,111 | 21.3% | 98 | 92 | **3.009** | **53%** | 8% |
+| **L** | 21+ | 21,636,078 | 37.9% | 78 | 78 | **1.991** | **4%** | 0% |
 
-**XL will not produce occasions, and that is the expected result, not a
-failure.** Judge it as "what kind of weekly shop is this," and label it as such
-so nobody assumes all four tiers carry equal meaning.
+The gradient is monotonic and steep. Predictions made *before* the runs — M at
+2.0–3.0 and L at 1.5–1.8 — both held.
 
-Underlying distribution: ≤5 22.4% · 6–10 18.4% · 11–15 12.2% · 16–20 9.0% ·
-21–30 12.9% · 31–50 14.9% · 51+ 10.0%. Maximum observed: 2,037 distinct
-products in one household-week — that record is not a household and the 51+
-band deserves inspection before anyone draws conclusions from it.
+### Band S — the occasion vocabulary
+
+Sharpest by a wide margin: 97% of its need-states are characterised, 58 exceed
+lift 10, and the top clusters reach lift 21. These are the meal deals, beer
+runs, flower purchases and lunch-on-the-go trips.
+
+**Caveat: 90% of S's 2,090 communities fall below the profiling support
+threshold** (median size 45 baskets). Only ~201 carry a full profile. **Report
+~201, never 2,090.**
+
+### Band M — two families, almost no noise
+
+53% characterised with only an 8% thin tail — the cleanest band. It splits
+into two clearly distinguishable groups:
+
+- **Fresh food shops** (need-states 7, 13, 20, 28, 30, 35, 36, 51, 59, 74, 21)
+  — cucumber, blueberries, tomatoes, apples, carrots, onions at lift 2.7–3.3
+- **Snack and drinks shops** (52, 23, 39) — Fridge Raiders, Peperami,
+  Powerade, energy drinks, Kopparberg
+
+### Band L — not occasions, and not weekly-shop archetypes either
+
+**1.991 against a 1.949 baseline.** Isolating 21.6M large baskets and
+clustering them alone bought essentially nothing; only 3 of 78 need-states
+exceed lift 3. This is the blend hypothesis confirmed, not a failure.
+
+But L *is* finding something — just not what was expected. Its need-states group
+**Cookstown** sausages, **Denny** pork, **Coleraine** cheddar, **Wilson's
+Country** potatoes, **Connolly's** gammon, **Keelings** grapes and **Isle of Man
+Creamery** milk: Northern Irish and Irish brands clustering together.
+
+**Band L is capturing region and store assortment, not shopping occasion.** A
+full weekly shop reflects where someone lives and what their store stocks. That
+is a legitimate segmentation — label it as *regional / store weekly-shop
+archetypes*. Calling it a need-state vocabulary would be wrong.
+
+### Should band L be included at all?
+
+Both ways have costs. Excluding it leaves 37.9% of baskets unlabelled, which
+drops them out of the transition graph entirely. Including it means a third of
+the "need-states" are not occasions.
+
+**Recommendation: include it, explicitly marked as a different kind of state.**
+A journey reading *"regional weekly shop → meal deal → beer run"* is honest and
+useful. One implying all three are comparable occasion types is not.
+
+### Underlying size distribution
+
+≤5 22.4% · 6–10 18.4% · 11–15 12.2% · 16–20 9.0% · 21–30 12.9% · 31–50 14.9% ·
+51+ 10.0%. Maximum observed: 2,037 distinct products in one household-week —
+that record is not a household, and the 51+ range deserves inspection before
+anyone draws conclusions from it.
 
 ---
 
