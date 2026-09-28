@@ -68,39 +68,81 @@ if hasattr(sys.stdout, "reconfigure"):
 import config
 import duckdb_manager
 import need_state_graph
-from cluster_basket_embeddings import UNCLUSTERED, progress_step
+from cluster_basket_embeddings import (
+    UNCLUSTERED, _cache_manifest_path, _read_manifest, progress_step,
+)
 from profile_need_states import outputs_for
 
 OUTPUT_DIR = config.OUTPUT_DIR
 DEFAULT_OUT = os.path.join(OUTPUT_DIR, "need_states_export.xlsx")
 
 
-def discover_runs():
+def discover_runs(column: str = "need_state_cluster"):
     """
-    Every label file with a matching profile, plus the edge file it came from.
+    Every label file paired with a profile and an edge list that PROVABLY
+    belong to it.
 
-    Filenames carry their settings, so the run set is readable off disk rather
-    than maintained by hand:
-        basket_need_state_clusters_k10_onedir_max10_r1p5.parquet
-          -> basket_knn_edges_k10_onedir_max10.parquet
+    Filename convention alone is not enough, and trusting it produced a wrong
+    export. Two legacy artifacts predate the run-specific naming scheme:
+
+      need_state_profiles.parquet   written by whichever run profiled last —
+                                    the baseline resolved to it and was
+                                    exported carrying band S's 2,090
+                                    need-states instead of its own 356.
+      basket_knn_edges.parquet      the old k=15 MUTUAL graph from an aborted
+                                    run, which the baseline's adjacency would
+                                    have been computed from despite its labels
+                                    coming from the k=10 one-directional graph.
+
+    Both are now checked rather than assumed:
+      * the profile must describe the same number of need-states the label
+        file actually contains;
+      * the edge list must carry the exact manifest the labels were
+        fingerprinted against. Unverifiable pairings get no adjacency rather
+        than a plausible-looking wrong one.
     """
     runs = []
     for clusters in sorted(glob.glob(os.path.join(OUTPUT_DIR,
                                                   "basket_need_state_clusters*.parquet"))):
+        name = os.path.basename(clusters)
         profiles, summary = outputs_for(clusters)
         if not (os.path.exists(profiles) and os.path.exists(summary)):
-            print(f"  skipping {os.path.basename(clusters)} — no profile beside it")
+            print(f"  SKIP {name}: no profile beside it")
             continue
-        stem = os.path.splitext(os.path.basename(clusters))[0]
+
+        present = pd.read_parquet(clusters, columns=[column])[column].unique()
+        n_labels = int(len(present) - (1 if UNCLUSTERED in present else 0))
+        n_summary = len(pd.read_parquet(summary, columns=["need_state"]))
+        if n_labels != n_summary:
+            print(f"  SKIP {name}: its label file holds {n_labels:,} need-states but "
+                  f"{os.path.basename(summary)} describes {n_summary:,}. They are not "
+                  f"the same run — re-profile this label file to export it.")
+            continue
+
+        stem = os.path.splitext(name)[0]
         edges_stem = re.sub(r"_r[0-9p]+$", "", stem).replace(
             "basket_need_state_clusters", "basket_knn_edges")
         edges = os.path.join(OUTPUT_DIR, edges_stem + ".parquet")
+
+        # Provenance, not just existence: the label manifest embeds the edge
+        # manifest it was built from, so an exact match is verifiable.
+        verified = None
+        if os.path.exists(edges):
+            want = _read_manifest(_cache_manifest_path(clusters))
+            have = _read_manifest(_cache_manifest_path(edges))
+            if want and have and want.get("edges") == have:
+                verified = edges
+            elif want is None:
+                print(f"  {name}: no manifest, so its edge list cannot be verified — "
+                      f"adjacency skipped rather than computed from a possibly "
+                      f"unrelated graph ({os.path.basename(edges)})")
+            else:
+                print(f"  {name}: {os.path.basename(edges)} is not the graph these "
+                      f"labels came from — adjacency skipped")
+
         runs.append({
-            "run": stem,
-            "clusters": clusters,
-            "profiles": profiles,
-            "summary": summary,
-            "edges": edges if os.path.exists(edges) else None,
+            "run": stem, "clusters": clusters, "profiles": profiles,
+            "summary": summary, "edges": verified,
         })
     return runs
 
@@ -181,7 +223,7 @@ def main():
     args = parser.parse_args()
 
     con = duckdb_manager.get_connection()
-    runs = discover_runs()
+    runs = discover_runs(args.column)
     if not runs:
         raise SystemExit(
             f"no runs found in {OUTPUT_DIR}. Expected "
