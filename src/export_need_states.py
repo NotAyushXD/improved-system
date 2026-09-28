@@ -49,8 +49,21 @@ import argparse
 import glob
 import os
 import re
+import sys
 
 import pandas as pd
+
+# Windows defaults stdout to cp1252, and PowerShell's `*>` redirection makes it
+# strict — so a single character outside that codepage raises UnicodeEncodeError
+# and kills the run. A box-drawing dash did exactly that here, after the
+# discovery phase had already completed.
+#
+# errors="replace" downgrades that from a crash to a '?'. The encoding is left
+# alone deliberately: forcing UTF-8 would fix the log file but make PowerShell
+# render every em dash as mojibake unless the reader passes -Encoding UTF8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
 
 import config
 import duckdb_manager
@@ -180,7 +193,7 @@ def main():
     summaries, products, adjacencies, transitions_all = [], [], [], []
 
     for r in runs:
-        print(f"── {r['run']}")
+        print(f"-- {r['run']}")
         summary = pd.read_parquet(r["summary"])
         profile = pd.read_parquet(r["profiles"])
 
