@@ -96,6 +96,37 @@ def build_baskets_table(con, parquet_path, dataset_tag: str, min_basket_products
     Returns (n_baskets_total, product_units_avg, product_uniques) — all
     three are bounded by catalog size or a single COUNT(*), never by
     basket count.
+
+    PRODUCT IDS COME BACK AS STRINGS, DELIBERATELY
+    ──────────────────────────────────────────────
+    `tpnb` is an INT in cltv_hh_metrics_tpnb_base (data/TABLE_REFERENCE.md),
+    and this export does not cast it. But the two PRODUCT-side extracts do:
+    ns_tpnb_to_tpna_mapping.sql and ns_item_lookup_tpna.sql both
+    `CAST(tpnb AS STRING)`, and parquet_loader.load_product_embeddings()
+    casts again with .astype(str). So product_embeddings.parquet is keyed by
+    str while everything built here was keyed by int.
+
+    Those two key spaces never meet. `product_uniques` becomes
+    product_id_to_index in pipeline_main, and GraphBuilder.prepare_globals()
+    then looks each product up in the str-keyed embedding dict — a lookup
+    that cannot match, has no else branch and printed nothing. Every product
+    silently got an all-zero 384-dim embedding, sub_cluster_id 0.0 and
+    distinctiveness 0.5: 386 of 388 node-feature dimensions constant, with
+    in_dim still 388 and nothing in the log out of place.
+
+    Casting to VARCHAR here — at the one place both `products` and
+    `product_uniques` are produced — is what makes the two sides join. The
+    downstream CASTs in profile_need_states.py and audit_product_data.py
+    (`CAST(UNNEST(products) AS VARCHAR)`) become no-ops rather than breaking.
+
+    ORDERING IS LOAD-BEARING: the DISTINCT query below groups and orders by
+    the RAW tpnb, not the cast one, so index assignment in
+    product_id_to_index is byte-for-byte what it was before this cast. That
+    is what keeps an already-built copurchase_sparse.npz valid — its
+    fingerprint is only (n_baskets, n_products) and would NOT notice a
+    reordering. Do not "simplify" this to ORDER BY the VARCHAR: it sorts
+    lexicographically, silently repermutes every product index, and the
+    co-purchase matrix would be reused against the wrong products.
     """
     _validate_tag(dataset_tag)
     glob_path = _glob_for(parquet_path)
@@ -127,7 +158,10 @@ def build_baskets_table(con, parquet_path, dataset_tag: str, min_basket_products
         FROM (
             SELECT household_number,
                    year_number * 100 + week_number AS year_week_number,
-                   tpnb, quantity
+                   -- VARCHAR, to match the str-keyed product_embeddings.parquet.
+                   -- See "PRODUCT IDS COME BACK AS STRINGS" in the docstring.
+                   CAST(tpnb AS VARCHAR) AS tpnb,
+                   quantity
             FROM read_parquet(?)
             WHERE household_number IS NOT NULL AND tpnb IS NOT NULL
         ) t
@@ -144,15 +178,32 @@ def build_baskets_table(con, parquet_path, dataset_tag: str, min_basket_products
     n_baskets_total = con.execute(f"SELECT COUNT(*) FROM {_qi(baskets_table)}").fetchone()[0]
 
     units_avg_rows = con.execute(
-        "SELECT tpnb, AVG(quantity) FROM read_parquet(?) GROUP BY tpnb", [glob_path]
+        "SELECT CAST(tpnb AS VARCHAR) AS tpnb_key, AVG(quantity) "
+        "FROM read_parquet(?) WHERE tpnb IS NOT NULL GROUP BY tpnb", [glob_path]
     ).fetchall()
     product_units_avg = {r[0]: float(r[1]) for r in units_avg_rows}
 
-    uniq_rows = con.execute("SELECT DISTINCT tpnb FROM read_parquet(?) ORDER BY tpnb", [glob_path]).fetchall()
-    product_uniques = np.array([r[0] for r in uniq_rows])
+    # GROUP BY / ORDER BY the RAW tpnb and cast only the projected value, so
+    # the index each product gets in product_id_to_index is identical to what
+    # the pre-cast version produced. See the docstring's ORDERING note — the
+    # co-purchase matrix depends on this and cannot detect a reordering.
+    # The projected column is aliased tpnb_key, NOT tpnb, so that `ORDER BY
+    # tpnb` can only resolve to the raw input column and never to the VARCHAR
+    # output. That resolution is the whole guarantee here; it should not
+    # depend on how a given DuckDB version breaks the tie.
+    uniq_rows = con.execute(
+        "SELECT CAST(tpnb AS VARCHAR) AS tpnb_key FROM read_parquet(?) "
+        "WHERE tpnb IS NOT NULL GROUP BY tpnb ORDER BY tpnb", [glob_path],
+    ).fetchall()
+    # dtype=object keeps these as plain Python str. A numpy '<U' array would
+    # hand out np.str_ instances — which do hash like str, but also get pickled
+    # into product_id_to_index.pkl and read back by score_new_baskets.py, and
+    # there is no reason to put a numpy scalar type in that contract.
+    product_uniques = np.array([r[0] for r in uniq_rows], dtype=object)
 
     print(f"  {baskets_table}: {n_baskets_total:,} baskets, "
-          f"{len(product_uniques):,} distinct products (read directly from parquet)")
+          f"{len(product_uniques):,} distinct products (read directly from parquet, "
+          f"product ids as VARCHAR to match product_embeddings.parquet)")
     return n_baskets_total, product_units_avg, product_uniques
 
 

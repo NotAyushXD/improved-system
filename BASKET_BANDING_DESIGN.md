@@ -1,86 +1,55 @@
-# Basket-size banding: clustering need-states separately, traversing them together
+# Basket-size banding: an investigation, and why it was not adopted
 
-*Design proposal, 2026-09-27. Every number below is measured on the real
-57,115,804-basket population, not estimated.*
+*Investigation record. Proposed 2026-09-27, tested 2026-09-28, concluded
+2026-09-29. Every number is measured on the real 57,115,804-basket population.*
+
+> [!IMPORTANT]
+> **Verdict: banding does not improve need-states and is not recommended as a
+> production segmentation.** The decisive test — what share of ≤10-item baskets
+> land in a distinctive need-state — gives **19.4%** for the ordinary
+> full-population clustering and **~20%** for a dedicated small-basket
+> clustering. Identical within rounding.
+>
+> The idea was accepted for a day on the strength of a measurement that turned
+> out to be wrong (§4). It is recorded in full because the reasoning that
+> produced it was sound, the bug it exposed was serious, and the method built
+> to settle it — permutation nulls (§5) — is now the project's standard
+> validation and is worth more than the hypothesis was.
 
 ---
 
-## 1. The problem this solves
+## 1. The question
 
 A **basket is a household's entire week**, not a shopping trip. No source table
 carries a transaction or visit identifier — `cltv_hh_metrics_tpnb_base` has
-`week_number` as its finest time grain — so a week is the best the data allows.
+`week_number` as its finest grain — so a week is the best the data allows.
 
 That matters because a need-state is meant to be an **occasion**. A week is not
-an occasion; it is a mixture of them. A household that shopped three times in a
-week produces one 30-item basket blending a big shop, a top-up and a treat run.
-Every such blend resembles every other blend, and no clustering algorithm can
-separate them.
+an occasion; it is a mixture of them. A household that shopped three times
+produces one 30-item basket blending a big shop, a top-up and a treat run.
+Every such blend resembles every other blend.
 
-Clustering the whole population at once confirmed this:
+**Hypothesis:** if large baskets are blends and small baskets are single
+occasions, then clustering small baskets *separately* — so they cannot be
+pulled toward the generic mass by kNN edges to 40-item weeks — should produce
+sharper need-states.
 
-| | all 57.1M baskets |
-|---|---|
-| Need-states found | 356 |
-| Median max product lift | **1.95** |
-| Need-states with lift > 3 | **44 of 284 (15%)** |
-| Products/basket in the 15 largest | 29–34 |
-
-Lift measures how much more often a product appears in a need-state than in
-shopping generally. **Lift ≈ 1 means a cluster holds a representative sample of
-products — a region of space, not a shopping occasion.** The 15 largest
-need-states topped out at lift 1.7, and the same products (courgettes, bottled
-water) were "most distinctive" for many different clusters at once.
-
-The clusters were geometrically tidy and semantically empty.
-
-### The measurement that pointed the way
-
-Distinctiveness turned out to be a direct function of basket size —
-**Spearman −0.829**, monotonic across every band:
-
-| avg products/basket | need-states | median max lift | baskets |
-|---|---|---|---|
-| ≤10 | 65 | **3.22** | 8.5M |
-| 10–15 | 86 | 2.15 | 9.8M |
-| 15–20 | 34 | 1.82 | 6.1M |
-| 20–25 | 37 | 1.68 | 9.0M |
-| 25–30 | 26 | 1.62 | 8.0M |
-| 30+ | 36 | 1.50 | 15.7M |
-
-Small weeks are single occasions and cluster sharply. Large weeks are blends
-and cannot.
-
-### Confirmation
-
-Re-clustering only the 23,341,615 baskets with ≤10 products:
-
-| | all baskets | ≤10 items |
-|---|---|---|
-| Median max lift | 1.95 | **5.03** |
-| Characterised (lift > 3) | 15% | **97%** |
-| Need-states above lift 10 | ~0 | **58** |
-| Near-duplicate clusters | — | **0** |
-
-The occasions that emerged are unmistakable: a **meal deal** (sandwich +
-smoothie + crisps) at lift 15–21, a **beer run** (Heineken / cider / Peroni), a
-**flower purchase** (tulips, roses), **lunch-on-the-go** variants. These are the
-*largest* clusters in that band, not obscure ones.
+This document records how that was tested and why it failed.
 
 ---
 
-## 2. How this idea emerged
+## 2. How the idea emerged
 
-Recorded because the design was not reasoned from theory. It came out of a
-negative result that was very nearly accepted as final.
+Kept because the design was not reasoned from theory. It came out of a negative
+result that was very nearly accepted as final, and the near-miss is the most
+transferable part of this whole exercise.
 
 **The pipeline finished and looked healthy.** 356 need-states, modularity
 0.4145, no embedding collapse, every basket labelled, all checks passing.
 Modularity was read at the time as evidence of real community structure.
 
 **But nobody knew what any need-state *was*.** They were integers. Product-lift
-profiling was built to answer that — for each cluster, which products are
-over-represented relative to the population.
+profiling was built to answer that.
 
 **The first profile was a shock.** All fifteen of the largest need-states topped
 out at lift 1.3–1.7, and the same handful of products — loose courgettes,
@@ -89,40 +58,24 @@ different clusters at once. The partition was tidy and meaningless.
 
 That also invalidated the modularity reading. **A kNN graph is locally connected
 by construction**, so Leiden returns neat modular partitions over structureless
-data too. Modularity had measured geometry, not meaning. Only lift could tell
-those apart, and it did.
+data too. Modularity measured geometry, not meaning.
 
-**The near-miss.** The obvious conclusion was that clustering had failed, that
-the week grain made need-states impossible, and that the problem was in the
-data rather than the method. That conclusion was wrong, and a single extra
-query caught it.
-
-The fifteen largest need-states are only about 1% of baskets each. Ranking
-*all 284* by their maximum lift told a completely different story: **44 exceeded
-lift 3**, the best reaching 9 — meal deals, beer runs, flower purchases. They
-had been invisible because they were small, and the first view had been sorted
-by size.
-
-Had the investigation stopped at the largest-fifteen view, the work would have
-been written off as a failure.
+**The near-miss.** The obvious conclusion was that clustering had failed and the
+week grain made need-states impossible. That conclusion was wrong, and one
+extra query caught it. The fifteen largest need-states are only ~1% of baskets
+each. Ranking *all 284* by maximum lift told a different story: **44 exceeded
+lift 3**. They had been invisible because they were small, and the first view
+was sorted by size.
 
 **The pattern hiding in those 44.** Every distinctive need-state averaged
-6.4–11.3 products per basket. Every undistinctive one averaged 29–34. Quantified
-across all need-states: **Spearman −0.829**, monotonic through every size band
-(the table in §1).
+6.4–11.3 products per basket; every undistinctive one averaged 29–34. Across all
+need-states: **Spearman −0.829**.
 
-**The test.** Cluster only the 23.3M baskets with ≤10 products. Median max lift
-went 1.95 → 5.03; characterised need-states went 15% → 97%.
+That correlation is real and has been reproduced on the corrected data (§6). It
+is the observation that motivated banding. **The observation survived; the
+intervention built on it did not.**
 
-**The objection that produced this design.** Clustering bands separately means
-their label spaces never connect — so a household moving between a top-up week
-and a big-shop week would have no representable transition, and 59% of baskets
-would drop out of the journey graph. The stratified-clustering-with-shared-
-traversal design in §3 is the answer to that objection.
-
-### What to take from this
-
-Three things worth carrying into the next iteration:
+### What to carry forward
 
 1. **A clustering algorithm always returns clusters.** Ask Leiden for groups and
    it gives you groups, on noise as readily as on structure. Internal metrics
@@ -131,270 +84,392 @@ Three things worth carrying into the next iteration:
    rescued this was one query away the whole time, behind a default ordering.
 3. **A negative result is a finding, not an endpoint** — but only if you
    interrogate it before acting on it.
+4. **And the converse, learned the hard way in §4: a *positive* result is not an
+   endpoint either.** The same interrogation is owed to results you like.
 
 ---
 
-## 3. The proposal
+## 3. What was built and run
 
-Split baskets into 3–4 populations by size. **Cluster each separately.**
-Traverse between them using household week sequences, which exist independently
-of any clustering.
+Three bands, clustered independently at the working configuration (k=10,
+one-directional kNN, gamma 1.5), then profiled and scored:
+
+| band | items | baskets | share |
+|---|---|---|---|
+| **S** | ≤10 | 23,341,615 | 40.9% |
+| **M** | 11–20 | 12,138,111 | 21.3% |
+| **L** | 21+ | 21,636,078 | 37.9% |
+
+The three partition the population exactly
+(23,341,615 + 12,138,111 + 21,636,078 = 57,115,804), which makes their coverage
+figures summable — used in §6.
+
+`--min-products` / `--max-products` on `cluster_basket_embeddings.py
+--build-edges` restrict the graph to a band. Cache filenames encode the subset,
+so bands cannot overwrite each other.
+
+---
+
+## 4. The bug that produced the wrong answer
+
+The first round of results looked decisive:
+
+| band | median max lift (as first measured) |
+|---|---|
+| baseline | 1.949 |
+| S ≤10 | **5.032** |
+| M 11–20 | 3.009 |
+| L 21+ | 1.991 |
+
+That was wrong. `profile_need_states.build_counts()` computed `product_baseline`
+over the **whole** basket table with no cluster filter, while the numerator
+covered only labelled baskets. **A run that labels a subset was scored against
+the baskets it had deliberately excluded.**
+
+Banding is precisely the case this breaks — every band labels a subset, so every
+band was measured against a population it was not drawn from.
+
+The correct property, now enforced by `check_lift_formula` in
+`test_pipeline.py`: **a clustering that does nothing must score lift 1.0
+everywhere.** Put all labelled baskets in one cluster and the fixed code returns
+exactly 1.0. The old code did not — band S's "do nothing" baseline was already
+above 1, because small baskets' product mix differs from the full population's.
+
+### The correction, and why its size varies
+
+Per product, the two measurements differ by exactly the product's *band-level*
+lift:
 
 ```
-Household 12345
-  week 202608    4 items  → band S  → need-state S34   (meal deal)
-  week 202609   38 items  → band XL → need-state L12   (full weekly shop)
-  week 202610    7 items  → band S  → need-state S91   (beer run)
+lift_vs_all_shopping = lift_within_band × band_lift
 ```
 
-Three bands, three label spaces, one chain.
+So the inflation is proportional to how small a share of all **item-rows** a
+band holds. Measured:
 
-### Why the traversal works
+| run | item-rows | share of total | correction factor |
+|---|---|---|---|
+| baseline | ~1.06B | 100% | **1.00×** |
+| L 21+ | ~750M | ~71% | 1.15× |
+| M 11–20 | ~182M | ~17% | 1.66× |
+| S ≤10 | 126,319,468 | ~12% | **3.07×** |
 
-`basket_id` is `<household_number>_<year_week>`. The household-week sequence is
-recoverable from the id alone and does not depend on which band a week fell
-into. `need_state_graph.build_need_state_transitions()` consumes
-`(basket_id, need_state)` pairs — union the band label spaces into a single
-column with distinct id ranges and it runs unchanged.
+**The baseline came back at 1.949 to three decimals after the fix** — it
+labelled every basket, so old and new baselines are the same set. That is the
+control proving the fix corrects rather than merely deflates.
 
-This is **stratified clustering with a shared temporal layer**. Each band gets a
-model suited to its structure; the sequence stitches them together.
+Band S's headline was inflated threefold. That single number was the entire
+quantitative case for banding.
 
-### What is and isn't shared
+---
 
-| | shared across bands? |
+## 5. Method: the permutation null
+
+Once the lift figures moved, the obvious question was how much of what remained
+was chance. `median_max_lift ≈ 1.6` has no meaning without knowing what a
+*structureless* clustering scores on the same data.
+
+**The null:** permute the `need_state_cluster` column, preserving the exact
+cluster-size distribution, then re-profile and re-score. One DuckDB pass, ~3
+minutes, no new code.
+
+```powershell
+# Full population (no UNCLUSTERED rows)
+.\.venv\Scripts\python.exe -c "import pandas as pd, numpy as np; d=pd.read_parquet(r'..\data\output\basket_need_state_clusters_k10_onedir_r1p5.parquet', columns=['basket_id','need_state_cluster']); d['need_state_cluster']=np.random.default_rng(42).permutation(d['need_state_cluster'].values); d.to_parquet(r'..\data\output\basket_need_state_clusters_k10_onedir_SHUFFLED_r1p5.parquet', index=False)"
+```
+
+> [!WARNING]
+> **For a band, permute ONLY the non-`UNCLUSTERED` rows.** Shuffling the whole
+> column scatters the `-1`s, the "band" becomes a random subset of all 57.1M
+> baskets, and the null is meaningless.
+>
+> ```python
+> m = (d["need_state_cluster"] != -1).values
+> v = d.loc[m, "need_state_cluster"].values.copy()
+> rng.shuffle(v)
+> d.loc[m, "need_state_cluster"] = v
+> ```
+
+### Two reusable calibrations came out of this
+
+**All four nulls produced ZERO need-states above lift 3 and zero above lift 5**,
+across cluster counts from 78 to 2,090 and populations from 12.1M to 57.1M
+baskets. `lift > 3` was a convention in this project; it is now an empirically
+validated threshold. Chance never reaches it on this dataset.
+
+**All four nulls sit in 1.199–1.261.** "Median max lift around 1.2 means
+nothing here" is a reusable constant.
+
+### The null rises with cluster size — do not reason the other way
+
+| run | item-rows per cluster | null |
+|---|---|---|
+| L 21+ | ~9.7M | **1.261** |
+| baseline | ~3.0M | 1.255 |
+| M 11–20 | ~1.9M | 1.234 |
+| S ≤10 | ~60k | **1.199** |
+
+Counter-intuitive but mechanical: more item-rows means more products clear the
+`MIN_PRODUCT_BASKETS=200` support floor, so the maximum is taken over a larger
+pool of candidates, and the maximum of more draws is larger. **More data per
+cluster gives a higher noise floor, not a lower one.** This was predicted wrong
+once during the investigation; don't repeat it.
+
+It also means **each run needs its own null**. Borrowing another run's floor
+will mislead by up to 0.06 lift, which is ~13% of the signal being measured.
+
+---
+
+## 6. Results
+
+All four runs, corrected baseline, each against its own permutation null.
+`excess` = observed − own null, and is the number to compare.
+
+| run | comms | obs | null | **excess** | ratio | >3 of all comms | >5 | >10 | twin / null |
+|---|---|---|---|---|---|---|---|---|---|
+| **baseline** all 57.1M | 356 | 1.949 | 1.255 | **0.694** | 1.55× | 44/356 = **12.4%** | 13 | 0 | 6.3× |
+| **M** 11–20 | 98 | 1.811 | 1.234 | 0.577 | 1.47× | 7/98 = 7.1% | 1 | 0 | **8.1×** |
+| **L** 21+ | 78 | 1.732 | 1.261 | 0.471 | 1.37× | 7/78 = 9.0% | 1 | 0 | 6.8× |
+| **S** ≤10 | 2,090 | 1.639 | 1.199 | 0.440 | 1.37× | 62/2,090 = 3.0% | 34 | **19** | 2.25× |
+
+### Population coverage — and why it disagrees with the table above
+
+`median_max_lift` takes a median **over communities**. Band S's communities
+range from 45 baskets to 195,000; 2,028 of its 2,090 are junk, and they count
+as much as the 62 real ones. The basket-weighted view inverts the ranking:
+
+| run | % of *its* baskets in a need-state with lift > 3 | baskets | % of all 57.1M |
+|---|---|---|---|
+| baseline | 10% | 5.71M | **10.0%** |
+| **S ≤10** | **20%** | 4.67M | 8.2% |
+| M 11–20 | 6% | 0.73M | 1.3% |
+| L 21+ | 4% | 0.87M | 1.5% |
+
+Because the bands partition the population exactly, the banded approach as a
+whole covers **~11.0%** of all baskets against the baseline's **10.0%** — a tie
+once the whole-number rounding on those percentages is allowed for (union
+10.5–11.5%, baseline 9.5–10.5%).
+
+**Take from this: `median_max_lift` is the wrong summary when community sizes
+span four orders of magnitude.** It is fine for the baseline (median community
+135,094, fairly uniform) and misleading for band S.
+
+### The decisive test
+
+Neither view above is a clean comparison: band S's 20% is measured over small
+baskets, the baseline's 10% over all baskets, most of which are large. The
+direct question is *what share of the baseline's own ≤10-item baskets are in a
+distinctive need-state?*
+
+```
+ small_baskets  in_distinctive  pct
+      23341615       4534414.0 19.4
+```
+
+**19.4% for the baseline, ~20% for band S, over an identical set of 23,341,615
+baskets.** The dedicated small-basket clustering — a separate graph, 2,090
+communities, its own pipeline path — buys between 0.1 and 1.1 percentage points.
+
+One caveat, and it runs against banding: the baseline's `max_lift` is computed
+over need-states holding both small and large baskets, so a small basket can be
+counted "distinctive" on the strength of a large-basket product. **19.4% is
+therefore slightly generous to the baseline.** Not enough to change the verdict
+at this margin, but it is the honest direction of the error.
+
+---
+
+## 7. Verdict
+
+| question | answer |
 |---|---|
-| **Embedding space** | **Yes.** All 57.1M baskets were embedded in one pass by the same GNN. A 5-item and a 40-item basket occupy the same 64-dim space and their distance is meaningful. |
-| **kNN graph edges** | **No.** Restricting to a band before building the graph means a basket can only find neighbours inside its own band. |
-| **Leiden communities** | **No.** Leiden reads only the graph, so a community can never span bands. |
+| Does banding cover more shopping? | **No.** 19.4% vs ~20% on identical baskets. |
+| Does banding find more need-states worth naming? | **No.** 12.4% of communities vs 3.0%. |
+| Is the typical banded need-state more distinctive? | **No.** Excess 0.694 vs 0.440. |
+| Does banding produce *sharper* occasions? | **Yes.** 34 need-states above lift 5 and 19 above lift 10, against the baseline's 13 and **zero**. Both nulls give zero, so these are real. |
 
-The disconnection is *deliberate*. Letting a meal-deal basket link to 30-item
-weeks is exactly what dragged it into the generic mass and produced lift 1.5.
+**Banding is a discovery tool for sharp occasions, not a population
+segmentation.** It describes the same ~4.6M small baskets the baseline already
+describes, but carves them into purer groups — the meal deal at lift 15–21
+rather than a mixed cluster at lift 4. That is worth something for *naming and
+explaining* occasions. It is not worth a separate production pipeline.
 
----
+Treat 19 as an upper bound: max lift rewards over-splitting, and band S's twin
+Jaccard is 2.25× its null with 11 near-duplicate pairs among 225 profiled.
 
-## 4. Proposed bands
+### What each band actually found
 
-Three bands were run on 2026-09-28. **All results below are measured, not
-predicted.**
+**Band S — the sharpest occasions, and a 90% junk tail.** The recognisable
+occasions are here: a meal deal (sandwich + smoothie + crisps) at lift 15–21,
+lunch-on-the-go variants, beer runs, flower purchases. But 1,889 of 2,090
+communities fall below the profiling support threshold (median size 45
+baskets). **Report ~201, never 2,090.**
 
-| band | items | baskets | share | communities | profiled | **median max lift** | **lift > 3** | thin profiles |
-|---|---|---|---|---|---|---|---|---|
-| *baseline* | *all* | *57,115,804* | *100%* | *356* | *284* | *1.949* | *15%* | *—* |
-| **S** | ≤10 | 23,341,615 | 40.9% | 2,090 | 225 | **5.032** | **97%** | **90%** |
-| **M** | 11–20 | 12,138,111 | 21.3% | 98 | 92 | **3.009** | **53%** | 8% |
-| **L** | 21+ | 21,636,078 | 37.9% | 78 | 78 | **1.991** | **4%** | 0% |
+**Band M — the worst over-splitter.** Twin Jaccard 0.429 against a 0.053 null —
+8.1×, the highest of any run, with 8 near-duplicate pairs among 92 profiled —
+despite having only 98 communities. It splits into two recognisable families:
+fresh-food shops (cucumber, blueberries, tomatoes, apples at lift 2.7–3.3) and
+snack/drinks shops (Fridge Raiders, Peperami, Powerade, energy drinks).
 
-The gradient is monotonic and steep. Predictions made *before* the runs — M at
-2.0–3.0 and L at 1.5–1.8 — both held.
+**Band L — capturing region, not occasion.** Its need-states group **Cookstown**
+sausages, **Denny** pork, **Coleraine** cheddar, **Wilson's Country** potatoes,
+**Connolly's** gammon, **Keelings** grapes and **Isle of Man Creamery** milk:
+Northern Irish and Irish brands clustering together. A full weekly shop reflects
+where someone lives and what their store stocks. That is a legitimate
+segmentation — *regional / store weekly-shop archetypes* — but calling it a
+need-state vocabulary would be wrong.
 
-### Band S — the occasion vocabulary
+### The size effect is real; banding just isn't how to exploit it
 
-Sharpest by a wide margin: 97% of its need-states are characterised, 58 exceed
-lift 10, and the top clusters reach lift 21. These are the meal deals, beer
-runs, flower purchases and lunch-on-the-go trips.
+Spearman(avg basket size, max lift), measured per run on the corrected data:
 
-**Caveat: 90% of S's 2,090 communities fall below the profiling support
-threshold** (median size 45 baskets). Only ~201 carry a full profile. **Report
-~201, never 2,090.**
+| run | size range | Spearman |
+|---|---|---|
+| baseline | 1 – 2,037 | **−0.83** |
+| L 21+ | 21 – 2,037 | **−0.93** |
+| S ≤10 | 1 – 10 | −0.55 |
+| M 11–20 | 11 – 20 | **0.00** |
 
-### Band M — two families, almost no noise
+The correlation tracks how much size range each band contains — strong where
+there is range to see it, exactly zero in the narrow band. The baseline's −0.83
+reproduces the original −0.829 that started this investigation.
 
-53% characterised with only an 8% thin tail — the cleanest band. It splits
-into two clearly distinguishable groups:
-
-- **Fresh food shops** (need-states 7, 13, 20, 28, 30, 35, 36, 51, 59, 74, 21)
-  — cucumber, blueberries, tomatoes, apples, carrots, onions at lift 2.7–3.3
-- **Snack and drinks shops** (52, 23, 39) — Fridge Raiders, Peperami,
-  Powerade, energy drinks, Kopparberg
-
-### Band L — not occasions, and not weekly-shop archetypes either
-
-**1.991 against a 1.949 baseline.** Isolating 21.6M large baskets and
-clustering them alone bought essentially nothing; only 3 of 78 need-states
-exceed lift 3. This is the blend hypothesis confirmed, not a failure.
-
-But L *is* finding something — just not what was expected. Its need-states group
-**Cookstown** sausages, **Denny** pork, **Coleraine** cheddar, **Wilson's
-Country** potatoes, **Connolly's** gammon, **Keelings** grapes and **Isle of Man
-Creamery** milk: Northern Irish and Irish brands clustering together.
-
-**Band L is capturing region and store assortment, not shopping occasion.** A
-full weekly shop reflects where someone lives and what their store stocks. That
-is a legitimate segmentation — label it as *regional / store weekly-shop
-archetypes*. Calling it a need-state vocabulary would be wrong.
-
-### Should band L be included at all?
-
-Both ways have costs. Excluding it leaves 37.9% of baskets unlabelled, which
-drops them out of the transition graph entirely. Including it means a third of
-the "need-states" are not occasions.
-
-**Recommendation: include it, explicitly marked as a different kind of state.**
-A journey reading *"regional weekly shop → meal deal → beer run"* is honest and
-useful. One implying all three are comparable occasion types is not.
-
-### Underlying size distribution
-
-≤5 22.4% · 6–10 18.4% · 11–15 12.2% · 16–20 9.0% · 21–30 12.9% · 31–50 14.9% ·
-51+ 10.0%. Maximum observed: 2,037 distinct products in one household-week —
-that record is not a household, and the 51+ range deserves inspection before
-anyone draws conclusions from it.
+**Small weeks genuinely are more distinctive than large ones. The
+full-population clustering already exploits that** — its distinctive
+need-states are the small-basket ones. Isolating them first adds nothing.
 
 ---
 
-## 5. The transition layer
+## 8. What was proposed but not built
 
-### Split within-band from across-band
+Kept for the record. None of it should be built unless the verdict above
+changes.
 
-These mean different things and must not be averaged:
+**Stratified clustering with a shared temporal layer.** Cluster each band
+separately; traverse between them using household week sequences, which exist
+independently of any clustering. `basket_id` is `<household>_<year_week>`, so
+the sequence is recoverable from the id alone regardless of band.
+`need_state_graph.build_need_state_transitions()` consumes
+`(basket_id, need_state)` pairs — union the band label spaces into one column
+with distinct id ranges and it runs unchanged.
 
-- **Within-band** (`S34 → S91`) — a genuine occasion-to-occasion move. *"After
-  a meal deal, households buy beer."*
-- **Across-band** (`S34 → L12`) — mostly encodes a change in shopping *mode*.
-  The band change is the signal, not the need-state pair. *"After a top-up,
-  households do a big shop."*
+This was the answer to the objection that banding disconnects label spaces, so a
+household moving between a top-up week and a big-shop week would have no
+representable transition.
 
-Both are interesting. Reported as one table, the obvious one buries the
-interesting one.
+**Within-band vs across-band transitions.** `S34 → S91` is a genuine
+occasion-to-occasion move; `S34 → L12` mostly encodes a change in shopping
+*mode*, where the band change is the signal rather than the need-state pair.
+Reported as one table the obvious one buries the interesting one.
 
-### Sparsity
+**Cross-band profile linking.** The same occasion appears in several bands — a
+meal deal in S, a meal-deal-flavoured corner of M — as unrelated ids. Jaccard
+over top-N high-lift products would link them.
 
-Four bands at ~200 need-states each gives ~800 states and ~640,000 directed
-pairs, against roughly 35.2M household-week steps. The current 356-state run
-observes 86,097 pairs; this will be several times thinner per cell and
-`MIN_TRANSITION_SUPPORT=30` will flag considerably more. Workable, but the long
-tail becomes noise — filter before reading.
+**Band boundaries are discontinuous.** A 15-item and a 16-item week land in
+different label spaces. Some households flip bands over a single extra item.
 
-### Band boundaries are discontinuous
-
-A 15-item week and a 16-item week land in different label spaces entirely. Some
-households will flip bands over a single extra item. Nothing to fix; just don't
-over-read a transition that is really a boundary artifact.
-
----
-
-## 6. Cross-band linking (the refinement)
-
-The same occasion will appear in several bands — a meal deal in S, and a
-meal-deal-flavoured corner of M — as unrelated need-states with different ids.
-
-After profiling each band, compute **similarity between need-state product
-profiles across bands** (Jaccard over top-N high-lift products, the same
-measure used to check within-band redundancy). Where an S need-state and an M
-need-state share their markers, link or merge them.
-
-That turns four disconnected vocabularies into one vocabulary with size
-variants, and makes "the same occasion at different scales" visible rather than
-duplicated. Cost is trivial — a few hundred × few hundred comparison on data
-already produced.
+**Sparsity.** ~800 states across four bands gives ~640,000 directed pairs
+against 35.2M household-week steps; the current 356-state run observes 86,097
+pairs. Several times thinner per cell, and `MIN_TRANSITION_SUPPORT=30` would
+flag considerably more.
 
 ---
 
-## 7. What this design does and does not license
+## 9. Limitations that still stand
 
-| Claim | Valid |
-|---|---|
-| "These are the occasions found in ≤5-item weeks" | ✓ |
-| "S34 and L12 are different need-states" | ✓ — different label spaces by construction |
-| "This household moved from a meal deal to a big shop" | ✓ — the sequence is band-independent |
-| "This 30-item week is 30% meal-deal by product content" | ✓ via product-profile scoring |
-| "This 30-item week **is** the meal-deal need-state" | ✗ — it is a mixture; forcing one label is the error that produced lift 1.5 |
-| "We found 800 need-states" | ✗ — most are small. Report only well-supported ones |
-
----
-
-## 8. Known limitations
-
-**The grain is the root cause and this is a workaround.** Basket size is a
-proxy for trip count, not a measurement of it. If anyone can obtain a
+**The grain is the root cause, and banding was a workaround for it.** Basket
+size is a proxy for trip count, not a measurement of it. If anyone can obtain a
 transaction or visit identifier from the warehouse, that single change would do
 more than everything described here. Worth asking whoever owns
 `product.product` and `cltv_hh_metrics_tpnb_base` before investing further.
 
-**A longer aggregation window makes this worse, not better.** Biweekly or
-monthly baskets blend *more* occasions per row. The direction that helps is
-finer, and finer is unavailable.
+**A longer aggregation window makes this worse.** Biweekly or monthly baskets
+blend *more* occasions per row. The direction that helps is finer, and finer is
+unavailable.
 
 **The observation window is thin.** 21.9M households across 57.1M baskets is
-**2.6 observed weeks per household**. Most contribute one or two transitions.
-`PIPELINE_TRANSITION_MAX_WEEK_GAP` is currently `none`, which counts a 1-week
-and a 6-week step identically — check the `avg_week_gap` column on every
-transition row before quoting a journey number. Widening the ~8-week SQL window
-is the proper fix.
+**2.6 observed weeks per household**. `PIPELINE_TRANSITION_MAX_WEEK_GAP` is
+`none`, which counts a 1-week and a 6-week step identically — check
+`avg_week_gap` on every transition row before quoting a journey number.
+Widening the ~8-week SQL window is the proper fix.
 
-**Small bands lean toward lighter shoppers.** With only 2.6 weeks observed per
+**Small bands lean toward lighter shoppers.** With 2.6 weeks observed per
 household, "small weeks" does not cleanly mean "the light weeks of every
-household". State this as a selection effect rather than hiding it.
+household". A selection effect, not a property of the occasions.
 
 **Product descriptions are not fully trustworthy.** `tpnb 54739758` appears in
 1,767,393 baskets (3.1%) described as "PENDRIVE FLASH DRIVE 12GB SLIQ" with
 department "FRESH FRUIT/VEG/SALAD". It maps to exactly one tpna, so the
-contradiction is in the source extract. Descriptions also feed the product
+contradiction is in the source extract. Descriptions feed the product
 embeddings, so corruption affects the clustering and not just the labels. Run
 `src/audit_product_data.py` before trusting any label.
 
----
-
-## 9. Implementation
-
-1. **`--min-products` alongside `--max-products`** in
-   `cluster_basket_embeddings.py --build-edges`, so any band is one command.
-   Cache filenames already encode the subset, so bands cannot overwrite each
-   other.
-2. **Cluster each band** with `cluster_leiden_networkit.py --edges <band> --min-coverage 0`.
-   Coverage is measured against the full population, so a band reports its own
-   share — that is the check working on the wrong question, not a failure.
-3. **Profile each band** with `profile_need_states.py`. Outputs are named after
-   the label file, so bands accumulate rather than overwrite.
-4. **Score each band** with `evaluate_run.py`, which appends to
-   `experiment_log.csv`.
-5. **Union the label spaces** into one `need_state_cluster` column with
-   distinct id ranges plus a `band` column.
-6. **Cross-band profile similarity** to link equivalent occasions.
-7. **Split transitions** into within-band and across-band tables.
-
-Steps 1, 5, 6 and 7 are not yet built. Steps 2–4 exist.
+**Basket-size distribution, for reference.** ≤5 22.4% · 6–10 18.4% · 11–15
+12.2% · 16–20 9.0% · 21–30 12.9% · 31–50 14.9% · 51+ 10.0%. Maximum observed:
+2,037 distinct products in one household-week — that record is not a household.
 
 ---
 
-## 10. How to judge whether a band worked
+## 10. How to judge any future clustering run
 
-Use **`median_max_lift`** and **`pct_lift_over_3`** from `experiment_log.csv`.
+This is the part of the investigation worth keeping.
 
-**Do not use modularity.** A kNN graph is locally connected by construction, so
-Leiden returns tidy modular partitions over structureless data too. Modularity
-0.4145 was read as evidence of real structure in the full-population run; the
-lift analysis later showed those clusters were meaningless. Modularity cannot
-distinguish a real grouping from a geometric one.
+**1. Always run a permutation null (§5).** Every metric is uninterpretable
+without one, and the null is per-run. This costs one profiling pass.
 
-Use **`median_twin_jaccard`** to catch the failure lift cannot see: one
-occasion split many ways. Lift compares a cluster to the *population*; only
-this compares clusters to *each other*.
+**2. Judge on `excess` = observed − own null**, not on the raw metric.
 
-> [!WARNING]
-> **The reference points below are suspended — do not calibrate a new band
-> against them.** Both runs were scored before `profile_need_states.py`
-> restricted the lift baseline to *labelled* baskets. The ≤10-item run
-> clustered 23.3M of 57.1M baskets and was measured against a baseline that
-> still contained the 33.8M big baskets it had excluded, so an unknown part of
-> the 1.95 → 5.03 gap is that mismatch rather than the size split. Banding is
-> precisely the case this breaks: **every band labels a subset**, so every band
-> would have been scored against the baskets outside it.
->
-> Both rows carry `lift_basis="population"` in `experiment_log.csv`; current
-> runs carry `"clustered"`, and the two are not comparable. Re-run
-> `profile_need_states.py` then `evaluate_run.py` on both label files to get a
-> valid pair, and replace this table with what they report.
+**3. Use the basket-weighted number for anything a stakeholder sees.** The
+profile log's `BASKETS in a need-state with max lift > 3` line. Community-
+weighted medians mislead when community sizes are heavy-tailed.
 
-Reference points from the two completed runs (**pre-fix, not comparable**):
+**4. Read `median_twin_jaccard` against its null** to catch the failure lift
+cannot see: one occasion split many ways. Lift compares a cluster to the
+population; only this compares clusters to each other.
 
-| run | median max lift | lift > 3 | twin Jaccard |
-|---|---|---|---|
-| all 57.1M baskets | 1.95 | 15% | not measured |
-| ≤10 items | **5.03** | **97%** | 0.429, 0 identical |
+**5. Do not use modularity.** A kNN graph is locally connected by construction,
+so Leiden returns tidy modular partitions over structureless data. Modularity
+0.4145 was read as evidence of structure in the full-population run; lift later
+showed those clusters were meaningless.
 
-Until those are regenerated, judge a band on `median_twin_jaccard` — which is
-computed from product sets, not from the baseline, and is therefore unaffected
-— and on whether its lift beats the *full-population run re-scored on the same
-basis*, not on the numbers above.
+**6. `pct_lift_over_3` in `experiment_log.csv` is computed over *profiled*
+need-states and is misleading across runs with different thin-profile rates.**
+Band S reads 27.6% against the baseline's 15.5% — apparently 1.8× better. Over
+all communities it is 3.0% vs 12.4%, i.e. 4× worse. Divide by `n_communities`.
+
+### Current reference points — all on `lift_basis="clustered"`, all null-corrected
+
+| run | obs | null | excess | % of baskets, lift>3 |
+|---|---|---|---|---|
+| baseline all 57.1M | 1.949 | 1.255 | **0.694** | **10%** |
+| M 11–20 | 1.811 | 1.234 | 0.577 | 6% |
+| L 21+ | 1.732 | 1.261 | 0.471 | 4% |
+| S ≤10 | 1.639 | 1.199 | 0.440 | 20% |
+
+A new run should beat the baseline's **0.694 excess** and **10% basket
+coverage**. Anything scored before 2026-09-29 carries `lift_basis="population"`
+or a blank, and is not comparable to these.
+
+---
+
+## 11. Open questions this investigation did not answer
+
+**How many need-states should there be?** Excess-over-null cannot answer it —
+max lift rewards over-splitting, and the null falls as clusters shrink, so both
+terms move the wrong way together. The clean answer is **held-out product
+prediction**: leave one product out, score it under the need-state's
+distribution versus the population's, average the log ratio in bits. It peaks
+at the true cluster count, has an absolute zero, and needs no null. It is one
+SQL query over the `ns_product_counts` and `product_baseline` tables
+`profile_need_states.py` already builds. Not yet implemented.
+
+**Is 10% basket coverage good?** It is unambiguously above chance — the null is
+zero — but it means 90% of shopping weeks sit in a need-state with no signature.
+Whether that is a floor imposed by the week grain (§9) or something the method
+can improve is not established.
+
+**Does `top_product_coverage` measure the right product?** It takes the rank-1
+product *by lift*, which is systematically the rarest one clearing the 200-basket
+floor — so it is pinned near that floor by construction and reads ~0.3% almost
+everywhere. The "marker vs description" question it was built to answer needs
+the best-covered product among the enriched ones, not the highest-lift one.

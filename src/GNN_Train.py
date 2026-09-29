@@ -208,6 +208,10 @@ def train_and_embed(
     lmdb_graph_cache.load_or_build_lmdb_cache(
         sampled, G, LMDB_TRAINING_GRAPHS_PATH, LMDB_MANIFEST_PATH,
         seed=config.SEED, n_train_samples_requested=N_TRAIN_SAMPLES,
+        # PIPELINE_LMDB_MAP_SIZE_GB existed in config.py and .env.example but
+        # was read by nothing: this call omitted map_size, so the hardcoded
+        # 200GB default always won and the knob was silently inert.
+        map_size=config.LMDB_MAP_SIZE_GB * 1024 ** 3,
     )
     train_dataset = lmdb_graph_cache.LMDBGraphDataset(LMDB_TRAINING_GRAPHS_PATH)
     print(f"  Training graphs ready: {len(train_dataset):,} (LMDB-backed, lazy random access)")

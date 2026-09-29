@@ -53,6 +53,17 @@ WHAT IS CHECKED, AND WHY EACH ONE EXISTS
                     reports. Both are pinned against the implementation they
                     replaced — observability was the goal, changed cluster
                     assignments would be a regression.
+10 PRODUCT KEY     the basket side's tpnb must actually JOIN to the embedding
+   WIRING           table. It did not: `tpnb` is an int in the basket export and
+                    a str in both product extracts, so prepare_globals matched
+                    NOTHING and every node carried an all-zero embedding,
+                    sub_cluster_id 0.0 and distinctiveness 0.5 — with in_dim
+                    still 388 and nothing in the log to show for it. Checks 4-6
+                    could not see this because their synthetic catalog is
+                    str-keyed on both sides; this one uses INTEGER tpnb and goes
+                    through parquet_loader, i.e. the production path. Also pins
+                    the product-index ORDERING, which copurchase_sparse.npz
+                    depends on and cannot detect a change to.
 """
 
 import argparse
@@ -701,8 +712,52 @@ def check_copurchase_chunk_additivity():
         return False
 
     print(f"  {n_baskets} baskets in chunks of {chunk} == single-shot, exactly — OK")
-    print("PASSED")
-    return True
+
+    # ── X must be a BINARY incidence matrix, not a count ─────────────────
+    # The chunk above was built with replace=False, so it never exercised the
+    # thing that actually bites: pipeline_main builds X_chunk straight from COO
+    # coordinates, and scipy SUMS duplicate (row, col) entries. build_baskets_
+    # table does `list(tpnb)`, not `list(DISTINCT tpnb)`, so a product listed
+    # twice in one basket becomes a 2 — and X.T @ X then stops meaning "how
+    # many baskets contained both A and B". Every node's cp_score and every
+    # edge weight in the pipeline reads off that matrix.
+    ok = True
+    # Two baskets, both holding products 0 and 1; basket 0 lists product 1 twice.
+    dup_rows, dup_cols = [0, 0, 0, 1, 1], [0, 1, 1, 0, 1]
+    truth = np.array([[2, 2], [2, 2]], dtype=np.int32)   # binary incidence answer
+
+    def _coo(shape=(2, 2)):
+        return sp.csr_matrix(
+            (np.ones(len(dup_rows), dtype=np.int32), (dup_rows, dup_cols)), shape=shape)
+
+    unclamped = _coo()
+    if unclamped.data.max() <= 1:
+        print("  NOTE: this scipy build did not sum duplicate COO entries, so the "
+              "clamp is a no-op here rather than a fix — the assertion below still "
+              "holds, but it is not evidence on this version.")
+    elif np.array_equal((unclamped.T @ unclamped).toarray(), truth):
+        ok = _fail("duplicate-product baskets did not distort X.T@X, so this test is "
+                   "no longer exercising anything — rewrite it before trusting it")
+    else:
+        print(f"  duplicated product inflates the raw counts to "
+              f"{(unclamped.T @ unclamped).toarray().tolist()} vs the true "
+              f"{truth.tolist()} — the hazard is real")
+
+    clamped = _coo()
+    np.minimum(clamped.data, 1, out=clamped.data)     # exactly what pipeline_main does
+    if clamped.data.dtype != np.int32:
+        ok = _fail(f"the clamp changed X_chunk.data dtype to {clamped.data.dtype} — "
+                   f"int32 is what the accumulator expects")
+    if not np.array_equal((clamped.T @ clamped).toarray(), truth):
+        ok = _fail(f"clamped X.T@X is {(clamped.T @ clamped).toarray().tolist()}, "
+                   f"expected {truth.tolist()} — the binary-incidence clamp in "
+                   f"pipeline_main does not restore the correct co-purchase counts")
+    else:
+        print("  np.minimum(data, 1) restores exact basket-incidence counts, "
+              "dtype preserved — OK")
+
+    print("PASSED" if ok else "FAILED")
+    return ok
 
 
 # ─────────────────────────────────────────────
@@ -2550,6 +2605,243 @@ def check_clustering_progress():
 # RUNNER
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# 10. PRODUCT KEY WIRING
+# ─────────────────────────────────────────────
+
+def check_product_key_wiring():
+    """
+    The basket side's product ids must actually JOIN to the embedding table.
+
+    THE BUG THIS PINS
+    ─────────────────
+    `tpnb` is an int in cltv_hh_metrics_tpnb_base and
+    ns_household_tpnb_week_agg_train.sql does not cast it, so
+    build_baskets_table handed pipeline_main int product ids. The two
+    PRODUCT-side extracts DO cast (ns_tpnb_to_tpna_mapping.sql:
+    `CAST(tpnb AS STRING)`), and parquet_loader casts again with .astype(str).
+    prepare_globals then did `if product in product_embedding:` across those
+    two key spaces — a lookup that can never match, with no else branch and no
+    counter behind it.
+
+    Result: emb_matrix all zeros, sub_cluster_id 0.0 for every product,
+    distinctiveness 0.5 for every product. 386 of 388 node-feature dimensions
+    constant, in_dim still 388, "Selected k=400" still printed, and no line
+    anywhere in a multi-hour run out of place. The need-states that came out
+    had no product identity in them at all.
+
+    WHY THE EXISTING SUITE COULD NOT SEE IT
+    ───────────────────────────────────────
+    build_synthetic_catalog() uses tpnbs like "P000" — strings on BOTH sides —
+    and check_functional() passes its own product_id_to_index rather than the
+    one build_baskets_table produces. The real wiring was never exercised. So
+    this check deliberately uses INTEGER tpnb in the raw export and goes
+    through parquet_loader, i.e. the production path, end to end.
+
+    Also pins the product-index ORDERING, which is load-bearing and invisible:
+    copurchase_sparse.npz is fingerprinted on (n_baskets, n_products) only, so
+    a reordering of product_id_to_index would be silently reused against the
+    wrong products. The DISTINCT query must group and order by the RAW tpnb,
+    not the VARCHAR cast — the ids below are chosen so numeric and
+    lexicographic order differ.
+    """
+    print()
+    print("=" * 70)
+    print("10. PRODUCT KEY WIRING: basket tpnb must join to the embedding table")
+    print("=" * 70)
+
+    import GraphBuilder as gb
+    from GraphBuilder import prepare_globals
+    import basket_store
+    import duckdb_manager
+    import parquet_loader
+
+    ok = True
+    rng = np.random.default_rng(7)
+    emb_dim = 16
+    dataset_tag = "pytest_keys"
+    raw_dir = Path("test_keywiring_raw")
+    emb_path = Path("test_keywiring_embeddings.parquet")
+
+    saved_candidates, saved_sil, saved_cache = (
+        gb.SUBCL_K_CANDIDATES, gb.SUBCL_SIL_SAMPLE, gb.SUBCL_CACHE_PATH)
+    gb.SUBCL_K_CANDIDATES = [2, 3]
+    gb.SUBCL_SIL_SAMPLE = 30
+    gb.SUBCL_CACHE_PATH = "test_keywiring_subclusters.pkl"
+
+    con = duckdb_manager.get_connection()
+
+    def _cleanup():
+        gb.SUBCL_K_CANDIDATES, gb.SUBCL_SIL_SAMPLE, gb.SUBCL_CACHE_PATH = (
+            saved_candidates, saved_sil, saved_cache)
+        shutil.rmtree(raw_dir, ignore_errors=True)
+        emb_path.unlink(missing_ok=True)
+        Path("test_keywiring_subclusters.pkl").unlink(missing_ok=True)
+        Path("test_keywiring_subclusters.pkl.tmp").unlink(missing_ok=True)
+        try:
+            basket_store.drop_all(con, dataset_tag)
+        except Exception:
+            pass
+
+    _cleanup()
+
+    try:
+        # Hand-picked, not random: 1-to-3-digit ids so that numeric order
+        # (2, 3, 4, ... 100, 101, ...) and text order ("100", "101", "12", ...)
+        # genuinely disagree. Any switch to ORDER BY the VARCHAR then shows up
+        # as a failure below rather than as a silently repermuted co-purchase
+        # matrix. A random draw would usually distinguish the two but is not
+        # guaranteed to, and a test that is only probably discriminating is not
+        # worth having.
+        tpnb_ints = sorted({
+            2, 3, 4, 6, 7, 8, 9, 12, 15, 20, 21, 30, 40, 42, 55,
+            60, 80, 100, 101, 120, 150, 200, 210, 250, 300, 400, 550, 600, 800, 999,
+        })
+        assert [str(t) for t in tpnb_ints] != sorted(str(t) for t in tpnb_ints), \
+            "test ids must distinguish numeric from lexicographic ordering"
+
+        # ── Raw export, with tpnb as an INT — the real warehouse shape ──
+        rows = []
+        for b in range(40):
+            size = int(rng.integers(2, 8))
+            for p in rng.choice(tpnb_ints, size=size, replace=False):
+                rows.append({
+                    "household_number": 1000 + b,
+                    "tpnb": int(p),
+                    "year_number": 2026,
+                    "period_number": 1 + (b % 10) // 4,
+                    "week_number": 1 + (b % 10),
+                    "quantity": float(rng.integers(1, 4)),
+                })
+        raw_dir.mkdir()
+        raw = pd.DataFrame(rows)
+        raw["tpnb"] = raw["tpnb"].astype("int64")
+        raw.to_parquet(raw_dir / "part-0.parquet", index=False)
+
+        # ── Embedding table, also written with an INT tpnb. The production
+        # SQL casts to STRING and parquet_loader casts again, so this is the
+        # harsher case: the loader's .astype(str) is the only normalisation,
+        # and the basket side has to meet it there.
+        pd.DataFrame({
+            "tpnb": np.array(tpnb_ints, dtype="int64"),
+            "embedding": [rng.normal(size=emb_dim).astype(np.float32) for _ in tpnb_ints],
+        }).to_parquet(emb_path, index=False)
+
+        # ── Exactly what pipeline_main.py Stage 0 does ──
+        product_df = parquet_loader.load_product_embeddings(emb_path)
+        product_embedding = dict(zip(product_df["tpnb"], product_df["embedding"]))
+
+        n_baskets, product_units_avg, product_uniques = basket_store.build_baskets_table(
+            con, raw_dir, dataset_tag, min_basket_products=2,
+        )
+        product_id_to_index = {pid: idx for idx, pid in enumerate(product_uniques)}
+
+        # ── Key TYPE on the basket side ──
+        sample_key = next(iter(product_id_to_index))
+        if not isinstance(sample_key, str):
+            ok = _fail(f"build_baskets_table returned product ids as "
+                       f"{type(sample_key).__name__} ({sample_key!r}), not str — these "
+                       f"cannot match parquet_loader's .astype(str) embedding keys")
+        else:
+            print(f"  product_uniques are str (e.g. {sample_key!r}) — OK")
+
+        # ── Key type inside the stored basket rows ──
+        stored = con.execute(
+            f'SELECT products FROM "baskets_{dataset_tag}" LIMIT 1').fetchone()[0]
+        if not isinstance(stored[0], str):
+            ok = _fail(f"baskets_{dataset_tag}.products holds "
+                       f"{type(stored[0]).__name__}, not str — _basket_dense_cp_submatrix "
+                       f"would fail every pid2idx lookup and build empty graphs")
+        else:
+            print(f"  baskets.products elements are str (e.g. {stored[0]!r}) — OK")
+
+        # ── Index ORDERING: numeric, not lexicographic ──
+        expected_order = [str(t) for t in tpnb_ints]
+        if list(product_uniques) != expected_order:
+            lexi = sorted(expected_order)
+            hint = (" — this is LEXICOGRAPHIC order, so the DISTINCT query is ordering "
+                    "by the VARCHAR cast instead of the raw tpnb. Every product index "
+                    "shifts, and copurchase_sparse.npz (fingerprinted on basket/product "
+                    "COUNTS only) would be reused against the wrong products."
+                    if list(product_uniques) == lexi else "")
+            ok = _fail(f"product_id_to_index ordering changed{hint}\n"
+                       f"      got      {list(product_uniques)[:6]}\n"
+                       f"      expected {expected_order[:6]}")
+        else:
+            print(f"  product index order is numeric by raw tpnb "
+                  f"({expected_order[:4]}...) — OK")
+
+        # ── THE CHECK: do the two sides actually join? ──
+        n_prod = len(product_id_to_index)
+        r, c, v = [], [], []
+        for _ in range(120):
+            i, j = rng.integers(0, n_prod, size=2)
+            if i == j:
+                continue
+            w = float(rng.integers(1, 10))
+            r += [i, j]; c += [j, i]; v += [w, w]
+        copurchase = sp.csr_matrix((v, (r, c)), shape=(n_prod, n_prod))
+
+        G = prepare_globals(
+            product_embedding=product_embedding,
+            product_id_to_index=product_id_to_index,
+            copurchase_sparse=copurchase,
+            product_units_avg=product_units_avg,
+        )
+
+        n_with_embedding = int((G["emb_matrix"] != 0).any(axis=1).sum())
+        if n_with_embedding != n_prod:
+            ok = _fail(f"only {n_with_embedding} of {n_prod} products carry a non-zero "
+                       f"embedding — the basket/embedding key spaces do not meet, so "
+                       f"every unmatched node is an all-zero 384-dim vector and the "
+                       f"need-states carry no product identity")
+        else:
+            print(f"  all {n_prod} products carry a real embedding vector — OK")
+
+        n_subcl = len(np.unique(G["subcluster_arr"]))
+        if n_subcl < 2:
+            ok = _fail(f"subcluster_arr has {n_subcl} distinct value(s) — every product "
+                       f"fell through to the 0.0 default, so node feature [emb_dim+1] "
+                       f"is constant")
+        else:
+            print(f"  subcluster_arr has {n_subcl} distinct values (not the 0.0 "
+                  f"fallback) — OK")
+
+        if np.allclose(G["distinctiveness_arr"], 0.5):
+            ok = _fail("distinctiveness_arr is 0.5 everywhere — every product fell "
+                       "through to the default, so node feature [emb_dim+2] is constant")
+        else:
+            print("  distinctiveness_arr is not the constant 0.5 fallback — OK")
+
+        # ── The guard itself must refuse a zero overlap, loudly ──
+        try:
+            gb._check_product_key_overlap(
+                0, {1: 0, 2: 1}, {"1": np.zeros(4), "2": np.zeros(4)})
+            ok = _fail("_check_product_key_overlap accepted a zero-overlap key space — "
+                       "the all-zero embedding matrix would go through silently again")
+        except ValueError as e:
+            message = str(e)
+            # Matched on the exact rendered lines, not on bare "int"/"str" —
+            # both words also occur in the message's static prose, so a looser
+            # check would pass even if the type reporting were removed. Naming
+            # the two types IS the diagnostic; without it the error says only
+            # that nothing matched.
+            named = ("basket-side product id: int" in message
+                     and "embedding-side product id: str" in message)
+            if named:
+                print("  _check_product_key_overlap raises on zero overlap and names "
+                      "both key types — OK")
+            else:
+                ok = _fail(f"_check_product_key_overlap raised but did not report the "
+                           f"two key types, which is the whole diagnostic: "
+                           f"{message[:160]}")
+    finally:
+        _cleanup()
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fast", action="store_true",
@@ -2604,6 +2896,8 @@ def main():
     ]
     if not args.fast:
         checks.append(("functional / parity / basket store", check_functional))
+        checks.append(("product key wiring / embeddings reach the graph",
+                       check_product_key_wiring))
     if args.prod_outputs:
         checks.append(("prod outputs", check_prod_outputs))
 

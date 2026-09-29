@@ -84,7 +84,19 @@ SEED                 = config.SEED
 #    neighbours). Edge feature [1] changes value, so every graph cached under
 #    version 2 is stale — this bump forces the LMDB cache to rebuild instead of
 #    training on the old edge scaling.
-GRAPH_BUILDER_VERSION = 3
+# 4: product ids are now VARCHAR on both sides of the join (basket_store.py's
+#    CAST(tpnb AS VARCHAR)). Before this, basket-side ids were int and
+#    embedding-side ids were str, so prepare_globals() matched NOTHING: every
+#    node carried an all-zero 384-dim embedding, sub_cluster_id 0.0 and
+#    distinctiveness 0.5. Node features [0:emb_dim], [emb_dim+1] and
+#    [emb_dim+2] all change value, which invalidates every cached graph and
+#    every set of weights trained on them — hence the bump, which forces both
+#    the LMDB cache and the model to rebuild.
+#    NOT covered by any fingerprint: basket_gnn_embeddings.parquet and the
+#    embeddings_chunk_*.parquet files behind it. Delete them by hand (or run
+#    reset_inference.py --yes) or the run will cluster vectors produced by the
+#    old, feature-less model.
+GRAPH_BUILDER_VERSION = 4
 
 # All pipeline-produced artifacts (caches, models, embeddings) live under
 # this folder rather than scattered in the working directory. Created here
@@ -363,6 +375,69 @@ def build_product_subclusters(product_embedding):
 # PREPARE GLOBALS
 # ─────────────────────────────────────────────
 
+def _check_product_key_overlap(n_matched, product_id_to_index, product_embedding):
+    """
+    Count the products that actually got an embedding, and say so out loud.
+
+    This existed as a bare `if product in product_embedding:` with no else and
+    no counter. When the two sides were keyed differently — basket ids as int
+    from DuckDB, embedding ids as str from parquet_loader — it matched zero
+    products and left emb_matrix entirely zero. in_dim was still 388, the
+    sub-clustering step still ran and still reported "Selected k=400", and
+    nothing anywhere in the log was out of place. The clustering that followed
+    had no product identity in it at all, which is what a median max product
+    lift of 1.95 across 356 need-states looks like from the other end.
+
+    A zero overlap is always a bug, never a data property, so it raises. A
+    partial overlap is legitimate (the catalog's long tail has no embedding —
+    see build_product_embeddings.py's SCOPE note) so it warns with a count.
+    """
+    n_products = len(product_id_to_index)
+    if n_products == 0:
+        # Distinct from "nothing matched" — there was nothing to match. Saying
+        # "0 of 0 (100%)" and then raising about a key mismatch would send
+        # whoever reads it to the wrong place entirely.
+        raise ValueError(
+            "product_id_to_index is empty — the basket table produced no products "
+            "at all. Check that the household x tpnb x week export under "
+            "PIPELINE_HOUSEHOLD_WEEK_TRAIN is non-empty and that its period filter "
+            "(ns_household_tpnb_week_agg_train.sql's BETWEEN clause) actually "
+            "selects rows."
+        )
+
+    share = n_matched / n_products
+    print(f"  Product embeddings matched: {n_matched:,} of {n_products:,} "
+          f"products ({share:.1%})")
+
+    if n_matched == 0:
+        def _describe(d, label):
+            k = next(iter(d), None)
+            return f"{label}: {type(k).__name__} e.g. {k!r}" if k is not None else f"{label}: empty"
+        raise ValueError(
+            "NONE of the products in the basket data matched the product embedding "
+            "table, so every node would carry an all-zero embedding vector, "
+            "sub_cluster_id 0.0 and distinctiveness 0.5 — the need-states this "
+            "produces contain no product information whatsoever.\n"
+            f"  {_describe(product_id_to_index, 'basket-side product id')}\n"
+            f"  {_describe(product_embedding, 'embedding-side product id')}\n"
+            "  Almost always a key TYPE mismatch: `tpnb` is an int in\n"
+            "  cltv_hh_metrics_tpnb_base, while ns_tpnb_to_tpna_mapping.sql and\n"
+            "  parquet_loader.load_product_embeddings() both cast it to str.\n"
+            "  basket_store.build_baskets_table() casts to VARCHAR to line the two\n"
+            "  up; if you are seeing this, check that cast survived, and that\n"
+            "  product_embeddings.parquet was built from the SAME warehouse export\n"
+            "  as the basket data (a mapping extract for a different period will\n"
+            "  also land here)."
+        )
+
+    if share < 0.5:
+        print(f"  WARNING: {n_products - n_matched:,} products ({1 - share:.1%}) have no "
+              f"embedding and fall back to an all-zero vector, sub_cluster_id 0.0 and "
+              f"distinctiveness 0.5. Those products carry no identity into the GNN. "
+              f"Check that product_embeddings.parquet covers the same period as the "
+              f"basket export before trusting the need-states.")
+
+
 def prepare_globals(product_embedding, product_id_to_index,
                     copurchase_sparse, product_units_avg):
     """
@@ -386,9 +461,15 @@ def prepare_globals(product_embedding, product_id_to_index,
     emb_dim    = len(sample_emb)
 
     emb_matrix = np.zeros((n_products, emb_dim), dtype=np.float32)
+    n_embedded = 0
     for product, idx in product_id_to_index.items():
         if product in product_embedding:
             emb_matrix[idx] = product_embedding[product]
+            n_embedded += 1
+    # Counted and reported before the expensive steps below, not after: a zero
+    # overlap here makes everything downstream meaningless, and it used to be
+    # completely silent. See _check_product_key_overlap.
+    _check_product_key_overlap(n_embedded, product_id_to_index, product_embedding)
 
     print("  Building product sub-clusters (global, no theme/category pre-grouping)...")
     product_subcluster, product_distinctiveness, best_k = \
@@ -399,6 +480,13 @@ def prepare_globals(product_embedding, product_id_to_index,
     distinctiveness_arr = np.zeros(n_products, dtype=np.float32)
     avg_units_arr        = np.ones(n_products, dtype=np.float32)
 
+    # These three .get() defaults are the same silent-fallback hazard the
+    # embedding lookup above had. product_subcluster and
+    # product_distinctiveness are keyed by whatever product_embedding was keyed
+    # by, so _check_product_key_overlap already governs both — a run that gets
+    # past it cannot land on 0.0/0.5 for every product. product_units_avg comes
+    # from DuckDB instead, so it shares the basket side's key space by
+    # construction.
     for product, idx in product_id_to_index.items():
         subcluster_arr[idx]      = product_subcluster.get(product, 0.0)
         distinctiveness_arr[idx] = product_distinctiveness.get(product, 0.5)
@@ -887,6 +975,31 @@ def merge_inference_output(dataset_tag, output_dir=None, final_path=None):
                                  f"{output_dir} to merge.")
 
     merged = pd.concat([pd.read_parquet(p) for p in chunk_paths], ignore_index=True)
+
+    # Refuse a merge that contains the same basket twice, rather than writing
+    # it and letting Stage 2 cluster the duplicates.
+    #
+    # This glob takes whatever chunk files are on disk. ensure_inference_chunk_plan
+    # returns early when its table already exists, so changing
+    # INFERENCE_CHUNK_BASKETS after a partial run re-plans nothing but DOES
+    # renumber nothing either — the risk is a chunk plan rebuilt (or a dataset
+    # re-tagged) while the previous run's chunk parquet is still sitting there.
+    # Those orphans merge in silently, and the only symptom is a basket count
+    # that nobody was checking.
+    n_dup = int(merged["basket_id"].duplicated().sum())
+    if n_dup:
+        raise ValueError(
+            f"{n_dup:,} duplicate basket_id(s) across the {len(chunk_paths)} "
+            f"embeddings_chunk_{dataset_tag}_*.parquet files under {output_dir} "
+            f"({len(merged):,} rows, {merged['basket_id'].nunique():,} distinct).\n"
+            f"  Almost always leftover chunk files from an earlier run with a "
+            f"different chunk plan or a different model.\n"
+            f"  Clear them with:  python reset_inference.py --dataset-tag "
+            f"{dataset_tag} --yes\n"
+            f"  then rerun the inference pass. Merging these would cluster the same "
+            f"basket twice, from two different embedding spaces."
+        )
+
     merged.to_parquet(final_path, index=False)
     print(f"Merged {len(chunk_paths)} chunk files ({len(merged):,} baskets total) into {final_path}")
     return merged

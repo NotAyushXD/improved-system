@@ -336,6 +336,22 @@ def main():
             (np.ones(len(chunk_items), dtype=np.int32), (local_basket_codes, product_idx)),
             shape=(local_basket_codes.max() + 1, n_products_cp),
         )
+        # X must be a BINARY incidence matrix for X.T @ X to mean "how many
+        # baskets contained both A and B". scipy sums duplicate (row, col)
+        # entries when building from COO, so a product appearing twice in one
+        # basket's `products` list becomes a 2 — and every co-purchase count
+        # involving it is then inflated quadratically, with nothing to show for
+        # it in the output.
+        #
+        # build_baskets_table does `list(tpnb)`, not `list(DISTINCT tpnb)`, so
+        # that depends on (household, year_week, tpnb) being unique in the
+        # export. It is, given the source SQL's GROUP BY — unless a retail week
+        # ever straddles two period_numbers, in which case the same week
+        # produces two rows and nothing here would notice. build_one_graph
+        # already de-duplicates products, so only this matrix was exposed.
+        # Clamping costs one pass over the chunk's nonzeros and removes the
+        # assumption entirely.
+        np.minimum(X_chunk.data, 1, out=X_chunk.data)
         copurchase_sparse = (copurchase_sparse + (X_chunk.T @ X_chunk)).tocsr()
         del chunk_df, chunk_items, local_basket_codes, product_idx, X_chunk
         gc.collect()

@@ -403,7 +403,11 @@ GMM_MAX_ITER = _int("PIPELINE_GMM_MAX_ITER", 100, minimum=1)
 # exact duplicate points exist in large numbers, and a component landing on a
 # pile of duplicates has essentially zero variance.
 #
-# 1e-4 gives that floor real margin. Raise further if the fit still aborts.
+# The default below is still sklearn's 1e-6, NOT the 1e-4 the paragraph above
+# argues for — deliberately, because raising it changes the fitted model and
+# that is a modelling decision, not a bug fix. If the fit aborts with
+# "ill-defined empirical covariance", set PIPELINE_GMM_REG_COVAR=1e-4 in .env;
+# cluster_basket_embeddings_gmm's error handler names that as the first remedy.
 GMM_REG_COVAR = _float("PIPELINE_GMM_REG_COVAR", 1e-6, minimum=0.0)
 
 ASSIGN_NEW_BASKET_K = _int("PIPELINE_ASSIGN_NEW_BASKET_K", 15, minimum=1)

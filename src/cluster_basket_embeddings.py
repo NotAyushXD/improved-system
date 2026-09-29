@@ -979,9 +979,32 @@ def assign_new_baskets_to_clusters(
         assigned cluster — low values flag baskets sitting between need-states)
     """
     k = k if k is not None else config.ASSIGN_NEW_BASKET_K
-    ref = reference_embeddings.merge(
-        reference_clusters[["basket_id", "need_state_cluster"]], on="basket_id", how="inner"
-    )
+
+    # UNCLUSTERED (-1) is the ABSENCE of a need-state, not one to vote for.
+    # Leaving it in the reference set lets a new basket surrounded by unplaced
+    # neighbours be "assigned" to need-state -1 with a confidence score
+    # attached — inventing a need-state that every uncovered basket appears to
+    # belong to, which is exactly what pipeline_main.py's Stage 2.5 goes out of
+    # its way to prevent. Harmless at 100% coverage, wrong the moment coverage
+    # drops, and silent either way.
+    reference_clusters = reference_clusters[["basket_id", "need_state_cluster"]]
+    n_unclustered = int((reference_clusters["need_state_cluster"] == UNCLUSTERED).sum())
+    if n_unclustered:
+        print(f"  Excluding {n_unclustered:,} UNCLUSTERED reference baskets "
+              f"({n_unclustered / len(reference_clusters):.1%}) — they have no need-state "
+              f"to vote for. New baskets whose neighbours were all unplaced will get a "
+              f"low cluster_confidence rather than a fabricated need-state.")
+        reference_clusters = reference_clusters[
+            reference_clusters["need_state_cluster"] != UNCLUSTERED
+        ]
+
+    ref = reference_embeddings.merge(reference_clusters, on="basket_id", how="inner")
+    if len(ref) == 0:
+        raise ValueError(
+            "No reference baskets left to vote over — reference_embeddings and "
+            "reference_clusters share no basket_id, or every reference basket is "
+            f"UNCLUSTERED ({n_unclustered:,} of them were)."
+        )
     if len(ref) < ref["basket_id"].nunique():
         raise ValueError("Duplicate basket_id in reference_embeddings after merge — dedupe first.")
 
@@ -1309,9 +1332,11 @@ if __name__ == "__main__":
                   f"PIPELINE_BASKET_KNN_K={_k} in .env before running it.")
         if not _mutual:
             print(f"  One-directional: every basket keeps its {_k} neighbours whether "
-                  f"or not they are returned, so coverage is 100% by construction. "
-                  f"Expect roughly {len(_frame) * _k / 1e6:,.0f}M candidate pairs before "
-                  f"deduplication — several times the mutual graph.")
+                  f"or not they are returned, so coverage is 100% except for baskets "
+                  f"whose every neighbour has cosine similarity <= 0 (the `sim > 0` "
+                  f"filter) — measured 100% here, but read the Coverage line rather "
+                  f"than assuming it. Expect roughly {len(_frame) * _k / 1e6:,.0f}M "
+                  f"candidate pairs before deduplication — several times the mutual graph.")
         _cache = _edge_cache_path(_k, _mutual, subset_tag=_band)
         _edges = build_basket_knn_graph(_frame, k=_k, use_mutual=_mutual,
                                         cache_path=_cache)
@@ -1326,6 +1351,13 @@ if __name__ == "__main__":
               f"  community and 0.05 put 100% of them there. 1.0-3.0 is a stable\n"
               f"  plateau where modularity varies only ~3%.")
     else:
-        _table = coverage_probe(_frame, k_values=args.k)
+        # --k defaults to None so that --build-edges can fall through to
+        # PIPELINE_BASKET_KNN_K (see the parser note above). The probe has its
+        # own default, which lives on coverage_probe's signature — passing
+        # k_values=None straight through raised TypeError on the very first
+        # line of it, so `python cluster_basket_embeddings.py` with no
+        # arguments crashed instead of running the documented 10/15/20/30/50.
+        _table = (coverage_probe(_frame) if args.k is None
+                  else coverage_probe(_frame, k_values=args.k))
         _table.to_csv(args.out, index=False)
         print(f"\nSaved {args.out}")
