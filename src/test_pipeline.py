@@ -38,6 +38,11 @@ WHAT IS CHECKED, AND WHY EACH ONE EXISTS
    GRAPH            need_state_graph.py, pinned to hand-computed values,
                     including the year-boundary week-ranking that a naive
                     subtraction gets wrong.
+ 7b LIFT FORMULA   profile_need_states.py's lift must be blind to basket size
+                    (pinned against a pure-size null where the true lift is 1.0
+                    everywhere) and must score need-states against LABELLED
+                    baskets only. A wrong lift does not crash — it silently
+                    reorders every profile and every label built from one.
  8 PROD OUTPUTS    opt-in sanity checks against real artifacts in ../data/output
                     (embedding collapse, degenerate clusters, label coverage).
                     Skipped automatically when those files are absent.
@@ -1279,6 +1284,207 @@ def check_need_state_graph():
 
 
 # ─────────────────────────────────────────────
+# 7b. LIFT FORMULA
+# ─────────────────────────────────────────────
+
+def check_lift_formula():
+    """
+    Two properties of profile_need_states.py's lift that are invisible in the
+    output and expensive to get wrong, because a broken lift does not crash —
+    it silently reorders every need-state's profile and every label built from
+    it.
+
+      A  Lift is an ITEM share ratio, so it must be blind to basket size.
+         Pinned against a pure-size null: identical product mix in both
+         need-states, only trip size differing, so the true lift is 1.0
+         everywhere. Basket-incidence lift — the natural-looking alternative
+         that has been proposed twice — returns 0.75 and 1.50 on exactly this
+         data.
+
+      B  The baseline covers LABELLED baskets only. A run that labels a subset
+         must not be scored against the baskets it excluded. This is the bug
+         that inflated the <=10-item run's headline lift against the full
+         population's, and nothing in the output revealed it.
+    """
+    print()
+    print("=" * 70)
+    print("7b. LIFT FORMULA — size-blind, and scored against labelled baskets only")
+    print("=" * 70)
+    try:
+        import duckdb_manager
+        import profile_need_states as pns
+        from cluster_basket_embeddings import UNCLUSTERED
+    except ImportError as e:
+        # "SKIP", not True — a skipped check reporting PASS in the summary is
+        # worse than no check at all.
+        print(f"  SKIP — profile_need_states not importable here ({e})")
+        print("SKIPPED")
+        return "SKIP"
+
+    ok = True
+    con = duckdb_manager.get_connection()
+
+    def _profile(rows, labels):
+        """
+        Build a baskets table + label frame from (basket_id, [tpnb...]) rows and
+        run the REAL build_counts/build_profiles over them. top_n is larger than
+        the catalog and min_product_baskets is 1, so nothing is filtered and the
+        shares below cover every product.
+        """
+        long = pd.DataFrame([(b, str(t)) for b, prods in rows for t in prods],
+                            columns=["basket_id", "tpnb"])
+        con.register("lift_long", long)
+        con.execute("""
+            CREATE OR REPLACE TEMP TABLE lift_baskets AS
+            SELECT basket_id, CAST(1 AS BIGINT) AS household_number,
+                   list(tpnb) AS products
+            FROM lift_long GROUP BY basket_id
+        """)
+        # build_profiles LEFT JOINs this, so it has to exist.
+        con.execute("""
+            CREATE OR REPLACE TEMP VIEW product_lookup AS
+            SELECT DISTINCT tpnb, 'product ' || tpnb AS description,
+                   'dept' AS department
+            FROM lift_long
+        """)
+        con.register("clusters", pd.DataFrame({
+            "basket_id": list(labels.keys()),
+            "need_state_cluster": list(labels.values()),
+        }))
+        pns.build_counts(con, "lift_baskets", "need_state_cluster")
+        return pns.build_profiles(con, top_n=50, min_product_baskets=1)
+
+    # ---- A. pure-size null -------------------------------------------------
+    # Need-state 0: 60 baskets of 2 products. Need-state 1: 30 baskets of 4.
+    # The round-robin gives every product exactly 20 baskets in EACH need-state,
+    # so the item mix is identical and only trip size differs.
+    rows, labels = [], {}
+    for b in range(60):
+        rows.append((f"small_{b}", [(2 * b) % 6, (2 * b + 1) % 6]))
+        labels[f"small_{b}"] = 0
+    for b in range(30):
+        rows.append((f"big_{b}", [(4 * b + i) % 6 for i in range(4)]))
+        labels[f"big_{b}"] = 1
+    prof = _profile(rows, labels)
+
+    if len(prof) != 12:
+        ok = _fail(f"expected 6 products x 2 need-states = 12 profiled rows, got {len(prof)}")
+    worst = float((prof["lift"] - 1.0).abs().max())
+    if worst > 1e-9:
+        ok = _fail(
+            f"pure-size null: every lift should be exactly 1.000 — both need-states hold "
+            f"the same product mix and differ only in basket size — but the worst "
+            f"deviation is {worst:.4f} (lift range "
+            f"{prof['lift'].min():.4f}..{prof['lift'].max():.4f}).\n"
+            f"    0.75 and 1.50 mean the denominator was changed from items to baskets, "
+            f"which makes lift scale with trip size. See the module docstring in "
+            f"profile_need_states.py."
+        )
+    else:
+        print("  pure-size null: all 12 lifts are exactly 1.000 — trip size is divided "
+              "out, not rewarded — OK")
+
+    sums = prof.groupby("need_state")["share_within_need_state"].sum()
+    if float((sums - 1.0).abs().max()) > 1e-9:
+        ok = _fail(f"share_within_need_state is a share of a need-state's items and must "
+                   f"sum to 1.0 across its products; got {sums.round(6).to_dict()}")
+    else:
+        print("  share_within_need_state sums to exactly 1.0 per need-state — OK")
+
+    # ---- B. baseline must ignore unlabelled baskets ------------------------
+    # Each need-state is two products, each filling half its items. Population
+    # items are 4x each product's need-state count, so every lift is 2.0.
+    rows, labels = [], {}
+    for b in range(40):
+        rows.append((f"a_{b}", [0, 1])); labels[f"a_{b}"] = 0
+        rows.append((f"b_{b}", [2, 3])); labels[f"b_{b}"] = 1
+    clean = _profile(rows, labels)
+
+    if abs(float(clean["lift"].min()) - 2.0) > 1e-9 or abs(float(clean["lift"].max()) - 2.0) > 1e-9:
+        ok = _fail(f"expected lift 2.0 for all four products (each fills half of its "
+                   f"need-state's items and a quarter of the population's); got "
+                   f"{clean['lift'].min():.4f}..{clean['lift'].max():.4f}")
+    else:
+        print("  a product filling half a need-state and a quarter of the population "
+              "scores lift 2.0 — OK")
+
+    # Same labelled baskets, plus 200 unlabelled ones stuffed with product 0.
+    # Half carry an explicit UNCLUSTERED label and half are absent from the
+    # label frame entirely — both routes out must be excluded from the baseline.
+    noisy_rows, noisy_labels = list(rows), dict(labels)
+    for b in range(200):
+        noisy_rows.append((f"junk_{b}", [0, 4, 5]))
+        if b % 2 == 0:
+            noisy_labels[f"junk_{b}"] = UNCLUSTERED
+    noisy = _profile(noisy_rows, noisy_labels)
+
+    merged = clean.merge(noisy, on=["need_state", "tpnb"], suffixes=("_clean", "_noisy"))
+    if len(merged) != len(clean):
+        ok = _fail(f"unlabelled baskets changed which (need-state, product) rows get "
+                   f"profiled: {len(clean)} rows before, {len(merged)} matched after")
+    elif float((merged["lift_clean"] - merged["lift_noisy"]).abs().max()) > 1e-9:
+        drift = float((merged["lift_clean"] - merged["lift_noisy"]).abs().max())
+        ok = _fail(
+            f"unlabelled baskets leaked into the lift baseline: adding 200 baskets that "
+            f"belong to NO need-state moved lift by up to {drift:.4f}.\n"
+            f"    product_baseline in build_counts() must JOIN clusters and filter "
+            f"'<> {UNCLUSTERED}', exactly as ns_product_counts does — otherwise a run "
+            f"that labels a subset is scored against the baskets it excluded."
+        )
+    else:
+        print("  200 unlabelled baskets (half UNCLUSTERED, half absent from the label "
+              "frame) left every lift unchanged — OK")
+
+    # ---- C. top_product_coverage recovers basket incidence ------------------
+    # share_within_need_state is an ITEM share, so it is capped by basket size:
+    # a product in EVERY basket of a 40-item need-state still only reaches
+    # 1/40. enrich_summary multiplies it back by the mean basket size to get a
+    # 0-1 number comparable across sizes. Here need-state 0 has 100 baskets, 80
+    # of them holding product 0, so coverage must come back as exactly 0.80.
+    rows, labels = [], {}
+    for b in range(80):
+        rows.append((f"c_{b}", [0, 1, 2])); labels[f"c_{b}"] = 0
+    for b in range(80, 100):
+        rows.append((f"c_{b}", [1, 2])); labels[f"c_{b}"] = 0
+    for b in range(100):
+        rows.append((f"d_{b}", [1, 2, 3])); labels[f"d_{b}"] = 1
+    prof_c = _profile(rows, labels)
+    summ = pns.enrich_summary(
+        pns.build_summary(con, "lift_baskets", "need_state_cluster"), prof_c)
+    ns0 = summ[summ["need_state"] == 0].iloc[0]
+
+    if abs(float(ns0["avg_products_per_basket"]) - 2.8) > 1e-9:
+        ok = _fail(f"fixture wrong: expected mean basket size 2.8, got "
+                   f"{ns0['avg_products_per_basket']}")
+    elif abs(float(ns0["top_share"]) - 80 / 280) > 1e-9:
+        ok = _fail(f"top_share should be product 0's ITEM share, 80/280 = "
+                   f"{80 / 280:.6f}; got {ns0['top_share']:.6f}. If it is 0.80 the "
+                   f"rank-1 row was read as a basket share.")
+    elif abs(float(ns0["top_product_coverage"]) - 0.80) > 1e-9:
+        ok = _fail(
+            f"top_product_coverage should recover the fraction of the need-state's "
+            f"baskets holding its signature product — 80 of 100 = 0.80 — but got "
+            f"{ns0['top_product_coverage']:.6f}. It is top_share * "
+            f"avg_products_per_basket; one of those is no longer what it was."
+        )
+    else:
+        print("  top_product_coverage recovers 80/100 baskets exactly from an item "
+              "share of 80/280 — OK")
+
+    for obj, kind in (("lift_baskets", "TABLE"), ("ns_product_counts", "TABLE"),
+                      ("product_baseline", "TABLE"), ("product_lookup", "VIEW")):
+        con.execute(f"DROP {kind} IF EXISTS {obj}")
+    for view in ("clusters", "lift_long"):
+        try:
+            con.unregister(view)
+        except Exception:
+            pass
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
+# ─────────────────────────────────────────────
 # 8. PROD OUTPUT SANITY (opt-in)
 # ─────────────────────────────────────────────
 
@@ -2391,6 +2597,7 @@ def main():
         ("graph primitives", check_graph_primitives),
         ("co-purchase additivity", check_copurchase_chunk_additivity),
         ("need-state graph", check_need_state_graph),
+        ("lift formula / profile baseline", check_lift_formula),
         ("clustering progress / graph build / Leiden parity", check_clustering_progress),
         ("graph coverage / no silent label loss", check_graph_coverage),
         ("label cache / no stale Leiden labels", check_label_cache),

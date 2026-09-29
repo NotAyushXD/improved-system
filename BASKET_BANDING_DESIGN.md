@@ -372,11 +372,29 @@ Use **`median_twin_jaccard`** to catch the failure lift cannot see: one
 occasion split many ways. Lift compares a cluster to the *population*; only
 this compares clusters to *each other*.
 
-Reference points from the two completed runs:
+> [!WARNING]
+> **The reference points below are suspended — do not calibrate a new band
+> against them.** Both runs were scored before `profile_need_states.py`
+> restricted the lift baseline to *labelled* baskets. The ≤10-item run
+> clustered 23.3M of 57.1M baskets and was measured against a baseline that
+> still contained the 33.8M big baskets it had excluded, so an unknown part of
+> the 1.95 → 5.03 gap is that mismatch rather than the size split. Banding is
+> precisely the case this breaks: **every band labels a subset**, so every band
+> would have been scored against the baskets outside it.
+>
+> Both rows carry `lift_basis="population"` in `experiment_log.csv`; current
+> runs carry `"clustered"`, and the two are not comparable. Re-run
+> `profile_need_states.py` then `evaluate_run.py` on both label files to get a
+> valid pair, and replace this table with what they report.
+
+Reference points from the two completed runs (**pre-fix, not comparable**):
 
 | run | median max lift | lift > 3 | twin Jaccard |
 |---|---|---|---|
 | all 57.1M baskets | 1.95 | 15% | not measured |
 | ≤10 items | **5.03** | **97%** | 0.429, 0 identical |
 
-A new band that lands near 1.95 has not worked. Near or above 5.03 has.
+Until those are regenerated, judge a band on `median_twin_jaccard` — which is
+computed from product sets, not from the baseline, and is therefore unaffected
+— and on whether its lift beats the *full-population run re-scored on the same
+basis*, not on the numbers above.

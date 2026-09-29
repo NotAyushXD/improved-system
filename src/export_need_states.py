@@ -8,7 +8,7 @@ between need-states, and writes five sheets:
 
   run_scorecard        one row per run — how good was this clustering
   need_state_summary   one row per (run, need_state) — size, households,
-                       avg products, label, max lift
+                       avg products, label, max/avg/median lift
   need_state_products  one row per (run, need_state, tpnb) — the detail table:
                        description, department, baskets, lift, share
   need_state_adjacency one row per (run, need_state_a, need_state_b) — which
@@ -239,8 +239,29 @@ def main():
         summary = pd.read_parquet(r["summary"])
         profile = pd.read_parquet(r["profiles"])
 
-        max_lift = profile.groupby("need_state")["lift"].max().rename("max_lift")
-        summary = summary.merge(max_lift, left_on="need_state", right_index=True, how="left")
+        # All three, because each alone misleads. max_lift is the only one
+        # comparable BETWEEN need-states — it is always the rank-1 product. But
+        # a single high-lift outlier can make a diffuse cluster look sharply
+        # defined, which is what avg_lift and median_lift are here to expose:
+        # max >> avg is one spike, max ~ avg is a broadly characterised
+        # need-state.
+        #
+        # The catch is that avg/median are taken over the top-N products
+        # build_profiles kept, and N varies. A need-state with only 3 products
+        # above the support threshold averages its best 3 while a full one
+        # averages 10 including the weaker ranks — so they read HIGH exactly
+        # where the profile is thinnest. Read them against
+        # n_products_profiled, never on their own. (Same trap as the Jaccard
+        # 1.0 incident; evaluate_run.py guards it by restricting to full
+        # top-10 sets.)
+        lift_stats = profile.groupby("need_state")["lift"].agg(
+            max_lift="max", avg_lift="mean", median_lift="median")
+        # profile_need_states.py now writes these into the summary parquet too.
+        # Drop before merging rather than letting pandas suffix them _x/_y —
+        # recomputing from the profile keeps old summaries working and keeps
+        # both artifacts agreeing by construction.
+        summary = summary.drop(columns=[c for c in lift_stats.columns if c in summary.columns])
+        summary = summary.merge(lift_stats, left_on="need_state", right_index=True, how="left")
         summary.insert(0, "run", r["run"])
         profile.insert(0, "run", r["run"])
         summaries.append(summary)
@@ -300,9 +321,20 @@ def main():
 
     print("""
 READING THESE
-  need_state_products    `lift` distinguishes a need-state; `share_within_need_state`
-                         says how much of it a product actually accounts for. High
+  need_state_summary     max_lift is the only lift stat comparable BETWEEN need-states.
+                         avg_lift and median_lift are taken over the top-N products
+                         kept per need-state, so they read high wherever
+                         n_products_profiled is small — read them together with that
+                         column. max >> avg is a single spike; max ~ avg is broadly
+                         characterised.
+  need_state_products    `lift` distinguishes a need-state: the product's share of that
+                         need-state's ITEMS over its share of all items, so trip size
+                         is divided out rather than rewarded. `share_within_need_state`
+                         is that first share alone and sums to 1.0 per need-state. High
                          lift on a tiny share is a marker, not a description.
+                         Lift is computed against the LABELLED baskets only, so runs
+                         that labelled different shares of the population are not
+                         directly comparable — see lift_basis in run_scorecard.
   need_state_adjacency   similarity, NOT movement. Filter by `lift` — unfiltered it
                          is most of the possible pairs and says nothing.
   need_state_transitions movement. `avg_week_gap` matters: with

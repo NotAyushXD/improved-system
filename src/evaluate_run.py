@@ -20,11 +20,26 @@ Ordered by how much they actually tell you:
                     over-represented product; median across need-states. Lift
                     ~1 means a cluster holds a representative sample of
                     products — a region of space, not a shopping occasion.
-                    Full population scored 1.95; <=10 items scored 5.03.
 
-  pct_lift_over_3   Share of need-states that are characterised at all.
-                    15% -> 97% between those two runs. This is the number to
-                    show a stakeholder.
+  pct_lift_over_3   Share of need-states that are characterised at all. This
+                    is the number to show a stakeholder.
+
+  lift_basis        Which basket population the lift denominator covered. Rows
+                    with different values here are NOT comparable on ANY lift
+                    column. See the warning below.
+
+⚠ THE 1.95-vs-5.03 COMPARISON IS SUSPENDED — DO NOT QUOTE IT
+────────────────────────────────────────────────────────────
+Both seeded runs were scored before profile_need_states.py restricted the lift
+baseline to labelled baskets. The <=10-item run clustered 23.3M of 57.1M
+baskets, and its 5.03 was measured against a baseline that still included the
+33.8M big baskets it had deliberately excluded — so an unknown part of the gap
+to the full population's 1.95 is that mismatch rather than the size split
+itself. Those rows carry lift_basis="population" and are kept for provenance
+only.
+
+To get a comparable pair, re-run profile_need_states.py and then evaluate_run.py
+against BOTH label files. Until then the size split is unjustified by this log.
 
   median_twin_jaccard
                     Each need-state vs its most similar neighbour, over top-10
@@ -65,10 +80,22 @@ COLUMNS = [
     "run", "note", "when",
     "n_baskets_labelled", "n_unclustered", "n_communities",
     "largest_share", "median_community_size",
-    "n_profiled", "median_max_lift", "pct_lift_over_3",
+    "n_profiled", "lift_basis", "median_max_lift", "pct_lift_over_3",
     "n_lift_over_5", "n_lift_over_10",
     "median_twin_jaccard", "n_twin_over_0p7", "pct_thin_profiles",
 ]
+
+# Which basket population the lift denominator covered, recorded per row rather
+# than assumed, because the log outlives the code that wrote it.
+#
+#   "clustered"  — baseline restricted to labelled baskets. Current, correct.
+#   "population" — baseline scanned every basket in the table regardless of
+#                  label. Harmless for a run that labels everything; wrong for
+#                  one that does not, and the log contains both kinds.
+#
+# Lift columns are meaningless across a change of basis. Anything scored before
+# build_counts() started filtering the baseline is "population".
+LIFT_BASIS = "clustered"
 
 
 def score(clusters_path: str, column: str = "need_state_cluster") -> dict:
@@ -122,6 +149,7 @@ def score(clusters_path: str, column: str = "need_state_cluster") -> dict:
         "largest_share": round(sizes.iloc[0] / len(labelled), 4) if len(sizes) else 0.0,
         "median_community_size": int(sizes.median()) if len(sizes) else 0,
         "n_profiled": int(len(per_ns_max_lift)),
+        "lift_basis": LIFT_BASIS,
         "median_max_lift": round(float(per_ns_max_lift.median()), 3),
         "pct_lift_over_3": round(float((per_ns_max_lift > 3).mean()), 3),
         "n_lift_over_5": int((per_ns_max_lift > 5).sum()),
@@ -167,6 +195,23 @@ def show(path: str = LOG_PATH):
     print("over structureless data, so it cannot tell a real grouping from a geometric")
     print("one. Judge runs on lift.")
 
+    # A sorted table invites reading down the lift column. Say plainly when the
+    # rows in it were not measured the same way, rather than letting the sort
+    # imply a ranking that does not exist.
+    bases = sorted(set(log["lift_basis"].dropna())) if "lift_basis" in log.columns else []
+    if len(bases) > 1:
+        print()
+        print("!" * 110)
+        print(f"MIXED LIFT BASES IN THIS LOG: {', '.join(bases)}")
+        print("Every lift column above is meaningless ACROSS those groups, and so is the")
+        print("sort. Rows marked `population` were scored before the lift baseline was")
+        print("restricted to labelled baskets — a run that labelled only part of the table")
+        print("was measured against baskets it had excluded, which moves its lift by an")
+        print("unknown amount. In particular the 1.95-vs-5.03 comparison that motivated the")
+        print("size split is NOT valid evidence until both runs are re-profiled and")
+        print("re-scored. Compare within one basis only.")
+        print("!" * 110)
+
 
 # Measured results from the two runs done before this script existed, recorded
 # so the comparison that motivated the size split is reproducible rather than
@@ -176,25 +221,39 @@ def show(path: str = LOG_PATH):
 # run-specific, which is exactly the gap this file closes.
 #
 # Blank fields were genuinely not measured at the time — not zero, not lost.
+#
+# ⚠ BOTH ROWS ARE lift_basis="population" AND THEIR LIFT COLUMNS ARE NOT
+#   COMPARABLE — not to each other, and not to anything scored since.
+#   profile_need_states.py now restricts the lift baseline to labelled baskets.
+#   These were scored before that: the <=10-item run's 23.3M labelled baskets
+#   were measured against a baseline containing all 57.1M, the 33.8M it had
+#   excluded included. Its 5.03 is therefore inflated by an unknown amount
+#   relative to the baseline run's 1.949, and the gap cannot be attributed to
+#   the size split. They are kept for provenance; re-profile and re-score both
+#   label files to replace them.
 SEED_HISTORY = [
     {
         "run": "basket_need_state_clusters",
-        "note": "BASELINE: all 57.1M baskets, k=10 one-directional, gamma 1.5",
+        "note": "BASELINE: all 57.1M baskets, k=10 one-directional, gamma 1.5 "
+                "| LIFT NOT COMPARABLE: scored on the pre-fix population baseline",
         "when": "2026-09-27 (recorded)",
         "n_baskets_labelled": 57115804, "n_unclustered": 0, "n_communities": 356,
         "largest_share": 0.015, "median_community_size": None,
-        "n_profiled": 284, "median_max_lift": 1.949, "pct_lift_over_3": 0.155,
+        "n_profiled": 284, "lift_basis": "population",
+        "median_max_lift": 1.949, "pct_lift_over_3": 0.155,
         "n_lift_over_5": None, "n_lift_over_10": None,
         "median_twin_jaccard": None, "n_twin_over_0p7": None,
         "pct_thin_profiles": None,
     },
     {
         "run": "basket_need_state_clusters_k10_onedir_max10_r1p5",
-        "note": "SIZE SPLIT: only the 23.3M baskets with <=10 products, same k/gamma",
+        "note": "SIZE SPLIT: only the 23.3M baskets with <=10 products, same k/gamma "
+                "| LIFT NOT COMPARABLE: baseline included the 33.8M excluded baskets",
         "when": "2026-09-27 (recorded)",
         "n_baskets_labelled": 23341615, "n_unclustered": 33774189, "n_communities": 2090,
         "largest_share": 0.008, "median_community_size": 45,
-        "n_profiled": 225, "median_max_lift": 5.03, "pct_lift_over_3": 0.973,
+        "n_profiled": 225, "lift_basis": "population",
+        "median_max_lift": 5.03, "pct_lift_over_3": 0.973,
         "n_lift_over_5": 114, "n_lift_over_10": 58,
         "median_twin_jaccard": 0.429, "n_twin_over_0p7": 11,
         "pct_thin_profiles": 0.107,

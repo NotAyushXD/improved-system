@@ -16,12 +16,47 @@ The most frequent product in almost every need-state is whatever is most
 frequent overall — bananas, milk, bread. Ranking by raw count gives 356
 near-identical lists and tells you nothing.
 
-    lift = P(product | need-state) / P(product)
+    lift = (items of product P in need-state / all items in need-state)
+         / (items of product P overall       / all items overall)
 
-A lift of 8 means "baskets in this need-state contain this product eight times
-more often than baskets in general". That is what distinguishes need-states
-from each other. Both numbers are reported, because lift alone can crown a
-product that appears in forty baskets — hence MIN_PRODUCT_BASKETS.
+A lift of 8 means "product P takes up eight times more of this need-state's
+shopping than it takes up of shopping in general". Both the lift and the raw
+basket count are reported, because lift alone can crown a product that appears
+in forty baskets — hence MIN_PRODUCT_BASKETS.
+
+THE DENOMINATOR IS ITEMS, NOT BASKETS — DO NOT "FIX" THIS
+─────────────────────────────────────────────────────────
+The obvious-looking alternative is basket incidence:
+
+    P(product in basket | need-state) / P(product in basket)
+
+It reads more naturally, it has been proposed twice, and it is wrong here,
+because need-states differ enormously in basket size — a top-up shop holds ~4
+products, a big shop ~40. A 40-item basket has ten times more chances to
+contain ANY given product, so basket incidence rises for every product at once
+with trip size. Simulated on a pure-size null — identical product mix in every
+need-state, only basket size differing, so the true lift is 1.0 everywhere:
+
+    need-state          mean size   item share   basket incidence
+    top-up                    1.4        1.013              0.311
+    normal                    3.6        1.002              0.775
+    big shop                  9.0        1.000              1.919
+
+Item share divides trip size out. Basket incidence manufactures a 6x spread
+from nothing but trip size, and would rank need-states by how much households
+bought rather than by what they bought. Basket size is already reported
+separately as `avg_products_per_basket`; keeping it out of lift is what lets
+you tell "this need-state is about barbecues" from "this need-state is large".
+
+`check_lift_formula` in test_pipeline.py pins that null, so a change back to
+basket counts fails a test instead of silently reordering every profile.
+
+Two consequences worth knowing:
+  * `share_within_need_state` is a share of ITEMS, and sums to exactly 1.0
+    across all of a need-state's products. Basket incidence would sum to the
+    average basket size instead.
+  * lift has no ceiling. Basket incidence caps at 1/P(product), which would
+    quietly bound `pct_lift_over_3` — the headline in evaluate_run.py.
 
 WHERE THE DATA COMES FROM
 ─────────────────────────
@@ -149,6 +184,17 @@ def build_counts(con, baskets_table: str, cluster_column: str):
     """
     Per (need-state, product) basket counts, and the population baseline.
 
+    BOTH SIDES COUNT THE SAME BASKETS — the labelled ones.
+
+    The baseline used to scan the whole table with no cluster filter. That is
+    harmless when a run labels every basket and badly wrong when it does not:
+    the <=10-item experiment clustered 23.3M of 57.1M baskets and scored them
+    against a baseline that still contained the 33.8M big baskets it had
+    deliberately excluded, so every need-state in it was measured against a
+    population it was not drawn from. Its headline lift — 5.03 against the full
+    population's 1.95, the number that motivated the size split — is not
+    comparable to anything until both runs are re-profiled through this code.
+
     One streaming pass each. The exploded relation — one row per basket per
     product, ~1B rows at full scale — exists only inside DuckDB's pipeline;
     nothing here pulls it into Python.
@@ -167,17 +213,57 @@ def build_counts(con, baskets_table: str, cluster_column: str):
             GROUP BY ns, tpnb
         """)
 
-    with progress_step("counting products across the whole population", 2, 2):
+    with progress_step("counting products across the labelled population", 2, 2):
+        # Same JOIN and same filter as ns_product_counts above — that identity
+        # is the whole point, and the item-row assertion below enforces it.
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE product_baseline AS
             SELECT tpnb, COUNT(*) AS n_baskets
-            FROM (SELECT CAST(UNNEST(products) AS VARCHAR) AS tpnb
-                  FROM "{baskets_table}")
+            FROM (
+                SELECT CAST(UNNEST(b.products) AS VARCHAR) AS tpnb
+                FROM "{baskets_table}" b
+                JOIN clusters c ON c.basket_id = b.basket_id
+                WHERE c."{cluster_column}" <> {UNCLUSTERED}
+            )
             GROUP BY tpnb
         """)
 
     pairs = con.execute("SELECT COUNT(*) FROM ns_product_counts").fetchone()[0]
     print(f"  {pairs:,} (need-state, product) pairs")
+
+    # Count what was left out, out loud. Silence here is exactly what let the
+    # mismatched baseline survive a full production run and a stakeholder
+    # comparison without anything in the log mentioning it.
+    n_all = con.execute(f'SELECT COUNT(*) FROM "{baskets_table}"').fetchone()[0]
+    n_base = con.execute(f"""
+        SELECT COUNT(*)
+        FROM "{baskets_table}" b
+        JOIN clusters c ON c.basket_id = b.basket_id
+        WHERE c."{cluster_column}" <> {UNCLUSTERED}
+    """).fetchone()[0]
+    pct = f" ({n_base / n_all:.1%})" if n_all else ""
+    print(f"  baseline population: {n_base:,} of {n_all:,} baskets in {baskets_table}{pct}")
+    if n_all - n_base:
+        print(f"  {n_all - n_base:,} baskets carry no need-state label and are excluded from "
+              f"BOTH sides of the lift ratio.\n"
+              f"  Lift in this run therefore describes the labelled subpopulation only, and "
+              f"is NOT\n  comparable to a run that labelled a different share of the table.")
+
+    # The two tables are built from the same JOIN, so they must cover exactly
+    # the same (basket, product) rows. Anything else means the numerator and
+    # the denominator are describing different populations again — the bug
+    # this function was rewritten to close. Fail before the profile is written,
+    # not after someone quotes it.
+    ns_items = con.execute("SELECT SUM(n_baskets) FROM ns_product_counts").fetchone()[0] or 0
+    base_items = con.execute("SELECT SUM(n_baskets) FROM product_baseline").fetchone()[0] or 0
+    if ns_items != base_items:
+        raise SystemExit(
+            f"lift numerator and denominator cover different populations: "
+            f"{ns_items:,} item-rows across need-states vs {base_items:,} in the baseline.\n"
+            f"Both queries in build_counts() must use the same JOIN and the same "
+            f"'<> {UNCLUSTERED}' filter; one of them has been changed."
+        )
+    print(f"  numerator and baseline cover the same {base_items:,} item-rows — OK")
 
 
 def build_summary(con, baskets_table: str, cluster_column: str) -> pd.DataFrame:
@@ -202,6 +288,11 @@ def build_profiles(con, top_n: int, min_product_baskets: int) -> pd.DataFrame:
     min_product_baskets is the guard that stops lift being won by a product
     appearing in a handful of baskets — with 154,597 products and 356
     need-states, unfiltered lift surfaces noise almost every time.
+
+    `ns_product_rows` and `total` are ITEM counts (sum of basket sizes), not
+    basket counts. That is deliberate and load-bearing — dividing by baskets
+    instead makes every lift in a need-state scale with its trip size. The
+    module docstring has the measured null; test_pipeline.py pins it.
     """
     total = con.execute("SELECT SUM(n_baskets) FROM product_baseline").fetchone()[0]
     return con.execute(f"""
@@ -229,6 +320,185 @@ def build_profiles(con, top_n: int, min_product_baskets: int) -> pd.DataFrame:
         QUALIFY rank_by_lift <= {top_n}
         ORDER BY s.need_state, rank_by_lift
     """).df()
+
+
+# Bands for the insight tables. The size edges are on a need-state's AVERAGE
+# basket size, so they are ranges of a mean rather than integer item counts.
+SIZE_BANDS = ([0, 2, 5, 10, 20, 50, float("inf")],
+              ["<=2", "2-5", "5-10", "10-20", "20-50", ">50"])
+LIFT_BANDS = ([-float("inf"), 1.5, 3, 5, 10, float("inf")],
+              ["< 1.5", "1.5-3", "3-5", "5-10", ">= 10"])
+COVERAGE_BANDS = ([0, 0.10, 0.25, 0.50, 0.75, 1.01],
+                  ["< 10%", "10-25%", "25-50%", "50-75%", ">= 75%"])
+DEPT_BANDS = ([0, 1, 3, 6, float("inf")], ["1", "2-3", "4-6", "7+"])
+
+
+def enrich_summary(summary: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-need-state columns derived from its profile, for the insight tables and
+    for anyone reading the summary parquet directly.
+
+    THE ONE THAT MATTERS IS top_product_coverage
+    ────────────────────────────────────────────
+    `share_within_need_state` is a share of ITEMS, so it is mechanically capped
+    by basket size: if EVERY basket in a need-state contains milk, milk's item
+    share is only 1/avg_basket_size. A 40-item need-state therefore cannot put
+    any product above 2.5%, and its shares are not comparable with a 3-item
+    need-state's.
+
+        top_product_coverage = top_share * avg_products_per_basket
+                             = the fraction of this need-state's baskets that
+                               contain its signature product
+
+    That divides the cap back out, giving a 0-1 number that IS comparable
+    across sizes. It is deliberately a separate column and not part of lift —
+    lift answers "what do these people buy", coverage answers "how much of this
+    need-state does that actually describe". Keeping them apart is what lets
+    you tell a genuine occasion from a large basket.
+
+    This is the number behind "a high lift on a tiny share is a marker, not a
+    description": lift 40 at 4% coverage is a curiosity, lift 6 at 80% is a
+    definition.
+    """
+    # head(1) rather than first(): GroupBy.first() returns the first NON-NULL
+    # value per column independently, so a null description would silently pull
+    # its lift and share from different rows.
+    ranked = profiles.sort_values(["need_state", "rank_by_lift"])
+    top1 = ranked.groupby("need_state", as_index=False).head(1).set_index("need_state")
+
+    stats = profiles.groupby("need_state")["lift"].agg(
+        max_lift="max", avg_lift="mean", median_lift="median")
+    summary = summary.drop(columns=[c for c in stats.columns if c in summary.columns])
+    summary = summary.merge(stats, left_on="need_state", right_index=True, how="left")
+
+    summary = summary.merge(
+        top1["share_within_need_state"].rename("top_share"),
+        left_on="need_state", right_index=True, how="left")
+    summary["top_product_coverage"] = (
+        summary["top_share"] * summary["avg_products_per_basket"]).clip(upper=1.0)
+
+    depts = profiles.groupby("need_state")["department"].nunique().rename("n_departments_top_n")
+    summary = summary.merge(depts, left_on="need_state", right_index=True, how="left")
+
+    summary["size_band"] = pd.cut(summary["avg_products_per_basket"],
+                                  bins=SIZE_BANDS[0], labels=SIZE_BANDS[1],
+                                  include_lowest=True)
+    return summary
+
+
+def _band_table(summary: pd.DataFrame, bands, title: str, first_header: str, note: str = ""):
+    """One banded cross-tab. Same columns every time so the tables read together."""
+    total = summary["n_baskets"].sum()
+    g = summary.groupby(bands, observed=False).agg(
+        n_ns=("need_state", "size"),
+        n_baskets=("n_baskets", "sum"),
+        med_lift=("max_lift", "median"),
+        pct3=("max_lift", lambda s: (s > 3).mean()),
+        med_size=("avg_products_per_basket", "median"),
+        med_cov=("top_product_coverage", "median"),
+    )
+    print(f"\n{title}")
+    if note:
+        print(f"  {note}")
+    print(f"  {first_header:<14}{'need-states':>12}{'baskets':>15}{'% of pop':>10}"
+          f"{'med lift':>10}{'lift>3':>8}{'med size':>10}{'coverage':>10}")
+    print("  " + "-" * 89)
+    for band, r in g.iterrows():
+        if not r["n_ns"]:
+            print(f"  {str(band):<14}{0:>12}{'-':>15}{'-':>10}{'-':>10}{'-':>8}{'-':>10}{'-':>10}")
+            continue
+        print(f"  {str(band):<14}{int(r['n_ns']):>12,}{int(r['n_baskets']):>15,}"
+              f"{r['n_baskets'] / total:>10.1%}{r['med_lift']:>10.2f}{r['pct3']:>8.0%}"
+              f"{r['med_size']:>10.1f}{r['med_cov']:>10.1%}")
+
+
+def print_insights(summary: pd.DataFrame, top_n: int):
+    """
+    Four cross-tabs plus the headline numbers, all from columns already
+    computed. Every one exists to answer a question the per-need-state listing
+    cannot: it shows 15 need-states out of 356 and hides the shape of the rest.
+    """
+    print("\n" + "=" * 91)
+    print("INSIGHTS — the shape of this run")
+    print("=" * 91)
+    print("  Columns are the same in every table. `med lift` is the median across "
+          "need-states of\n  each one's BEST product lift; `coverage` is the median "
+          "share of a need-state's baskets\n  that actually contain its signature "
+          "product. Read lift and coverage together.")
+
+    _band_table(summary, summary["size_band"],
+                "1. BY BASKET SIZE — does trip size still drive the metric?",
+                "avg basket",
+                "Lift is an item share ratio, so it should NOT slope with size. A strong "
+                "slope here\n  means either real structure (small trips genuinely are more "
+                "distinctive) or a leak.")
+
+    _band_table(summary,
+                pd.cut(summary["max_lift"], bins=LIFT_BANDS[0], labels=LIFT_BANDS[1]),
+                "2. BY HOW WELL CHARACTERISED — and how much of the population is there",
+                "max lift",
+                "The % of pop column is the honest stakeholder number. A run where 90% of "
+                "need-states\n  clear lift 3 but the weak ones hold half the baskets is not "
+                "a good run.")
+
+    _band_table(summary,
+                pd.cut(summary["top_product_coverage"], bins=COVERAGE_BANDS[0],
+                       labels=COVERAGE_BANDS[1], include_lowest=True),
+                "3. BY SIGNATURE STRENGTH — marker, or description?",
+                "top product",
+                "What share of a need-state's baskets contain its top-lift product. Low "
+                "coverage with\n  high lift is a marker on a niche product, not a "
+                "description of the occasion.")
+
+    # department is optional — build_product_lookup falls back to NULL when the
+    # attributes extract predates commercial_hierarchy_department. nunique() is
+    # then 0 everywhere and pd.cut drops it, so say why the table is missing
+    # rather than printing four empty rows.
+    if summary["n_departments_top_n"].fillna(0).sum() == 0:
+        print("\n4. BY DEPARTMENT SPREAD — skipped: no department in the product lookup "
+              "(commercial_hierarchy_department\n   is absent from "
+              "PIPELINE_PRODUCT_ATTRIBUTES_TPNA, so there is nothing to spread over).")
+    else:
+        _band_table(summary,
+                    pd.cut(summary["n_departments_top_n"], bins=DEPT_BANDS[0],
+                           labels=DEPT_BANDS[1]),
+                    f"4. BY DEPARTMENT SPREAD — is the top-{top_n} one aisle or a supermarket?",
+                    "departments",
+                    f"Distinct departments among the top-{top_n} products. A need-state whose "
+                    f"signature spans\n  most of the store is a region of embedding space, not "
+                    f"a shopping occasion.")
+
+    # Headline scalars. The weighted-vs-unweighted gap is the one that tends to
+    # surprise: it says whether the weak need-states are the big ones.
+    total = summary["n_baskets"].sum()
+    unweighted = summary["max_lift"].median()
+    over3 = summary["max_lift"] > 3
+    pop_over3 = summary.loc[over3, "n_baskets"].sum() / total if total else float("nan")
+    # Spearman by hand — pandas routes method="spearman" through scipy, and
+    # rank-then-pearson is the same number with no extra dependency.
+    rho = summary["avg_products_per_basket"].rank().corr(summary["max_lift"].rank())
+
+    print("\n" + "-" * 91)
+    print("HEADLINES")
+    print(f"  need-states                                  {len(summary):>12,}")
+    print(f"  labelled baskets                             {int(total):>12,}")
+    print(f"  median max lift (per need-state)             {unweighted:>12.2f}")
+    print(f"  need-states with max lift > 3                {over3.mean():>11.0%}")
+    print(f"  BASKETS in a need-state with max lift > 3    {pop_over3:>11.0%}   "
+          f"<- the number to quote")
+    print(f"  median signature coverage                    "
+          f"{summary['top_product_coverage'].median():>11.0%}")
+    print(f"  Spearman(avg basket size, max lift)          {rho:>12.2f}")
+    if pd.notna(rho) and abs(rho) >= 0.4:
+        print(f"    NOTE: lift still tracks basket size at rho={rho:.2f}. Item-share lift "
+              f"divides trip\n    size out arithmetically, so this is either genuine "
+              f"(small trips are more focused)\n    or the clustering has largely "
+              f"rediscovered basket size. Compare table 1's med lift\n    against table 1's "
+              f"coverage: if coverage slopes the same way, it is genuine.")
+    if pd.notna(pop_over3) and pop_over3 < over3.mean() - 0.10:
+        print(f"    NOTE: {over3.mean():.0%} of need-states clear lift 3 but only "
+              f"{pop_over3:.0%} of baskets sit in one.\n    The weakest need-states are the "
+              f"largest — the clusters that matter most are the\n    least characterised.")
 
 
 def label_from_profile(profiles: pd.DataFrame, n_terms: int = 3) -> pd.DataFrame:
@@ -309,9 +579,18 @@ def main():
     summary["n_products_profiled"] = summary["n_products_profiled"].fillna(0).astype(int)
     thin = int((summary["n_products_profiled"] < args.top_n).sum())
 
+    summary = enrich_summary(summary, profiles)
+
     profiles_path, summary_path = outputs_for(args.clusters)
     profiles.to_parquet(profiles_path, index=False)
-    summary.to_parquet(summary_path, index=False)
+    # size_band stays an ordered Categorical in memory so the insight tables
+    # come out in band order, but it is written as plain text: the export
+    # concatenates summaries across runs, and concatenating Categoricals with
+    # one run's column missing turns the whole column to NaN.
+    on_disk = summary.copy()
+    on_disk["size_band"] = summary["size_band"].astype(str).where(
+        summary["size_band"].notna())
+    on_disk.to_parquet(summary_path, index=False)
     print(f"\nSaved {profiles_path} ({len(profiles):,} rows)")
     print(f"Saved {summary_path} ({len(summary):,} need-states)")
     if thin:
@@ -331,11 +610,14 @@ def main():
             desc = p.description if isinstance(p.description, str) else f"tpnb {p.tpnb}"
             print(f"      lift {p.lift:6.1f}  {desc[:58]}")
 
+    print_insights(summary, args.top_n)
+
     print("\n" + "=" * 78)
     print("Read need_state_profiles.parquet for the full ranking. `lift` is the "
-          "column\nthat distinguishes need-states; `share_within_need_state` tells you "
-          "how much\nof the need-state a product actually accounts for. A high lift on "
-          "a tiny\nshare is a marker, not a description.")
+          "column\nthat distinguishes need-states: this product's share of the "
+          "need-state's ITEMS\nover its share of all items. `share_within_need_state` is "
+          "that first share on\nits own, and sums to 1.0 across a need-state's products. "
+          "A high lift on a tiny\nshare is a marker, not a description.")
 
 
 if __name__ == "__main__":
