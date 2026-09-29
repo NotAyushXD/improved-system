@@ -93,6 +93,7 @@ ACTIVE_FILES = [
     "basket_store.py",
     "lmdb_graph_cache.py",
     "need_state_graph.py",
+    "baseline_mean_embedding.py",
 ]
 
 OUTPUT_DIR = Path("../data/output")
@@ -561,8 +562,11 @@ def check_graph_primitives():
         print("  _basket_dense_cp_submatrix: all-unknown-product basket handled — OK")
 
     # ── build_one_graph: exact node-feature slot layout ──────────────────
-    # in_dim = emb_dim + 4, and the four extras must sit in this exact order:
-    # [emb_dim]=cp_score [+1]=sub_cluster [+2]=distinctiveness [+3]=log_units.
+    # in_dim = emb_dim + 3, and the three extras must sit in this exact order:
+    # [emb_dim]=cp_score [+1]=distinctiveness [+2]=log_units.
+    # sub_cluster_id used to occupy [+1]; it was removed as an unusable scalar
+    # encoding of a 400-way nominal label that the embedding block already
+    # carries in full. Everything after it shifted down one slot.
     # Anything downstream reading a slot by index breaks silently if these move.
     emb_dim = 6
     prods = ["A", "B", "C"]
@@ -576,36 +580,37 @@ def check_graph_primitives():
     g = build_one_graph(
         products=prods, units=[3.0, 1.0, 1.0], basket_id="t1",
         emb_matrix=emb_matrix, emb_dim=emb_dim,
-        subcluster_arr=subcl, distinctiveness_arr=dist,
+        distinctiveness_arr=dist,
         dense_cp=dense_cp, local_idx=local_idx, product_id_to_index=pid2idx,
     )
     x = g.x.numpy()
-    if x.shape != (3, emb_dim + 4):
-        ok = _fail(f"node feature matrix should be (3, {emb_dim+4}), got {x.shape}")
+    if x.shape != (3, emb_dim + 3):
+        ok = _fail(f"node feature matrix should be (3, {emb_dim+3}), got {x.shape}")
     if not np.allclose(x[:, :emb_dim], emb_matrix):
         ok = _fail("slots [0:emb_dim] are not the product embedding")
-    if not np.allclose(x[:, emb_dim + 1], subcl):
-        ok = _fail(f"slot [emb_dim+1] should be sub_cluster_id, got {x[:, emb_dim+1]}")
-    if not np.allclose(x[:, emb_dim + 2], dist):
-        ok = _fail(f"slot [emb_dim+2] should be distinctiveness, got {x[:, emb_dim+2]}")
-    if not np.allclose(x[:, emb_dim + 3], np.log1p([3.0, 1.0, 1.0])):
-        ok = _fail(f"slot [emb_dim+3] should be log1p(units), got {x[:, emb_dim+3]}")
+    if not np.allclose(x[:, emb_dim + 1], dist):
+        ok = _fail(f"slot [emb_dim+1] should be distinctiveness, got {x[:, emb_dim+1]}")
+    if not np.allclose(x[:, emb_dim + 2], np.log1p([3.0, 1.0, 1.0])):
+        ok = _fail(f"slot [emb_dim+2] should be log1p(units), got {x[:, emb_dim+2]}")
+    if x.shape[1] != emb_dim + 3:
+        ok = _fail(f"a sub_cluster_id slot has come back: width {x.shape[1]} "
+                   f"exceeds emb_dim+3")
     if not ((x[:, emb_dim] >= 0).all() and (x[:, emb_dim] <= 1).all()):
         ok = _fail(f"slot [emb_dim] (cp_score) should be min-max normalised, got {x[:, emb_dim]}")
-    print("  build_one_graph: node feature slot layout [emb|cp|subcl|distinct|log_units] — OK")
+    print("  build_one_graph: node feature slot layout [emb|cp|distinct|log_units] — OK")
 
     # ── build_one_graph: duplicate products are deduped, units SUMMED ────
     g2 = build_one_graph(
         products=["A", "B", "A"], units=[2.0, 1.0, 5.0], basket_id="t2",
         emb_matrix=emb_matrix, emb_dim=emb_dim,
-        subcluster_arr=subcl, distinctiveness_arr=dist,
+        distinctiveness_arr=dist,
         dense_cp=dense_cp, local_idx=local_idx, product_id_to_index=pid2idx,
     )
     if g2.x.shape[0] != 2:
         ok = _fail(f"duplicate tpnb should collapse to 2 nodes, got {g2.x.shape[0]}")
-    elif not np.isclose(g2.x.numpy()[0, emb_dim + 3], np.log1p(7.0)):
+    elif not np.isclose(g2.x.numpy()[0, emb_dim + 2], np.log1p(7.0)):
         ok = _fail(f"duplicate units should sum to 7 -> log1p(7)={np.log1p(7.0):.4f}, "
-                   f"got {g2.x.numpy()[0, emb_dim+3]:.4f}")
+                   f"got {g2.x.numpy()[0, emb_dim+2]:.4f}")
     else:
         print("  build_one_graph: duplicate products deduped with units summed — OK")
 
@@ -628,10 +633,10 @@ def check_graph_primitives():
             g_neg = build_one_graph(
                 products=prods, units=units_in, basket_id="tneg",
                 emb_matrix=emb_matrix, emb_dim=emb_dim,
-                subcluster_arr=subcl, distinctiveness_arr=dist,
+                distinctiveness_arr=dist,
                 dense_cp=dense_cp, local_idx=local_idx, product_id_to_index=pid2idx,
             )
-        got_lu = g_neg.x.numpy()[:, emb_dim + 3]
+        got_lu = g_neg.x.numpy()[:, emb_dim + 2]
         runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
         if not np.allclose(got_lu, want, atol=1e-6):
             ok = _fail(f"log_units for units={units_in} should be {want}, got {list(got_lu)}")
@@ -652,12 +657,12 @@ def check_graph_primitives():
     g3 = build_one_graph(
         products=["ZZZ"], units=[1.0], basket_id="t3",
         emb_matrix=emb_matrix, emb_dim=emb_dim,
-        subcluster_arr=subcl, distinctiveness_arr=dist,
+        distinctiveness_arr=dist,
         dense_cp=np.zeros((0, 0), dtype=np.float32), local_idx={},
         product_id_to_index=pid2idx,
     )
-    if g3.x.shape != (1, emb_dim + 4) or g3.edge_index.shape != (2, 0):
-        ok = _fail(f"unknown-product basket should give a 1x{emb_dim+4} zero node and no "
+    if g3.x.shape != (1, emb_dim + 3) or g3.edge_index.shape != (2, 0):
+        ok = _fail(f"unknown-product basket should give a 1x{emb_dim+3} zero node and no "
                    f"edges, got x={tuple(g3.x.shape)} edge_index={tuple(g3.edge_index.shape)}")
     else:
         print("  build_one_graph: basket of entirely unknown products degrades safely — OK")
@@ -874,8 +879,8 @@ def check_functional():
     )
     assert "theme_ids" not in G, "theme_ids key found in prepare_globals() output"
     emb_dim = G["emb_dim"]
-    assert G["in_dim"] == emb_dim + 4, f"expected in_dim == emb_dim+4, got {G['in_dim']}"
-    print(f"  prepare_globals(): in_dim={G['in_dim']} (emb_dim={emb_dim}+4), no theme_ids — OK")
+    assert G["in_dim"] == emb_dim + 3, f"expected in_dim == emb_dim+3, got {G['in_dim']}"
+    print(f"  prepare_globals(): in_dim={G['in_dim']} (emb_dim={emb_dim}+3), no theme_ids — OK")
 
     con = duckdb_manager.get_connection()
     # Drop leftover DuckDB state from a previous run BEFORE touching local
@@ -954,7 +959,7 @@ def check_functional():
         g_infer = build_one_graph(
             products=row["products"], units=row["units"], basket_id=row["basket_id"],
             emb_matrix=G["emb_matrix"], emb_dim=G["emb_dim"],
-            subcluster_arr=G["subcluster_arr"], distinctiveness_arr=G["distinctiveness_arr"],
+            distinctiveness_arr=G["distinctiveness_arr"],
             dense_cp=basket_dense_cp, local_idx=local_idx_map,
             product_id_to_index=G["product_id_to_index"],
         )
@@ -2606,6 +2611,84 @@ def check_clustering_progress():
 # ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
+# 9b. MEAN-EMBEDDING CONTROL
+# ─────────────────────────────────────────────
+
+def check_mean_embedding_baseline():
+    """
+    baseline_mean_embedding._basket_means, pinned to hand-computed values.
+
+    This is the control the GNN gets judged against — if it computes the wrong
+    basket vector, the comparison sends Stage 1 the wrong way and nothing
+    crashes. The two cases that actually matter are the ones a naive
+    implementation gets wrong:
+
+      * a product with no embedding must be DROPPED from the mean, not
+        averaged in as a zero vector (which would drag the basket toward the
+        origin in proportion to catalog coverage rather than contents);
+      * a basket with no embedded product at all must give a zero row and
+        n_used == 0, not a divide-by-zero or a dropped row — the row count has
+        to stay aligned with basket_id.
+    """
+    print()
+    print("=" * 70)
+    print("9b. MEAN-EMBEDDING CONTROL: _basket_means")
+    print("=" * 70)
+
+    from baseline_mean_embedding import _basket_means
+
+    ok = True
+    pid2idx = {"A": 0, "B": 1, "C": 2}          # "D" is deliberately absent
+    emb_matrix = np.array([[1.0, 0.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32)
+    chunk = pd.DataFrame({"products": [
+        ["A", "B"],        # both embedded
+        ["C"],             # single
+        ["D"],             # only an unembedded product
+        [],                # empty
+        ["A", "D", "C"],   # D must not be averaged in as a zero
+    ]})
+
+    means, n_used = _basket_means(chunk, emb_matrix, pid2idx)
+    want_means = np.array([[2.0, 2.0], [5.0, 6.0], [0.0, 0.0],
+                           [0.0, 0.0], [3.0, 3.0]], dtype=np.float32)
+    want_used = np.array([2, 1, 0, 0, 2], dtype=np.int64)
+
+    if means.shape != (5, 2):
+        ok = _fail(f"means should be (5, 2) — one row per basket — got {means.shape}")
+    elif not np.allclose(means, want_means):
+        ok = _fail(f"basket means wrong.\n      got      {means.tolist()}\n"
+                   f"      expected {want_means.tolist()}")
+    elif not np.array_equal(n_used, want_used):
+        ok = _fail(f"n_products_used should be {want_used.tolist()}, got {n_used.tolist()}")
+    else:
+        print("  mean over embedded products only, unembedded dropped not zeroed — OK")
+        print("  empty / all-unembedded baskets give a zero row and n_used=0 — OK")
+
+    # Row alignment under a non-default index — --limit slices with .iloc
+    # upstream, and if the function read exploded labels without resetting
+    # first, every basket's products would land on the wrong row.
+    shifted = chunk.copy()
+    shifted.index = np.arange(100, 105)
+    means_shifted, used_shifted = _basket_means(shifted, emb_matrix, pid2idx)
+    if not (np.allclose(means_shifted, want_means) and np.array_equal(used_shifted, want_used)):
+        ok = _fail("a non-RangeIndex chunk produced different vectors — exploded row "
+                   "labels are being used as basket offsets without a reset_index")
+    else:
+        print("  identical result on a chunk with a shifted index — OK")
+
+    empty_means, empty_used = _basket_means(
+        pd.DataFrame({"products": pd.Series([], dtype=object)}), emb_matrix, pid2idx)
+    if empty_means.shape != (0, 2) or len(empty_used) != 0:
+        ok = _fail(f"empty chunk should give (0, 2) and no counts, got "
+                   f"{empty_means.shape} / {len(empty_used)}")
+    else:
+        print("  empty chunk handled — OK")
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
+# ─────────────────────────────────────────────
 # 10. PRODUCT KEY WIRING
 # ─────────────────────────────────────────────
 
@@ -2798,20 +2881,28 @@ def check_product_key_wiring():
         else:
             print(f"  all {n_prod} products carry a real embedding vector — OK")
 
-        n_subcl = len(np.unique(G["subcluster_arr"]))
-        if n_subcl < 2:
-            ok = _fail(f"subcluster_arr has {n_subcl} distinct value(s) — every product "
-                       f"fell through to the 0.0 default, so node feature [emb_dim+1] "
-                       f"is constant")
-        else:
-            print(f"  subcluster_arr has {n_subcl} distinct values (not the 0.0 "
-                  f"fallback) — OK")
-
         if np.allclose(G["distinctiveness_arr"], 0.5):
             ok = _fail("distinctiveness_arr is 0.5 everywhere — every product fell "
-                       "through to the default, so node feature [emb_dim+2] is constant")
+                       "through to the default, so node feature [emb_dim+1] is constant")
         else:
             print("  distinctiveness_arr is not the constant 0.5 fallback — OK")
+
+        # The sub-cluster id must NOT come back as a node feature. It is a
+        # ~400-way nominal label flattened onto one scalar, and a deterministic
+        # function of the embedding already present in full in the same row —
+        # so it can only add an arbitrary ordering to the space need-states are
+        # carved from. Harmless while embeddings were zeroed; a live,
+        # meaningless input once they work. Pinned here because the natural
+        # "fix" for the constant-0.0 symptom is to restore it.
+        if "subcluster_arr" in G:
+            ok = _fail("prepare_globals returned subcluster_arr — the sub-cluster id "
+                       "was removed as a node feature deliberately; see its docstring "
+                       "before putting it back")
+        if G["in_dim"] != G["emb_dim"] + 3:
+            ok = _fail(f"in_dim is {G['in_dim']}, expected emb_dim+3 "
+                       f"({G['emb_dim']}+3) — the node feature set changed")
+        else:
+            print(f"  in_dim is emb_dim+3 = {G['in_dim']}, no sub_cluster_id slot — OK")
 
         # ── The guard itself must refuse a zero overlap, loudly ──
         try:
@@ -2893,6 +2984,7 @@ def main():
         ("clustering progress / graph build / Leiden parity", check_clustering_progress),
         ("graph coverage / no silent label loss", check_graph_coverage),
         ("label cache / no stale Leiden labels", check_label_cache),
+        ("mean-embedding control", check_mean_embedding_baseline),
     ]
     if not args.fast:
         checks.append(("functional / parity / basket store", check_functional))

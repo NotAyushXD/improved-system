@@ -16,6 +16,36 @@
 > to settle it — permutation nulls (§5) — is now the project's standard
 > validation and is worth more than the hypothesis was.
 
+> [!WARNING]
+> **A SECOND bug was found on 2026-09-30, after this document was concluded,
+> and every number in it predates the fix.** Product ids were `int` on the
+> basket side and `str` on the embedding side, so `prepare_globals()` matched
+> nothing and **every node carried an all-zero product embedding** — see
+> `CLAUDE.md` §4b. All four runs here were clustered on basket geometry with
+> no product semantics in it whatsoever.
+>
+> **The verdict stands.** It rests on a *relative* comparison — 19.4% vs ~20%
+> on an identical 23,341,615 baskets — where both sides carried the same
+> defect, and the fix does not preferentially help small baskets. Banding is
+> still not a production segmentation.
+>
+> **§6 and §7's absolute numbers and per-band characterisations do not.**
+> Treat them as provisional until re-measured. Band L's "Northern Irish and
+> Irish brands cluster together" is the most suspect: brand is deliberately
+> stripped from the embedded text (`build_product_embeddings.py`) precisely so
+> it cannot drive similarity, so with working embeddings the vectors push
+> *against* brand grouping. With zeroed embeddings nothing did. That finding
+> may be a portrait of the bug rather than of large baskets.
+>
+> **§5 — the permutation-null method — is unaffected and remains current.** So
+> is §2's account of how the near-miss was caught, and §9's limitations. The
+> reusable constants in §5 (`lift > 3`; null ≈ 1.2) were calibrated on the old
+> geometry and need re-deriving, which the method already requires per run.
+>
+> One thing worth carrying: **44 of 356 need-states cleared lift 3 with no
+> product information in the model at all.** Whatever the corrected run
+> produces should be strictly better than everything measured below.
+
 ---
 
 ## 1. The question

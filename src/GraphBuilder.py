@@ -84,14 +84,18 @@ SEED                 = config.SEED
 #    neighbours). Edge feature [1] changes value, so every graph cached under
 #    version 2 is stale — this bump forces the LMDB cache to rebuild instead of
 #    training on the old edge scaling.
-# 4: product ids are now VARCHAR on both sides of the join (basket_store.py's
-#    CAST(tpnb AS VARCHAR)). Before this, basket-side ids were int and
-#    embedding-side ids were str, so prepare_globals() matched NOTHING: every
-#    node carried an all-zero 384-dim embedding, sub_cluster_id 0.0 and
-#    distinctiveness 0.5. Node features [0:emb_dim], [emb_dim+1] and
-#    [emb_dim+2] all change value, which invalidates every cached graph and
-#    every set of weights trained on them — hence the bump, which forces both
-#    the LMDB cache and the model to rebuild.
+# 4: TWO changes, both to node feature VALUES and one to the WIDTH.
+#    (a) Product ids are now VARCHAR on both sides of the join
+#        (basket_store.py's CAST(tpnb AS VARCHAR)). Before this, basket-side
+#        ids were int and embedding-side ids were str, so prepare_globals()
+#        matched NOTHING: every node carried an all-zero 384-dim embedding,
+#        sub_cluster_id 0.0 and distinctiveness 0.5.
+#    (b) sub_cluster_id was removed as a node feature, so in_dim went from
+#        emb_dim + 4 to emb_dim + 3 and every slot after cp_score shifted down
+#        one. See prepare_globals' docstring for why.
+#    Either alone would invalidate every cached graph and every set of weights
+#    trained on them; this bump forces both the LMDB cache and the model to
+#    rebuild rather than reuse them.
 #    NOT covered by any fingerprint: basket_gnn_embeddings.parquet and the
 #    embeddings_chunk_*.parquet files behind it. Delete them by hand (or run
 #    reset_inference.py --yes) or the run will cluster vectors produced by the
@@ -432,8 +436,8 @@ def _check_product_key_overlap(n_matched, product_id_to_index, product_embedding
 
     if share < 0.5:
         print(f"  WARNING: {n_products - n_matched:,} products ({1 - share:.1%}) have no "
-              f"embedding and fall back to an all-zero vector, sub_cluster_id 0.0 and "
-              f"distinctiveness 0.5. Those products carry no identity into the GNN. "
+              f"embedding and fall back to an all-zero vector and distinctiveness 0.5. "
+              f"Those products carry no identity into the GNN. "
               f"Check that product_embeddings.parquet covers the same period as the "
               f"basket export before trusting the need-states.")
 
@@ -443,13 +447,37 @@ def prepare_globals(product_embedding, product_id_to_index,
     """
     Converts all dicts to numpy arrays.
 
-    in_dim = emb_dim + 4
+    in_dim = emb_dim + 3
         [emb_dim]  product embedding
         [+1]       co-purchase score
-        [+1]       sub_cluster_id  (normalised — from GLOBAL clustering, no
-                                     theme/category pre-grouping)
         [+1]       distinctiveness
         [+1]       log_units       (filled per basket at graph build time)
+
+    WHY THERE IS NO sub_cluster_id FEATURE (removed 2026-09-30)
+    ──────────────────────────────────────────────────────────
+    There used to be a fourth extra feature: the product's global k-means
+    cluster id, stored as `label / (k - 1)`. It is gone, for two reasons that
+    only became visible once the embedding block stopped being all zeros (see
+    _check_product_key_overlap).
+
+    1. The ENCODING could not work. It is a nominal label over ~400 clusters
+       squeezed onto one scalar in [0, 1]. Cluster 200 and 201 land next to
+       each other and mean nothing to each other; 0 and 399 sit at opposite
+       ends for no reason. A linear layer can only learn a monotone function
+       of an arbitrary label ordering.
+    2. It was REDUNDANT. The label is a deterministic k-means function of the
+       product's own 384-dim embedding — which is features [0:emb_dim] of the
+       very same row, present in full and unquantised.
+
+    So it could add nothing the network did not already have, while injecting
+    an arbitrary ordering into the space need-states are carved out of. While
+    the embeddings were broken it was 0.0 for every product and therefore
+    harmless; with them working it would have been a live, meaningless input.
+
+    build_product_subclusters() still runs: distinctiveness is computed from
+    those same centroids and IS kept, because it measures how typical a
+    product is of its neighbourhood — a density property that is not linearly
+    recoverable from the vector itself.
 
     No theme/category parameter anywhere in this function's signature —
     need-states are discovered downstream of basket embeddings; nothing
@@ -471,26 +499,33 @@ def prepare_globals(product_embedding, product_id_to_index,
     # completely silent. See _check_product_key_overlap.
     _check_product_key_overlap(n_embedded, product_id_to_index, product_embedding)
 
+    # The cluster LABELS are deliberately discarded — see the docstring. The
+    # call still has to happen: distinctiveness is measured against these same
+    # centroids, and is the part that survives.
     print("  Building product sub-clusters (global, no theme/category pre-grouping)...")
-    product_subcluster, product_distinctiveness, best_k = \
+    _discarded_subcluster_labels, product_distinctiveness, best_k = \
         build_product_subclusters(product_embedding)
-    print(f"  Global sub-clusters: k={best_k}")
+    print(f"  Global sub-clusters: k={best_k} "
+          f"(used for distinctiveness only — the cluster id is not a node feature)")
 
-    subcluster_arr      = np.zeros(n_products, dtype=np.float32)
     distinctiveness_arr = np.zeros(n_products, dtype=np.float32)
-    avg_units_arr        = np.ones(n_products, dtype=np.float32)
 
-    # These three .get() defaults are the same silent-fallback hazard the
-    # embedding lookup above had. product_subcluster and
-    # product_distinctiveness are keyed by whatever product_embedding was keyed
-    # by, so _check_product_key_overlap already governs both — a run that gets
-    # past it cannot land on 0.0/0.5 for every product. product_units_avg comes
-    # from DuckDB instead, so it shares the basket side's key space by
-    # construction.
+    # avg_units_arr is NOT a node feature and is deliberately not built here.
+    # It was computed and returned for a long time without a single reader.
+    # The idea it was presumably meant for — log(units / this product's typical
+    # units), i.e. "unusually many of this for THIS product", a much better
+    # occasion signal than the absolute log_units currently used — is a queued
+    # experiment, not something in the model today. `product_units_avg` is
+    # still a parameter of this function, so rebuilding the array is one line
+    # when that experiment runs. A named placeholder beats a silent one.
+    #
+    # The .get() default below is the same silent-fallback hazard the embedding
+    # lookup above had: product_distinctiveness is keyed by whatever
+    # product_embedding was keyed by, so _check_product_key_overlap already
+    # governs it — a run that gets past that check cannot land on 0.5 for every
+    # product.
     for product, idx in product_id_to_index.items():
-        subcluster_arr[idx]      = product_subcluster.get(product, 0.0)
         distinctiveness_arr[idx] = product_distinctiveness.get(product, 0.5)
-        avg_units_arr[idx]       = product_units_avg.get(product, 1.0)
 
     # No whole-matrix dtype cast here on purpose: .astype(np.float32) on a
     # different dtype always allocates a brand-new copy of the ENTIRE
@@ -518,10 +553,10 @@ def prepare_globals(product_embedding, product_id_to_index,
     return dict(
         emb_matrix          = emb_matrix,
         emb_dim             = emb_dim,
-        in_dim              = emb_dim + 4,   # embedding + 4 extra features — no theme_score
-        subcluster_arr      = subcluster_arr,
+        # embedding + cp_score + distinctiveness + log_units. Was emb_dim + 4
+        # until sub_cluster_id was removed; see this function's docstring.
+        in_dim              = emb_dim + 3,
         distinctiveness_arr = distinctiveness_arr,
-        avg_units_arr       = avg_units_arr,
         csr                 = csr,
         product_id_to_index = product_id_to_index,
     )
@@ -633,21 +668,25 @@ def _minmax(arr):
 def build_one_graph(
     products, units, basket_id,
     emb_matrix, emb_dim,
-    subcluster_arr, distinctiveness_arr,
+    distinctiveness_arr,
     dense_cp, local_idx,
     product_id_to_index,
 ):
     """
-    Node feature layout (in_dim = emb_dim + 4):
+    Node feature layout (in_dim = emb_dim + 3):
       [0:emb_dim]    product embedding
       [emb_dim]      cp_score
-      [emb_dim+1]    sub_cluster_id  (normalised 0-1, from global clustering)
-      [emb_dim+2]    distinctiveness
-      [emb_dim+3]    log_units
+      [emb_dim+1]    distinctiveness
+      [emb_dim+2]    log_units
+
+    There is no sub_cluster_id slot — it was removed as an unusable encoding
+    of information the embedding block already carries in full. The
+    `subcluster_arr` parameter went with it; prepare_globals() no longer
+    returns one. See prepare_globals' docstring for the argument.
 
     No theme/category input anywhere in this function.
     """
-    in_dim = emb_dim + 4
+    in_dim = emb_dim + 3
 
     # Deduplicate — keep first occurrence, sum units for duplicates
     seen      = {}
@@ -701,7 +740,6 @@ def build_one_graph(
 
     # ── Node features ──
     emb      = emb_matrix[global_idx_arr]          # (n, emb_dim)
-    subcl    = subcluster_arr[global_idx_arr]       # (n,) normalised [0,1]
     distinct = distinctiveness_arr[global_idx_arr]  # (n,) [0,1]
 
     # Co-purchase node score (from the dense submatrix passed in — training
@@ -716,11 +754,10 @@ def build_one_graph(
     else:
         cp = np.zeros(n, dtype=np.float32)
 
-    # Stack all features: [emb | cp | subcluster | distinctiveness | log_units]
+    # Stack all features: [emb | cp | distinctiveness | log_units]
     feat = np.concatenate([
         emb,
         cp[:, None],
-        subcl[:, None],
         distinct[:, None],
         log_units[:, None],
     ], axis=1).astype(np.float32)
@@ -855,7 +892,6 @@ def _embed_basket_chunk(chunk_df, G, model, device, batch_size=None, show_progre
             basket_id            = basket_ids[i],
             emb_matrix           = G["emb_matrix"],
             emb_dim              = G["emb_dim"],
-            subcluster_arr       = G["subcluster_arr"],
             distinctiveness_arr  = G["distinctiveness_arr"],
             dense_cp             = basket_dense_cp,
             local_idx            = local_idx_map,

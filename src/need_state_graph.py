@@ -216,6 +216,13 @@ def build_need_state_adjacency(
     `share_a` is the fraction of need-state A's total edge weight that runs to
     B — the asymmetric read ("how much of A's boundary is with B"), which is
     usually the more actionable number for a small state adjacent to a big one.
+
+    Note `deg` is computed BEFORE self-loops are dropped, on purpose: a
+    need-state's within-state edge weight is part of its volume, and excluding
+    it would shrink every denominator by the bulk of the graph. This is the
+    canonical definition — export_need_states.adjacency() computes the
+    identical number in SQL so the parquet and the workbook agree, and offers
+    the cross-edges-only variant alongside it as `cross_lift`.
     """
     lab = clusters.set_index("basket_id")[cluster_col]
 
@@ -403,6 +410,7 @@ def possible_journeys(
     beam: int = config.JOURNEY_BEAM,
     exclude_self_loops: bool = True,
     min_path_prob: float = 0.0,
+    include_partial: bool = False,
 ) -> pd.DataFrame:
     """
     Multi-step journeys out of a need-state, via beam search over the directed
@@ -415,6 +423,18 @@ def possible_journeys(
     exclude_self_loops : skip "stayed in the same need-state" steps, so the
         result shows actual movement rather than N weeks of standing still
     min_path_prob : prune paths below this cumulative probability
+    include_partial : also return the shorter paths visited on the way to
+        `depth`. Off by default, and that default changed on 2026-09-30.
+
+        Every path in the beam at every depth used to be returned together,
+        sorted by path_prob. Because path_prob is a PRODUCT of probabilities
+        <= 1, a shorter path can never score below its own continuations — so
+        the top of the table was always depth-1 rows no matter what `depth`
+        was asked for, and `depth=3` looked like it had done nothing. The
+        `n_steps` column distinguished them, but the sort order invited
+        reading straight down. Pass include_partial=True for the old shape;
+        it is still the right thing when you want "anywhere reachable within
+        N weeks" rather than "where they are in N weeks".
 
     Returns
     -------
@@ -435,6 +455,7 @@ def possible_journeys(
 
     paths = [((from_need_state,), 1.0, 1.0, 0)]
     finished = []
+    deepest = []          # the beam as it stood after the LAST productive step
 
     for _ in range(depth):
         expanded = []
@@ -453,12 +474,19 @@ def possible_journeys(
         expanded.sort(key=lambda r: r[1], reverse=True)
         paths = expanded[:beam]
         finished.extend(paths)
+        deepest = paths
 
-    if not finished:
+    # `deepest`, not `finished`, unless asked otherwise — see include_partial.
+    # It is the beam at the last depth actually reached, which may be shorter
+    # than `depth` if the graph ran out of outgoing edges (a need-state nobody
+    # leaves, or everything pruned by min_path_prob).
+    rows = finished if include_partial else deepest
+
+    if not rows:
         print(f"  No journeys found out of need-state {from_need_state}.")
         return pd.DataFrame(columns=["path", "path_prob", "weakest_step", "low_support_steps"])
 
-    out = pd.DataFrame(finished, columns=["path", "path_prob", "weakest_step", "low_support_steps"])
+    out = pd.DataFrame(rows, columns=["path", "path_prob", "weakest_step", "low_support_steps"])
     out["n_steps"] = out["path"].map(len) - 1
     return out.sort_values("path_prob", ascending=False).reset_index(drop=True)
 

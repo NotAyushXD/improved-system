@@ -153,7 +153,6 @@ def main():
         build_one_graph(
             products=prods, units=units, basket_id=df["basket_id"].iloc[i],
             emb_matrix=G["emb_matrix"], emb_dim=G["emb_dim"],
-            subcluster_arr=G["subcluster_arr"],
             distinctiveness_arr=G["distinctiveness_arr"],
             dense_cp=dense, local_idx=lmap, product_id_to_index=pid2idx,
         )
@@ -189,7 +188,6 @@ def main():
         graphs.append(build_one_graph(
             products=prods, units=df["units"].iloc[i], basket_id=df["basket_id"].iloc[i],
             emb_matrix=G["emb_matrix"], emb_dim=G["emb_dim"],
-            subcluster_arr=G["subcluster_arr"],
             distinctiveness_arr=G["distinctiveness_arr"],
             dense_cp=dense, local_idx=lmap, product_id_to_index=pid2idx))
 

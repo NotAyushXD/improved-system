@@ -55,12 +55,14 @@ running as Administrator, on every local drive tried. DuckDB needs no such
 privileged step — it just opens an ordinary file.)
 
 BREAKING CHANGE — cached artifact schema: GraphBuilder.py's node feature
-layout changed (in_dim = emb_dim + 4, was + 5) and its sub-clustering
-algorithm changed (global MiniBatchKMeans, was per-theme KMeans). The basket
-grain also changed (household x WEEK, was household x PERIOD), which
-invalidates everything derived from basket composition. Delete these under
-data/output/ before running this version against any changed data or basket
-definition:
+layout is now in_dim = emb_dim + 3 (was + 4 before sub_cluster_id was dropped
+on 2026-09-30, and + 5 before that when theme_score existed), and product ids
+are VARCHAR on both sides of the embedding join — see CLAUDE.md §4b for why
+that second one matters more than it sounds. Its sub-clustering algorithm also
+changed (global MiniBatchKMeans, was per-theme KMeans), and the basket grain
+changed (household x WEEK, was household x PERIOD), which invalidates
+everything derived from basket composition. Delete these under data/output/
+before running this version against any changed data or basket definition:
     basket_gnn_model.pt, copurchase_sparse.npz,
     product_id_to_index.pkl, product_units_avg.pkl,
     basket_gnn_embeddings.parquet, gmm_basket_model.pkl,
@@ -110,14 +112,17 @@ your downloaded tables:
     python build_product_embeddings.py
     python pipeline_main.py
 
-Stage 2 runs both Leiden and GMM clustering and reports how much they agree,
-since need-states here are decided by comparing/combining both methods
-rather than picking one. GMM_N_COMPONENTS below is a placeholder — swap it
-for your team's real best-K selection once that logic is available; in the
-meantime cluster_basket_embeddings.select_k_via_bic() gives a reasonable BIC
-sweep to eyeball.
+Stage 2 produces need-states with LEIDEN. GMM is opt-in behind --with-gmm and
+does not run by default: GMM_N_COMPONENTS is still the placeholder 30, and an
+Adjusted Rand Index between a 30-way and a ~356-way partition is driven to ~0
+by the granularity gap alone, so the comparison cost a full GaussianMixture fit
+over 57.1M x 64 float64 and reported a number that meant nothing. Pick a real K
+with cluster_basket_embeddings.select_k_via_bic() before turning it back on.
+Nothing about the GMM code changed — score_new_baskets.py still uses a saved
+model, which is where GMM genuinely earns its place (it can .predict() a brand
+new basket directly, where Leiden needs a kNN majority vote).
 
-Run:  python pipeline_main.py [--worker-id NAME]
+Run:  python pipeline_main.py [--worker-id NAME] [--with-gmm]
 """
 
 import argparse
@@ -197,6 +202,29 @@ def main():
              "(defaults to hostname-pid). DuckDB's chunk queue is only safe for "
              "one process at a time (see basket_store.claim_next_chunk) — this "
              "is mostly a diagnostic label for single-machine runs.",
+    )
+    # GMM is OPT-IN as of 2026-09-30. It used to run on every pipeline, and it
+    # was the most expensive thing in Stage 2 after the kNN search: a full
+    # GaussianMixture fit over 57.1M x 64 float64, repeated n_init times.
+    #
+    # What it bought was a comparison that cannot work. GMM_N_COMPONENTS is 30
+    # — flagged as a placeholder in config.py, .env.example and this file —
+    # while Leiden finds ~356 communities. The Adjusted Rand Index between a
+    # 30-way and a 356-way partition is driven toward 0 by the granularity gap
+    # alone, so compare_leiden_gmm() reports a number that says nothing about
+    # whether the two methods agree.
+    #
+    # The code is untouched and score_new_baskets.py still uses a saved model
+    # (a fitted GMM can .predict() a new basket directly, where Leiden needs
+    # the kNN majority-vote workaround — that is GMM's real advantage here).
+    # Pass --with-gmm to fit one, ideally after picking a real K with
+    # cluster_basket_embeddings.select_k_via_bic().
+    parser.add_argument(
+        "--with-gmm", action="store_true",
+        help="also fit a GMM over the basket embeddings (Stage 2b) and compare "
+             "it to Leiden. Off by default: at PIPELINE_GMM_N_COMPONENTS=30 "
+             "against ~356 Leiden communities the ARI is uninformative, and the "
+             "fit is expensive. Set a real K via select_k_via_bic() first.",
     )
     args = parser.parse_args()
 
@@ -466,22 +494,33 @@ def main():
     print(f"\nNeed-state clusters found: {_real_clusters.nunique()}")
     print(f"[Stage 2a] done in {fmt_duration(leiden_done - stage2_started)}")
 
-    print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
-    gmm_clusters = cluster_basket_embeddings_gmm(basket_gnn_embeddings, n_components=GMM_N_COMPONENTS)
-    print(f"[Stage 2b] done in {fmt_duration(time.perf_counter() - leiden_done)}")
+    if args.with_gmm:
+        print("\n[Stage 2b] GMM clustering (comparison / combination method)...")
+        gmm_clusters = cluster_basket_embeddings_gmm(basket_gnn_embeddings,
+                                                     n_components=GMM_N_COMPONENTS)
+        print(f"[Stage 2b] done in {fmt_duration(time.perf_counter() - leiden_done)}")
 
-    print("\n[Stage 2c] Comparing the two methods...")
-    compare_leiden_gmm(leiden_clusters, gmm_clusters)
+        print("\n[Stage 2c] Comparing the two methods...")
+        compare_leiden_gmm(leiden_clusters, gmm_clusters)
+    else:
+        gmm_clusters = None
+        print("\n[Stage 2b/2c] GMM SKIPPED (pass --with-gmm to run it). Leiden is the "
+              "method producing need-states; at GMM_N_COMPONENTS="
+              f"{GMM_N_COMPONENTS} against {_real_clusters.nunique()} Leiden "
+              "communities the ARI would be driven to ~0 by the granularity gap "
+              "alone and would not tell you whether the two methods agree.")
     print(f"[Stage 2] total {fmt_duration(time.perf_counter() - stage2_started)}")
 
     # Both label sets kept side by side — need_state_cluster (Leiden) and
     # need_state_cluster_gmm (GMM) — rather than collapsing to one, since the
     # real decision (compare vs. combine, and how) isn't settled yet.
-    need_state_clusters = leiden_clusters.merge(gmm_clusters, on="basket_id", how="outer")
+    need_state_clusters = (leiden_clusters if gmm_clusters is None
+                           else leiden_clusters.merge(gmm_clusters, on="basket_id",
+                                                      how="outer"))
     need_state_clusters_path = os.path.join(OUTPUT_DIR, "basket_need_state_clusters.parquet")
     need_state_clusters.to_parquet(need_state_clusters_path, index=False)
     print(f"  Saved {need_state_clusters_path} ({len(need_state_clusters):,} rows, "
-          f"columns: need_state_cluster [Leiden], need_state_cluster_gmm [GMM])")
+          f"columns: {', '.join(need_state_clusters.columns)})")
 
     # ─────────────────────────────────────────────
     # Stage 2.5: need-state GRAPHS — how need-states relate to each other
@@ -493,7 +532,23 @@ def main():
     #   transitions — where households actually go next (directed, time-ordered)
     # Only the second can answer "what journey can this customer take".
     print("\n[Stage 2.5] Building need-state graphs...")
-    _gmm_model = joblib.load(GMM_MODEL_PATH) if os.path.exists(GMM_MODEL_PATH) else None
+    # Only load a GMM that THIS run fitted.
+    #
+    # This used to be `joblib.load(GMM_MODEL_PATH) if os.path.exists(...)`,
+    # which was already loose — gmm_basket_model.pkl is not fingerprinted — and
+    # becomes an actual trap now that Stage 2b is opt-in: a model left behind by
+    # an earlier run would be scored against THIS run's embeddings, and
+    # build_gmm_overlap would produce a posterior-overlap matrix from a model
+    # that never saw this embedding space. It would look entirely plausible.
+    if args.with_gmm and os.path.exists(GMM_MODEL_PATH):
+        _gmm_model = joblib.load(GMM_MODEL_PATH)
+    else:
+        _gmm_model = None
+        if os.path.exists(GMM_MODEL_PATH):
+            print(f"  Skipping the GMM posterior-overlap cross-check: "
+                  f"{GMM_MODEL_PATH} exists but was fitted by an earlier run, and it "
+                  f"carries no fingerprint tying it to these embeddings. Rerun with "
+                  f"--with-gmm to fit one against this run.")
     need_state_graph.build_and_save_all(
         edges                 = basket_edges,
         # UNCLUSTERED rows are excluded here, not passed through: "-1" is the

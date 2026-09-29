@@ -69,7 +69,6 @@ def build_lmdb_cache(sampled_baskets_df, G, lmdb_path: str,
                 g = build_one_graph(
                     products=products, units=units, basket_id=basket_ids[i],
                     emb_matrix=G["emb_matrix"], emb_dim=G["emb_dim"],
-                    subcluster_arr=G["subcluster_arr"],
                     distinctiveness_arr=G["distinctiveness_arr"],
                     dense_cp=basket_dense_cp, local_idx=local_idx_map,
                     product_id_to_index=pid2idx,

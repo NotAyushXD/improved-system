@@ -30,8 +30,26 @@ WHY ADJACENCY IS COMPUTED HERE IN SQL
 ─────────────────────────────────────
 need_state_graph.build_need_state_adjacency() does this in pandas, which is
 fine at need-state grain but has to join 192M basket-level edges twice to get
-there. DuckDB streams that. The formula matches: n_edges, weight_sum, and lift
-as observed-over-expected under independence.
+there. DuckDB streams that.
+
+`lift` is the SAME quantity in both, and that was not true until 2026-09-30.
+This file used to compute it over cross-state edges only — self-loops filtered
+out BEFORE the degree term — and from `n_edges` rather than `weight_sum`. In a
+kNN graph most edges are within-state, so its denominator was several times
+smaller and the two artifacts reported numbers on different scales under one
+column name. Both were defensible; having both was not.
+
+Canonical definition, matching need_state_graph:
+
+    deg(X)        total edge WEIGHT incident to X, within-state edges included
+    total_w       total edge weight over all pairs, within-state included
+    expected(A,B) deg(A) * deg(B) / (2 * total_w)
+    lift          weight_sum(A,B) / expected(A,B)
+
+The question it answers is "do A and B touch more than their sizes predict".
+The old question — "given that an edge leaves A, is B an unusually common
+destination" — is still useful and is kept as a separate `cross_lift` column,
+which is what it always actually was.
 
 A NOTE ON avg_week_gap
 ──────────────────────
@@ -151,19 +169,34 @@ def adjacency(con, edges_path: str, clusters: pd.DataFrame, top_n: int) -> pd.Da
     """
     Which need-states border each other, from the basket-level kNN edges.
 
-    `lift` here is observed edges over what independence would predict, so a
-    lift of 1 means two need-states touch exactly as often as their sizes
+    Two columns, two different nulls — see the module docstring:
+
+      lift        weight_sum / (deg_a * deg_b / (2 * total_w)), where the
+                  degree and total include WITHIN-state edge weight. The
+                  configuration-model null. Identical to what
+                  need_state_graph.build_need_state_adjacency() writes to
+                  need_state_adjacency.parquet, so the two are comparable.
+      cross_lift  the same shape computed over cross-state EDGE COUNTS only.
+                  "Given that an edge leaves A, is B an unusually common
+                  destination." This is what the `lift` column in this file
+                  used to be.
+
+    A lift of 1 means two need-states touch exactly as often as their sizes
     imply — i.e. no meaningful adjacency. At full scale the adjacency table is
     ~79% of all possible pairs, so it is ONLY readable filtered by lift.
     """
     con.register("ns_labels", clusters.rename(columns={clusters.columns[1]: "ns"}))
     return con.execute(f"""
         WITH e AS (
+            -- Self-pairs are KEPT here: within-state edge weight belongs in the
+            -- degree term of a configuration-model null. They are dropped from
+            -- the output at the very end, the same way build_need_state_adjacency
+            -- drops them after computing deg.
             SELECT a.ns AS ns_a, b.ns AS ns_b, x.weight
             FROM read_parquet('{edges_path}') x
             JOIN ns_labels a ON a.basket_id = x.basket_a
             JOIN ns_labels b ON b.basket_id = x.basket_b
-            WHERE a.ns <> {UNCLUSTERED} AND b.ns <> {UNCLUSTERED} AND a.ns <> b.ns
+            WHERE a.ns <> {UNCLUSTERED} AND b.ns <> {UNCLUSTERED}
         ),
         pairs AS (
             SELECT LEAST(ns_a, ns_b) AS need_state_a,
@@ -172,23 +205,38 @@ def adjacency(con, edges_path: str, clusters: pd.DataFrame, top_n: int) -> pd.Da
                    SUM(weight) AS weight_sum
             FROM e GROUP BY 1, 2
         ),
+        -- Configuration-model terms: weight, self-pairs included.
         deg AS (
-            SELECT need_state_a AS ns, SUM(n_edges) AS d FROM pairs GROUP BY 1
+            SELECT need_state_a AS ns, SUM(weight_sum) AS d FROM pairs GROUP BY 1
             UNION ALL
-            SELECT need_state_b, SUM(n_edges) FROM pairs GROUP BY 1
+            SELECT need_state_b, SUM(weight_sum) FROM pairs GROUP BY 1
         ),
         degree AS (SELECT ns, SUM(d) AS degree FROM deg GROUP BY 1),
-        total AS (SELECT SUM(n_edges) AS m FROM pairs)
+        total AS (SELECT SUM(weight_sum) AS total_w FROM pairs),
+        -- Cross-only terms, for cross_lift: counts, self-pairs excluded.
+        xpairs AS (SELECT * FROM pairs WHERE need_state_a <> need_state_b),
+        xdeg AS (
+            SELECT need_state_a AS ns, SUM(n_edges) AS d FROM xpairs GROUP BY 1
+            UNION ALL
+            SELECT need_state_b, SUM(n_edges) FROM xpairs GROUP BY 1
+        ),
+        xdegree AS (SELECT ns, SUM(d) AS degree FROM xdeg GROUP BY 1),
+        xtotal AS (SELECT SUM(n_edges) AS m FROM xpairs)
         SELECT p.need_state_a, p.need_state_b, p.n_edges,
                ROUND(p.weight_sum, 2) AS weight_sum,
-               ROUND(p.n_edges * 1.0 / (SELECT m FROM total), 6) AS share_of_all_edges,
-               ROUND((p.n_edges * 1.0 / (SELECT m FROM total))
-                     / NULLIF((da.degree * 1.0 / (2 * (SELECT m FROM total)))
-                            * (db.degree * 1.0 / (2 * (SELECT m FROM total))) * 2, 0), 3)
-                   AS lift
-        FROM pairs p
-        JOIN degree da ON da.ns = p.need_state_a
-        JOIN degree db ON db.ns = p.need_state_b
+               ROUND(p.n_edges * 1.0 / (SELECT m FROM xtotal), 6) AS share_of_all_edges,
+               ROUND(p.weight_sum / NULLIF(
+                     da.degree * db.degree / (2.0 * (SELECT total_w FROM total)), 0), 3)
+                   AS lift,
+               ROUND((p.n_edges * 1.0 / (SELECT m FROM xtotal))
+                     / NULLIF((xda.degree * 1.0 / (2 * (SELECT m FROM xtotal)))
+                            * (xdb.degree * 1.0 / (2 * (SELECT m FROM xtotal))) * 2, 0), 3)
+                   AS cross_lift
+        FROM xpairs p
+        JOIN degree  da  ON da.ns  = p.need_state_a
+        JOIN degree  db  ON db.ns  = p.need_state_b
+        JOIN xdegree xda ON xda.ns = p.need_state_a
+        JOIN xdegree xdb ON xdb.ns = p.need_state_b
         ORDER BY p.n_edges DESC
         LIMIT {top_n}
     """).df()

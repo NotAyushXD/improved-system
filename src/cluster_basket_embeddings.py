@@ -1270,6 +1270,15 @@ if __name__ == "__main__":
                              "one band, e.g. --min-products 11 --max-products 20. Bands "
                              "cache under distinct filenames and cannot overwrite each "
                              "other.")
+    parser.add_argument("--tag", default=None, metavar="NAME",
+                        help="--build-edges mode: extra label folded into the cache "
+                             "filename, for a variant run over a DIFFERENT embedding "
+                             "table (e.g. --embeddings the mean-product-embedding "
+                             "control, --tag meanemb). Without it two embedding tables "
+                             "at the same k would fight over one cache file: the "
+                             "manifest refuses the mismatch, but only AFTER the second "
+                             "run has overwritten the first. Combines with "
+                             "--min/--max-products.")
     parser.add_argument("--embeddings",
                         default=os.path.join(OUTPUT_DIR, "basket_gnn_embeddings.parquet"),
                         help="basket embeddings parquet produced by Stage 1")
@@ -1282,15 +1291,16 @@ if __name__ == "__main__":
         _frame = pd.read_parquet(args.embeddings)
     print(f"  {len(_frame):,} baskets")
 
-    _band = None
+    _band = args.tag or None
     if args.build_edges and (args.max_products or args.min_products):
         lo, hi = args.min_products, args.max_products
         if lo and hi and lo > hi:
             raise SystemExit(f"--min-products {lo} is above --max-products {hi}")
 
         # Both bounds in the tag, so bands cannot collide on disk:
-        #   max10  ·  min21  ·  min11max20
-        _band = (f"min{lo}" if lo else "") + (f"max{hi}" if hi else "")
+        #   max10  ·  min21  ·  min11max20  ·  meanemb_max10 (with --tag)
+        _band = ((f"{args.tag}_" if args.tag else "")
+                 + (f"min{lo}" if lo else "") + (f"max{hi}" if hi else ""))
         where = " AND ".join(
             ([f"len(products) >= {int(lo)}"] if lo else [])
             + ([f"len(products) <= {int(hi)}"] if hi else [])

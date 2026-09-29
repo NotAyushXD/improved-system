@@ -208,7 +208,7 @@ during training and scoring. Take the basket above: `[MILK, BREAD, EGGS, BUTTER]
 ```
 
 **One NODE = one product, as it appears in this specific basket.** Its
-feature vector (`in_dim = 384 + 4 = 388` numbers) is:
+feature vector (`in_dim = 384 + 3 = 387` numbers) is:
 
 ```
 NODE "MILK" (inside basket 4213_202615)
@@ -223,20 +223,17 @@ NODE "MILK" (inside basket 4213_202615)
 │                                          the global co-purchase matrix,│
 │                                          normalised 0–1 within THIS    │
 │                                          basket                        │
-│ [385]    sub-cluster id (0–1)         → which of the K global product │
-│                                          clusters MILK belongs to      │
-│                                          (same for every MILK anywhere)│
-│ [386]    distinctiveness (0–1)        → how far MILK sits from its    │
+│ [385]    distinctiveness (0–1)        → how far MILK sits from its    │
 │                                          cluster centroid vs. the      │
 │                                          farthest centroid — same for  │
 │                                          every MILK anywhere           │
-│ [387]    log(units)                   → log1p(2) — MILK-SPECIFIC to   │
+│ [386]    log(units)                   → log1p(2) — MILK-SPECIFIC to   │
 │                                          THIS basket (bought 2 here)   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Three of these five components (embedding, sub-cluster id, distinctiveness)
-are **product-level constants** — the same for every MILK node in every
+Two of these four components (embedding, distinctiveness) are
+**product-level constants** — the same for every MILK node in every
 basket anywhere. Two (co-purchase score, log-units) are **basket-specific**
 — they depend on what else is in *this* basket and how much was bought
 *here*. That mix is deliberate: the GNN needs both "what kind of product is
@@ -252,13 +249,13 @@ since they depend on the real embedding geometry):
 | row sum ÷ (n−1=3) | 750,000 | 726,667 | 310,000 | 500,000 |
 | log1p(·) | 13.53 | 13.50 | 12.64 | 13.12 |
 | **[384] cp_score** (min-max over these 4) | **1.000** | **0.966** | **0.000** | **0.539** |
-| **[385] sub-cluster id** (cluster ÷ 199) | 0.070 (cluster 14 — dairy) | 0.236 (cluster 47 — bakery) | 0.106 (cluster 21) | 0.070 (cluster 14 — dairy, same as MILK) |
-| **[386] distinctiveness** | 0.71 | 0.58 | 0.83 | 0.65 |
-| **[387] log(units)** | log1p(2) = 1.099 | log1p(1) = 0.693 | log1p(1) = 0.693 | log1p(1) = 0.693 |
+| **[385] distinctiveness** | 0.71 | 0.58 | 0.83 | 0.65 |
+| **[386] log(units)** | log1p(2) = 1.099 | log1p(1) = 0.693 | log1p(1) = 0.693 | log1p(1) = 0.693 |
 
-Note MILK and BUTTER land in the *same* sub-cluster (both dairy, by
-embedding similarity) even though they were never told that label —
-that's the global K-means from §3 doing its job.
+MILK and BUTTER land in the same region of embedding space (both dairy)
+even though they were never told that label. The global K-means from §3
+still runs — `distinctiveness` is measured against its centroids — but the
+cluster *id* is no longer a node feature; see the note at the end of §7.
 
 **EDGES** carry 2 features each, built purely from co-purchase counts (no
 theme/category signal anywhere):
@@ -290,9 +287,8 @@ than MILK↔BREAD):
 |---|---|---|
 | [0:384] embedding | *identical* 384 floats | *identical* 384 floats |
 | [384] cp_score | 1.000 | **1.000** (see note below) |
-| [385] sub-cluster id | 0.070 | *identical* — 0.070 |
-| [386] distinctiveness | 0.71 | *identical* — 0.71 |
-| [387] log(units) | log1p(2) = 1.099 | log1p(1) = 0.693 |
+| [385] distinctiveness | 0.71 | *identical* — 0.71 |
+| [386] log(units) | log1p(2) = 1.099 | log1p(1) = 0.693 |
 
 *Note on the tie*: with only 2 products in a basket, there's exactly one
 co-purchase pair to compute from, so MILK and WINE's raw scores are
@@ -305,7 +301,7 @@ knowing about if a downstream analysis ever reads `cp_score` as an absolute
 popularity signal rather than a within-basket-relative one.
 
 The resulting object per basket is a PyTorch Geometric `Data`:
-`x` (shape `[n_products_in_basket, 388]`), `edge_index` (shape `[2, n_edges]`),
+`x` (shape `[n_products_in_basket, 387]`), `edge_index` (shape `[2, n_edges]`),
 `edge_attr` (shape `[n_edges, 2]`). Building this small, basket-scoped
 structure — rather than one giant matrix over the whole catalog — is exactly
 what keeps this step's memory bounded regardless of catalog size (see the
@@ -319,7 +315,7 @@ memory-fix history in `GPT_CONTEXT_PROMPT.md`).
 it's a training basket or a brand-new one being scored later:
 
 ```
- x [n, 388] ──► node_encoder (Linear 388→128) ──► ReLU
+ x [n, 387] ──► node_encoder (Linear 387→128) ──► ReLU
               │
               ▼
       GINEConv #1 (128→128, uses edge_attr) ──► ReLU ──► Dropout
@@ -367,7 +363,7 @@ all 4 is what `proj` then maps down to the final 64-dim basket embedding —
 in a real basket, one lone dissimilar item doesn't get to dominate the
 average the way it would in a 2-item basket.
 
-During training, a decoder (`64→128→388`) tries to reconstruct the basket's
+During training, a decoder (`64→128→387`) tries to reconstruct the basket's
 own mean node features from this 64-dim vector, and the reconstruction error
 is the training loss (a graph autoencoder) — there's no need-state label to
 predict; the model just learns to compress basket structure faithfully. A
@@ -464,7 +460,7 @@ Each of these is real behaviour of the current code, verified by a test in
 `1 − d(own centroid) / d(farthest centroid)`, so a **high** value means the
 product sits **close** to its own sub-cluster centroid — i.e. *typical* of it,
 not distinctive from it. Worth knowing before interpreting node feature
-`[386]`.
+`[385]`.
 
 **2. Every 2-item basket gets `cp_score = 1.0` for both nodes.** With n=2
 there is exactly one co-purchase pair, so both raw scores tie, and `_minmax()`
@@ -491,28 +487,65 @@ decide in SQL what should happen to them.
 
 **5. `GMM_N_COMPONENTS = 30` is still a placeholder**, explicitly labelled as
 such in the code; `select_k_via_bic()` exists to inform the choice and
-deliberately does not auto-pick.
+deliberately does not auto-pick. As of 2026-09-30 the GMM does **not** run by
+default — `pipeline_main.py --with-gmm` turns it on. An Adjusted Rand Index
+between a 30-way and a ~356-way partition is pushed to ~0 by the granularity
+gap alone, so the comparison cost a full fit over 57.1M × 64 float64 and
+reported a number that said nothing about whether the two methods agree.
 
-`LEIDEN_RESOLUTION` **is no longer a guess** — it is **1.5**, chosen from a
-measured sweep over the real graph. Below 1.0 the graph collapses into a
-single community; from 1.0 to 3.0 modularity varies only 3% while the
-community count rises smoothly. 1.5 gives 356 need-states, modularity 0.4145,
-largest community 1.5% of baskets. Sweep upward with
+`LEIDEN_RESOLUTION` **was chosen from a measured sweep** — 1.5, giving 356
+need-states at modularity 0.4145. ⚠ That sweep, and every number in it, was
+run on the embedding space described in note 9 below, i.e. one with no product
+semantics in it. **Re-sweep before trusting 1.5 again**; the resolution cliff
+is a property of a specific graph, not of Leiden. Sweep upward from 1.0 with
 `cluster_leiden_networkit.py --sweep`, never downward.
 
 **6. `orders` and `sales_inc_vat` are exported but never consumed** by any
 Python file. Need-states here are composition-driven only — no spend or
 frequency signal enters the model.
 
-**7. No theme or category anywhere.** Product sub-clustering (node feature
-`[385]`) runs globally over the whole catalog with no pre-grouping. It is
-*derived* structure, not a supplied hierarchy label.
+**7. No theme or category anywhere.** Product sub-clustering runs globally
+over the whole catalog with no pre-grouping. It is *derived* structure, not a
+supplied hierarchy label — and since 2026-09-30 the cluster **id** is not a
+node feature at all (note 9); only `distinctiveness`, measured against the
+same centroids, survives.
 
 **8. A low training loss does not mean the embeddings are useful.** The model
 reconstructs the *mean* of each basket's node features. If those means vary
 little across baskets, a near-constant output scores well — and every basket
 lands in nearly the same place, making clustering meaningless while everything
 appears to succeed. `test_pipeline.py --prod-outputs` checks for exactly this.
+
+A sharper form of the same warning: because the target is the mean of the node
+features and `emb_dim` of `in_dim` dimensions ARE the mean product-embedding
+vector, the loss is ~99% dominated by it, and the two `GINEConv` layers mix in
+neighbour information the target does not contain. The co-purchase graph
+therefore barely enters the gradient. `baseline_mean_embedding.py` exists to
+measure what that costs: it clusters the plain mean product embedding, no GNN,
+through the identical kNN/Leiden/profiling path. If the GNN cannot beat it,
+Stage 1 is elaborate machinery for an average.
+
+**9. Until 2026-09-30 the product embedding never reached the graph at all.**
+`tpnb` is an int in `cltv_hh_metrics_tpnb_base` and the basket export does not
+cast it, while `ns_tpnb_to_tpna_mapping.sql` and
+`parquet_loader.load_product_embeddings()` both cast it to str. The lookup in
+`prepare_globals()` therefore matched nothing, with no else branch and no
+counter: **every node carried an all-zero 384-dim embedding, sub_cluster_id
+0.0 and distinctiveness 0.5.** `in_dim` was still 388, sub-clustering still
+reported "Selected k=400", and no line in a multi-hour run was out of place.
+
+`basket_store.build_baskets_table()` now casts to VARCHAR at the one point
+both `products` and `product_uniques` are produced, and
+`GraphBuilder._check_product_key_overlap()` counts the matches and raises on
+zero. `test_pipeline.py` check 10 pins the wiring end to end with an integer
+`tpnb`, which the pre-existing synthetic fixtures could not — they are
+str-keyed on both sides.
+
+**Everything measured before that date describes a model with no product
+semantics in it**: the 1.949 median max lift, the ~1.2 permutation-null floor,
+the gamma-1.5 sweep, the mutual-kNN coverage curve, and the per-band
+characterisations in `BASKET_BANDING_DESIGN.md` §6–§7. The methods stand; the
+numbers need re-measuring.
 
 ---
 
@@ -562,8 +595,8 @@ households, baskets, products and need-states relate across both graphs.
 | Quantity | Value | Where |
 |---|---|---|
 | Product embedding dim | 384 | `all-MiniLM-L6-v2`, `build_product_embeddings.py` |
-| Extra node features | 4 (co-purchase score, sub-cluster id, distinctiveness, log-units) | `GraphBuilder.build_one_graph()` |
-| Node feature width (`in_dim`) | 388 | `emb_dim + 4` |
+| Extra node features | 3 (co-purchase score, distinctiveness, log-units) | `GraphBuilder.build_one_graph()` |
+| Node feature width (`in_dim`) | 387 | `emb_dim + 3` |
 | Edge feature width | 2 (log co-purchase count, relative strength) | `GraphBuilder._build_edges_numba()` |
 | Edges kept per node | ≤ `TOP_K = 10` | `PIPELINE_TOP_K` in `.env` |
 | GNN hidden width | 128 | `PIPELINE_HIDDEN_DIM` in `.env` |

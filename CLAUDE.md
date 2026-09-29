@@ -120,7 +120,7 @@ Every number below is measured on the real dataset, not estimated.
 | Co-purchase matrix non-zeros | 1,474,348,846 |
 | Training baskets sampled | 299,999 |
 | Inference chunks | 1,143 × 50,000 |
-| Node feature width | 388 (384 text + 4) |
+| Node feature width | **387** (384 text + 3) — was 388 until sub_cluster_id was dropped, 2026-09-30 |
 | Basket embedding width | 64 |
 | kNN edges (k=10, one-directional) | **508,168,451** |
 | Need-states at gamma=1.5 | **356** |
@@ -149,6 +149,61 @@ modularity 0.4145, largest community 1.5% of baskets, ~36 min on 64 threads.
 **If you change `k`, `mutual` or `resolution`, `.env` and the on-disk artifacts
 must agree** or the pipeline rebuilds an hour of work and then refuses the
 labels. See §6.
+
+> ⚠ **Every value above was calibrated on the pre-2026-09-30 embedding space —
+> the one with no product semantics in it (§4b). They are not wrong, they are
+> unverified against the corrected geometry.** Re-derive in this order:
+>
+> | | |
+> |---|---|
+> | `LEIDEN_RESOLUTION` | **Must re-sweep.** The resolution cliff is a property of a specific graph. One graph load, `--sweep 1.0 1.5 2.0 3.0`. |
+> | `USE_MUTUAL_KNN` | Worth one re-probe (~30 min). The 41/50/53% coverage curve in §7 was measured over embeddings with no product signal; real vectors may make neighbour relations far more reciprocal. If mutual now clears 95% it is the better graph. |
+> | `BASKET_KNN_K` | Falls out of the mutual probe. Low priority. |
+> | `MIN_GRAPH_COVERAGE` | Policy, not a measurement. Keep. |
+
+---
+
+## 4b. THE EMBEDDING BUG — READ BEFORE QUOTING ANY PRE-2026-09-30 NUMBER
+
+`tpnb` is an **int** in `cltv_hh_metrics_tpnb_base`, and
+`ns_household_tpnb_week_agg_train.sql` does not cast it. Both product-side
+extracts do — `ns_tpnb_to_tpna_mapping.sql` casts to STRING, and
+`parquet_loader.load_product_embeddings()` casts again with `.astype(str)`.
+
+So `GraphBuilder.prepare_globals()` looked up int keys in a str-keyed dict.
+It matched **nothing**, with no else branch and no counter behind it. Every
+product got an all-zero 384-dim embedding, sub_cluster_id 0.0 and
+distinctiveness 0.5 — 386 of 388 node-feature dimensions constant. `in_dim`
+was still 388, sub-clustering still printed "Selected k=400", every test
+passed, and nothing in a multi-hour run looked wrong.
+
+Fixed by casting to VARCHAR in `basket_store.build_baskets_table()` (which is
+where both `products` and `product_uniques` are produced), plus
+`_check_product_key_overlap()`, which counts the matches and raises on zero.
+`test_pipeline.py` check 10 pins it with an **integer** `tpnb` end to end —
+the pre-existing fixtures could not catch it because they are str-keyed on
+both sides.
+
+**What this invalidates.** Everything measured before 2026-09-30 describes a
+model that had never seen a product embedding:
+
+- the 1.949 median max lift and 12.4% > lift 3 in `experiment_log.csv`;
+- the ~1.2 permutation-null floor and the `lift > 3` threshold calibrated
+  against it (`BASKET_BANDING_DESIGN.md` §5);
+- the gamma sweep that chose 1.5, and the mutual-kNN coverage curve;
+- the per-band characterisations in `BASKET_BANDING_DESIGN.md` §6–§7 —
+  band L's "Northern Irish brands cluster together" is very likely the bug,
+  since brand is deliberately stripped from the embedded text and live
+  vectors push *against* brand grouping.
+
+**What survives.** All of the method: per-run permutation nulls, the
+`lift_basis` column, item-share lift, "sort by the thing you are measuring".
+And the banding *verdict* — that was a relative comparison (19.4% vs ~20% on
+identical baskets) where both sides carried the same defect, and the fix does
+not preferentially help small baskets.
+
+Encouragingly: 44 of 356 need-states cleared lift 3 **with no product
+semantics in the model at all.** The corrected run should be strictly better.
 
 ---
 
@@ -248,7 +303,7 @@ Each of these cost hours. None is obvious from reading the code.
 Changing the first is hours (retrain + re-embed). Changing the second is ~35
 minutes. They are unrelated.
 
-### Mutual-kNN silently deletes half the population — settled, do not revisit
+### Mutual-kNN silently deletes half the population — settled on the OLD geometry, re-probe once
 
 Vertices are derived from edge endpoints, so a basket that loses every edge
 stops existing. Measured coverage under `USE_MUTUAL_KNN=true`:
@@ -261,8 +316,18 @@ stops existing. Measured coverage under `USE_MUTUAL_KNN=true`:
 
 The curve flattens in the low 50s. It never reaches the 95% floor. The dropped
 baskets are **not random** — they are the ones in sparse regions, i.e. the most
-distinctive shopping missions. Use `USE_MUTUAL_KNN=false`, which gives 100%
-coverage by construction; `k` then controls density only, never coverage.
+distinctive shopping missions. Use `USE_MUTUAL_KNN=false`; `k` then controls
+density only, essentially never coverage. (Not *quite* "100% by construction":
+`build_basket_knn_graph` drops edges with cosine similarity ≤ 0, so a basket
+whose every neighbour is negatively similar would still fall out. Measured
+100% here — read the Coverage line rather than assuming it.)
+
+⚠ Every figure in that table was measured over embeddings with **no product
+semantics in them** (§4b). Neighbour reciprocity is exactly the kind of thing
+real product vectors would change. Worth one `--k 15 30 50` probe (~30 min)
+against the corrected embeddings before treating this as settled again: if
+mutual now clears the 95% floor it is the better graph, because it suppresses
+hub bridges without the one-directional graph's density.
 
 ### The resolution cliff
 
@@ -362,8 +427,51 @@ Capture the py-spy dump **before** killing anything.
 Stage 0, Stage 1 (co-purchase, sub-clusters, GNN training, full inference over
 all 57.1M baskets), Stage 2a (edge build + NetworKit clustering, 100% coverage).
 
-### In progress
-Stage 2b (GMM) — slow, see §7. Stages 2c and 2.5 unreached at production scale.
+### The one thing blocking everything else
+A **full rebuild against the corrected embeddings** (§4b). Until that lands,
+no lift number in this repository describes the model as it now stands. Order:
+
+```powershell
+# 0. confirm the diagnosis — 2 seconds
+.\.venv\Scripts\python.exe -c "import pickle, parquet_loader; pid=pickle.load(open(r'..\data\output\product_id_to_index.pkl','rb')); emb=set(parquet_loader.load_product_embeddings()['tpnb']); print('matched:', sum(1 for k in pid if k in emb), 'of', len(pid))"
+
+# 1. orphan the old embeddings — NOT fingerprinted, will not self-invalidate
+.\.venv\Scripts\python.exe .\reset_inference.py --dataset-tag train --yes
+.\.venv\Scripts\python.exe .\test_pipeline.py
+
+# 2. rebuild. LMDB + model rebuild automatically (GRAPH_BUILDER_VERSION 4).
+#    Stops at Stage 2a naming the Leiden command, as designed.
+.\.venv\Scripts\python.exe -u .\pipeline_main.py *> E:\ayp\pipeline.log
+.\.venv\Scripts\python.exe -u .\cluster_leiden_networkit.py --sweep 1.0 1.5 2.0 3.0 *> E:\ayp\sweep.log
+.\.venv\Scripts\python.exe -u .\cluster_leiden_networkit.py --resolution <from the sweep> *> E:\ayp\labels.log
+.\.venv\Scripts\python.exe -u .\pipeline_main.py *> E:\ayp\pipeline2.log
+
+# 3. the only thing that says whether it worked
+.\.venv\Scripts\python.exe -u .\profile_need_states.py
+.\.venv\Scripts\python.exe -u .\evaluate_run.py --clusters <labels> --note "post embedding fix"
+#    plus its OWN permutation null — the floor moves with cluster size
+```
+
+`copurchase_sparse.npz` and `product_subclusters.pkl` survive the fix (the
+product-index ORDERING is deliberately preserved — see the docstring of
+`basket_store.build_baskets_table`), which is hours saved.
+
+### Running alongside it
+**`baseline_mean_embedding.py`** — the control the GNN has never been measured
+against. Clusters the plain mean product embedding per basket, PCA'd to 64
+dims, through the identical kNN/Leiden/profiling path, tagged `meanemb` so
+nothing collides. The loss reconstructs the mean of the node features and
+`emb_dim` of `in_dim` dimensions *are* that mean, so the graph convolutions
+barely enter the gradient. If the GNN cannot beat this on `excess` lift,
+Stage 1 is elaborate machinery for an average.
+
+### Parked, deliberately
+Stage 2b (GMM) is now opt-in behind `pipeline_main.py --with-gmm`. At
+`GMM_N_COMPONENTS=30` against ~356 Leiden communities the ARI is driven to ~0
+by the granularity gap alone, so it cost a full fit and reported nothing. Set
+a real K with `select_k_via_bic()` before turning it back on. GMM's real value
+here is scoring — a fitted model can `.predict()` a new basket directly, where
+Leiden needs the kNN majority vote in `score_new_baskets.py`.
 
 ### Designed but not built
 - **Hierarchical rollup.** 356 need-states is too many for a business audience,
@@ -378,6 +486,12 @@ Stage 2b (GMM) — slow, see §7. Stages 2c and 2.5 unreached at production scal
 - **Similarity threshold on kNN edges.** There is no knob for "only connect
   baskets more than X% similar" — you control *how many* neighbours, never *how
   close*. Distance survives only as the edge weight.
+- **`units / this product's typical units`** as a node feature, replacing the
+  absolute `log_units`. "24 beers is a party, 2 beers is a Tuesday" — a much
+  better occasion signal than raw quantity. `product_units_avg` is already
+  computed and passed into `prepare_globals`; rebuilding the array is one
+  line. Held back deliberately so the embedding fix can be attributed on its
+  own; it needs its own rebuild cycle and its own permutation null.
 
 ### Known data limitation
 `PIPELINE_TRANSITION_MAX_WEEK_GAP=none` is a deliberate deviation. The training

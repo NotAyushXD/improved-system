@@ -191,8 +191,8 @@ def train_and_embed(
         copurchase_sparse   = copurchase_sparse,
         product_units_avg   = product_units_avg,
     )
-    in_dim = G["in_dim"]   # emb_dim + 4
-    print(f"  Node feature dim: {in_dim}  (emb_dim={G['emb_dim']} + 4 extra features)")
+    in_dim = G["in_dim"]   # emb_dim + 3  (cp_score, distinctiveness, log_units)
+    print(f"  Node feature dim: {in_dim}  (emb_dim={G['emb_dim']} + 3 extra features)")
 
     # ── Step 2: Sample training baskets (from DuckDB, bounded result size) ──
     print("\n[ 2 / 4 ] Sampling training baskets...")
