@@ -377,8 +377,8 @@ cluster over next.
 
 ## 6. Basket embeddings → need-states
 
-Every basket now has one 64-dim vector. Two independent clustering passes
-run over these vectors (not over products, not over raw baskets):
+Every basket now has one 64-dim vector. **Leiden** clusters it. A **GMM**
+path exists alongside and is opt-in:
 
 ```
                     64-dim basket embeddings
@@ -388,7 +388,7 @@ run over these vectors (not over products, not over raw baskets):
    kNN graph (k=10,                    GaussianMixture
    one-directional,                    (n_components=30,
    cosine similarity)                   diagonal covariance)
-              │                            │
+              │                       ── ONLY with --with-gmm ──
               ▼                            │
    Leiden community detection              ▼
    (NetworKit ParallelLeiden,         need_state_cluster_gmm
@@ -399,9 +399,29 @@ run over these vectors (not over products, not over raw baskets):
               └─────────────┬──────────────┘
                              ▼
               basket_need_state_clusters.parquet
-        (both label sets kept side by side — compared via
-         Adjusted Rand Index, neither discarded)
 ```
+
+**Stage 2b/2c are off by default since 2026-09-30.** `GMM_N_COMPONENTS` is
+still the placeholder 30 while Leiden finds ~356 communities, and an Adjusted
+Rand Index between a 30-way and a 356-way partition is driven toward 0 by the
+granularity gap alone — so `compare_leiden_gmm` cost a full fit over
+57.1M × 64 float64 and reported a number that said nothing about whether the
+two methods agree. Pass `pipeline_main.py --with-gmm` to run it, ideally after
+picking a real K with `select_k_via_bic()`. With the flag, both label sets are
+written side by side and neither is discarded; without it, the file carries
+the Leiden columns only.
+
+The GMM code is untouched, and `score_new_baskets.py` still uses a saved model
+— which is where GMM genuinely earns its place, since a fitted GMM can
+`.predict()` a brand-new basket directly where Leiden needs a kNN majority
+vote.
+
+**And one control worth running once.** `baseline_mean_embedding.py` clusters
+the plain mean product embedding per basket — PCA'd to 64 dims, no GNN, no
+training — through this exact same kNN/Leiden path. The autoencoder target in
+§5 is the mean of the node features, and 384 of 387 dimensions *are* that
+mean, so the co-purchase graph barely enters the gradient. If the GNN cannot
+beat the control on lift-above-its-own-null, §5 is an elaborate average.
 
 A basket's `need_state_cluster` is therefore a group of baskets whose
 64-dim GNN embeddings sit close together — which, by construction, means
@@ -601,6 +621,7 @@ households, baskets, products and need-states relate across both graphs.
 | Edges kept per node | ≤ `TOP_K = 10` | `PIPELINE_TOP_K` in `.env` |
 | GNN hidden width | 128 | `PIPELINE_HIDDEN_DIM` in `.env` |
 | Basket embedding dim (`out_dim`) | 64 | `PIPELINE_OUT_DIM` in `.env` |
-| Global product sub-clusters (K) | chosen from `[50, 100, 200, 400]` by silhouette | `PIPELINE_SUBCL_K_CANDIDATES` in `.env`. On the real catalog k=400 was selected — the ceiling of the range, with silhouette still rising, so the true optimum is likely higher |
-| Leiden kNN neighbors | 15 | `PIPELINE_BASKET_KNN_K` in `.env` |
-| GMM components | 30 (placeholder) | `PIPELINE_GMM_N_COMPONENTS` in `.env` |
+| Global product sub-clusters (K) | chosen from `[50, 100, 200, 400]` by silhouette | `PIPELINE_SUBCL_K_CANDIDATES` in `.env`. On the real catalog k=400 was selected — the ceiling of the range, with silhouette still rising, so the true optimum is likely higher. Feeds `distinctiveness` only; the cluster id is not a node feature |
+| Leiden kNN neighbors | 15 default, **10** in `.env` | `PIPELINE_BASKET_KNN_K` in `.env` |
+| Leiden resolution | 1.0 default, **1.5** in `.env` — ⚠ re-sweep, see note 5 | `PIPELINE_LEIDEN_RESOLUTION` in `.env` |
+| GMM components | 30 (placeholder); Stage 2b off by default | `PIPELINE_GMM_N_COMPONENTS` in `.env`, `pipeline_main.py --with-gmm` |

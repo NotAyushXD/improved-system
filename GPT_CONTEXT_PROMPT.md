@@ -1,5 +1,28 @@
 # Context for reviewing this codebase
 
+> [!WARNING]
+> **This briefing is OUT OF DATE as of 2026-09-30 and its "current state"
+> claims should not be relied on.** It is kept because the domain framing and
+> the theme-free history below are still accurate and still worth pasting.
+>
+> Read **[CLAUDE.md](CLAUDE.md)** for current state — it is the authority. In
+> particular, three things below are now wrong:
+>
+> 1. **Node feature width is 387 (`emb_dim + 3`), not 388.** `sub_cluster_id`
+>    was dropped as a node feature: a ~400-way nominal label flattened onto
+>    one scalar, and a deterministic function of the embedding already present
+>    in full in the same row.
+> 2. **The product embedding never reached the graph until 2026-09-30.**
+>    `tpnb` is an int on the basket side and a str on both product sides, so
+>    the lookup matched nothing and every node carried an all-zero 384-dim
+>    vector — silently. Every measured result predating the fix describes a
+>    model with no product semantics in it. See CLAUDE.md §4b.
+> 3. **Stage 2b (GMM) is opt-in**, behind `pipeline_main.py --with-gmm`, not
+>    part of the default run.
+>
+> If you are pasting this into an AI to brief it, paste CLAUDE.md as well and
+> tell it CLAUDE.md wins on any conflict.
+
 I'm uploading the full contents of a data pipeline. Please read this context
 first, then wait for my actual question/task at the end (or in my next
 message) before proposing changes.

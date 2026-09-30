@@ -238,9 +238,15 @@ def run_parallel_leiden(graph, resolution: float, iterations: int, want_membersh
 
     print(f"  -> {n_communities:,} communities, "
           f"modularity={modularity:.4f}, in {fmt_duration(elapsed)}")
-    print(f"     sizes: largest={sizes[0]:,} ({largest_share:.1%} of clustered baskets), "
-          f"median={int(np.median(sizes)):,}, "
-          f"top5={[int(s) for s in sizes[:5]]}")
+    # largest_share guards len(sizes); the size line did not, so an empty
+    # partition turned a "nothing to cluster" situation into an IndexError.
+    if len(sizes):
+        print(f"     sizes: largest={sizes[0]:,} ({largest_share:.1%} of clustered baskets), "
+              f"median={int(np.median(sizes)):,}, "
+              f"top5={[int(s) for s in sizes[:5]]}")
+    else:
+        print("     sizes: NO communities — the graph has no vertices. Check that "
+              "the edge list is non-empty.")
     if largest_share > 0.5:
         print(f"     WARNING: one community holds {largest_share:.1%} of all clustered "
               f"baskets. That is hub collapse, not a need-state — unrelated groups have "
@@ -285,6 +291,16 @@ def main():
     args = parser.parse_args()
     if args.out is None:
         args.out = labels_path_for(args.edges, args.resolution)
+        if args.smoke_test:
+            # A smoke test MUST NOT be able to land on the production label
+            # path. It used to: --out defaulted to labels_path_for(...), and the
+            # manifest written at the end embeds the REAL edge manifest — so a
+            # mechanics check over the first N edges produced a file that
+            # pipeline_main would load as genuine, fingerprint and all, while
+            # the run's own output said "these clusters are not a result".
+            # Nothing downstream could tell.
+            stem, ext = os.path.splitext(args.out)
+            args.out = f"{stem}_SMOKETEST{ext}"
 
     if args.threads is not None:
         nk.setNumberOfThreads(args.threads)
@@ -363,8 +379,16 @@ def main():
         print(f"  NOTE: no manifest beside {args.edges}, so these labels cannot be "
               f"fingerprinted. pipeline_main will refuse to reuse them and will ask "
               f"you to re-cluster.")
-    write_labels(result, label_manifest(edge_manifest, args.resolution, args.iterations),
-                 path=args.out)
+    manifest = label_manifest(edge_manifest, args.resolution, args.iterations)
+    if args.smoke_test:
+        # Belt as well as braces on the filename above: poison the manifest so
+        # that even if this file is renamed onto the production path by hand, no
+        # load_cached_labels() call can ever match it.
+        manifest["smoke_test_edges"] = int(args.smoke_test)
+        print(f"  SMOKE TEST: writing to {args.out} with a deliberately "
+              f"unmatchable manifest. These labels cannot be picked up by "
+              f"pipeline_main, by design.")
+    write_labels(result, manifest, path=args.out)
     print(f"\nSaved {args.out} ({len(result):,} rows)")
     print(f"  communities: {result.loc[result['need_state_cluster'] != UNCLUSTERED, 'need_state_cluster'].nunique():,}")
     print(f"  modularity : {modularity:.4f}")

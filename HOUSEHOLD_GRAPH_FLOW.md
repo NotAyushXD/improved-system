@@ -34,7 +34,7 @@ Households are nodes in neither of them.**
 
 A household is never a node, never has an embedding, and is never clustered.
 It survives only as a **string prefix inside `basket_id`**
-(`basket_store.py:117`):
+(`basket_store.build_baskets_table()`):
 
 ```sql
 CAST(household_number AS VARCHAR) || '_' || CAST(year_week_number AS VARCHAR)
@@ -61,24 +61,24 @@ LEVEL                                    WHERE IT'S SET                      ROW
          │  SUM(quantity), SUM(orders), SUM(sales_inc_vat)
          │  WHERE year*100+period BETWEEN 202603 AND 202604   ← ~2 periods ≈ 8 weeks
          │  ⚠ NO household sampling filter is actually present in the SQL.
-         │    pipeline_main.py:225 warns to "check the MOD(household_number, N) = 0
+         │    pipeline_main warns to "check the MOD(household_number, N) = 0
          │    filter is being applied" — that filter does not exist in any file
          │    under data/. Full household population is exported as written.
          ▼
   household × tpnb × week                      the exported parquet             ~billions
          │
-         │  basket_store.build_baskets_table()   basket_store.py:113-138
+         │  basket_store.build_baskets_table()
          │  GROUP BY household_number, year_week_number
          │  list(tpnb) → products,  list(quantity) → units
          │  HAVING len(list(tpnb)) >= 2          ← 1-item baskets dropped
          ▼
   household × week   ("a basket")               baskets_train in DuckDB          ~tens of M
          │
-         │  GraphBuilder.build_one_graph()       GraphBuilder.py:438
+         │  GraphBuilder.build_one_graph()
          ▼
   product-within-a-basket   ("a node")          PyG Data.x                       ~hundreds of M
          │
-         │  global_mean_pool + proj              GNN_Train.py:120-121
+         │  global_mean_pool + proj  (BasketGNN.encode)
          ▼
   household × week, as 64 floats                basket_gnn_embeddings.parquet    ~tens of M
          │
@@ -142,7 +142,7 @@ Careful — the word "embedding" means two different things in this codebase:
 
 ## 3. How a NODE is created  (Graph A — inside one basket)
 
-`GraphBuilder.build_one_graph()`, GraphBuilder.py:438-537. Called identically
+`GraphBuilder.build_one_graph()`. Called identically
 for training and scoring — there is only one graph-building function, on
 purpose, so train/score can't drift.
 
@@ -151,11 +151,11 @@ purpose, so train/score can't drift.
    products = [MILK, BREAD, EGGS, BUTTER]      units = [2, 1, 1, 1]
 
         ┌──────────────────────────────────────────────────────┐
-        │  dedupe: keep first occurrence, SUM units for dupes   │  line 457-470
+        │  dedupe: keep first occurrence, SUM units for dupes   │
         └──────────────────────────────────────────────────────┘
                               │
         ┌─────────────────────┴───────────────────────────────────────────────┐
-        │  ONE NODE PER DISTINCT PRODUCT.   in_dim = 384 + 4 = 388             │
+        │  ONE NODE PER DISTINCT PRODUCT.   in_dim = 384 + 3 = 387             │
         └─────────────────────────────────────────────────────────────────────┘
 
    NODE "MILK"  (as it exists inside THIS basket)
@@ -167,43 +167,55 @@ purpose, so train/score can't drift.
    ├────────────┼────────────────────────────┼──────────────────────────────┤
    │ [384]      │ cp_score                    │ ◄ BASKET-SPECIFIC            │
    │            │ log1p(row_sum−diag)/(n−1),  │   depends on what ELSE is in │
-   │            │ then min-max within basket  │   this basket   (line 493-498)│
+   │            │ then min-max within basket  │   this basket   │
    ├────────────┼────────────────────────────┼──────────────────────────────┤
-   │ [385]      │ sub_cluster_id / (k−1)      │ PRODUCT only                 │
-   │            │ global K-means over whole   │   (GraphBuilder.py:238-309)  │
-   │            │ catalog, k ∈ {50,100,200,   │                              │
-   │            │ 400} by silhouette          │                              │
+   │ [385]      │ distinctiveness             │ PRODUCT only                 │
+   │            │ 1 − d(own centroid)/        │   measured against the same  │
+   │            │      d(farthest centroid)   │   global K-means centroids   │
    ├────────────┼────────────────────────────┼──────────────────────────────┤
-   │ [386]      │ distinctiveness             │ PRODUCT only                 │
-   │            │ 1 − d(own centroid)/        │   (line 287)                 │
-   │            │      d(farthest centroid)   │                              │
-   ├────────────┼────────────────────────────┼──────────────────────────────┤
-   │ [387]      │ log1p(units)                │ ◄ BASKET-SPECIFIC            │
-   │            │                              │   log1p(2) here   (line 483) │
+   │ [386]      │ log1p(units)                │ ◄ BASKET-SPECIFIC            │
+   │            │                              │   log1p(2) here              │
    └────────────┴────────────────────────────┴──────────────────────────────┘
 
-        3 of 5 components are product constants; 2 are basket-specific.
+        2 of 4 components are product constants; 2 are basket-specific.
         That mix is the design: "what kind of product is this, globally"
         + "how is it behaving in THIS basket".
 ```
+
+**`sub_cluster_id` used to sit at [385] and was removed on 2026-09-30**, which
+is why everything after cp_score shifted down one slot. It was the product's
+global K-means cluster id stored as `label / (k − 1)`: a ~400-way nominal label
+flattened onto one scalar, so cluster 200 and 201 were adjacent and meant
+nothing to each other. It was also a deterministic function of the 384-dim
+embedding sitting in slots [0:384] of the very same row. The global K-means
+still runs — `distinctiveness` is measured against its centroids — but the
+cluster id itself is gone. See `GraphBuilder.prepare_globals`' docstring.
+
+> [!WARNING]
+> **Until 2026-09-30, slots [0:384] were all zero for every product in every
+> basket.** `tpnb` is an int in the basket export and a str in both product
+> extracts, so the lookup in `prepare_globals()` matched nothing — silently,
+> with no else branch and no counter. `in_dim` still read 388 and nothing in
+> the log was out of place. Any need-state output produced before that date
+> has no product information in it at all. See `CLAUDE.md` §4b.
 
 ### Edges inside the basket
 
 ```
         Source of truth: the GLOBAL co-purchase matrix
         ──────────────────────────────────────────────
-        pipeline_main.py:272-306 —  copurchase = Σ over chunks of Xᵀ·X
+        pipeline_main Stage 1a —  copurchase = Σ over chunks of Xᵀ·X
           X = basket × product incidence, so (Xᵀ X)[a,b] = # baskets
           containing BOTH a and b, population-wide.
           Built in 500k-basket chunks, checkpointed, fingerprinted.
           Exactly additive over row-disjoint chunks → chunking changes nothing.
                               │
                               │  sliced per basket — never the full matrix
-                              │  _basket_dense_cp_submatrix()  GraphBuilder.py:411
+                              │  GraphBuilder._basket_dense_cp_submatrix()
                               ▼
         For basket 4213_202615, a 4×4 submatrix over {MILK,BREAD,EGGS,BUTTER}
                               │
-                              │  _build_edges_numba()  GraphBuilder.py:109-174
+                              │  GraphBuilder._build_edges_numba()
                               ▼
         Keep each node's TOP_K = 10 strongest partners *within this basket*
 
@@ -220,29 +232,29 @@ purpose, so train/score can't drift.
         edge_attr = 2 features:
           [0]  log1p(co-purchase count)              — absolute strength
           [1]  count / this node's OWN strongest link — relative, self-scaled
-                                                        (line 162-171)
+                                                        
 ```
 
 Note the edge features are **purely co-purchase-derived**. No theme, category,
 or hierarchy signal enters the graph anywhere — the module docstring
-(GraphBuilder.py:9-39) is emphatic that this replaced an earlier
+(GraphBuilder.py's header) is emphatic that this replaced an earlier
 theme-flag design.
 
 **Why per-basket slicing matters:** a single dense catalog-wide co-purchase
 matrix would be ~200k² × 4 bytes ≈ **160 GB**. Each basket's own submatrix is
 bounded by its own product count squared — independent of catalog size
-(GraphBuilder.py:388-409).
+(`GraphBuilder._basket_dense_cp_submatrix`).
 
 ---
 
 ## 4. Graph A → one point in the embedding space
 
-`GNN_Train.BasketGNN`, GNN_Train.py:83-126.
+`GNN_Train.BasketGNN`.
 
 ```
-   x [n_products_in_basket, 388]
+   x [n_products_in_basket, 387]
         │
-        ▼  node_encoder: Linear 388 → 128, ReLU
+        ▼  node_encoder: Linear 387 → 128, ReLU
    [n, 128]
         │
         ▼  GINEConv #1 (uses edge_attr) → ReLU → Dropout(0.1)
@@ -251,7 +263,7 @@ bounded by its own product count squared — independent of catalog size
         ▼  GINEConv #2 (uses edge_attr) → ReLU
    [n, 128]
         │
-        ▼  global_mean_pool   ── collapses n nodes → 1 vector  (line 120)
+        ▼  global_mean_pool   ── collapses n nodes → 1 vector  
    [1, 128]
         │
         ▼  proj: Linear 128→128 → ReLU → Linear 128→64
@@ -261,7 +273,7 @@ bounded by its own product count squared — independent of catalog size
 ### How it's trained — no labels anywhere
 
 ```
-        z (64) ──► decoder: 64→128→388 ──► recon (388)
+        z (64) ──► decoder: 64→128→387 ──► recon (387)
                                              │
         target = mean of this basket's own node features  (line 129-132)
                                              │
@@ -272,18 +284,27 @@ It's a **graph autoencoder**. There is no need-state label to predict; the
 model only learns to compress basket structure faithfully. Need-states are
 *discovered* afterwards, by clustering — never supervised.
 
+**Read the target carefully, though.** 384 of the 387 dimensions it
+reconstructs are the basket's mean product-embedding vector, so MSE is
+overwhelmingly dominated by it, and the two `GINEConv` layers mix in
+neighbour information the target does not contain. The co-purchase graph
+therefore contributes very little to the gradient. `baseline_mean_embedding.py`
+measures what that costs: it clusters the plain mean product embedding, no GNN
+at all, through the identical kNN/Leiden/profiling path. If the GNN cannot beat
+that control, this whole stage is an elaborate average.
+
 Training config: 300k baskets sampled **stratified by basket size**
-(buckets ≤5 / ≤15 / ≤50 / >50, `basket_store.py:120-126`, sampled at
+(buckets ≤5 / ≤15 / ≤50 / >50, the `size_bucket` column, sampled at
 `sample_training_baskets()` line 188), 20 epochs, lr 1e-4, Adam, grad-clip 1.0.
 Then **every** basket in the population is embedded by the same `encode()` path
-in restartable 50k chunks (`run_inference`, GraphBuilder.py:628).
+in restartable 50k chunks (`GraphBuilder.run_inference`).
 
 ---
 
 ## 5. ★ How households connect to each other  (Graph B)
 
 **This is the answer to the core question.** `build_basket_knn_graph()`,
-cluster_basket_embeddings.py:72-183.
+`cluster_basket_embeddings.build_basket_knn_graph`.
 
 ```
    Every basket is now a 64-dim point. L2-normalized (line 101).
@@ -341,7 +362,8 @@ before igraph ever sees it.
 ## 6. Clustering that graph → need-states
 
 Two independent methods run over the **same** 64-dim vectors, and **both are
-kept** — `pipeline_main.py:349-365` deliberately does not pick one.
+kept** — `pipeline_main` deliberately does not pick one. (With `--with-gmm`;
+see the note in §6.)
 
 ```
                     64-dim basket embeddings (L2-normalized)
@@ -380,6 +402,21 @@ kept** — `pipeline_main.py:349-365` deliberately does not pick one.
                              | gmm_confidence
 ```
 
+> [!NOTE]
+> **The GMM half of this diagram is off by default since 2026-09-30.**
+> `pipeline_main.py --with-gmm` turns it on; without it the output carries the
+> Leiden columns only, and `compare_leiden_gmm` does not run.
+>
+> `GMM_N_COMPONENTS` is still the placeholder 30 while Leiden finds ~356
+> communities, and an Adjusted Rand Index between a 30-way and a 356-way
+> partition is driven toward 0 by the granularity gap alone — so the
+> comparison cost a full GaussianMixture fit over 57.1M x 64 float64 and
+> reported a number that said nothing about whether the two methods agree.
+> Pick a real K with `select_k_via_bic()` before turning it back on.
+>
+> None of the GMM code changed, and the row that matters below — new baskets —
+> is still why it exists.
+
 ### Why both
 
 | | Leiden | GMM |
@@ -391,13 +428,14 @@ kept** — `pipeline_main.py:349-365` deliberately does not pick one.
 | confidence | neighbour-vote agreement | posterior probability |
 
 That last row is the practical dividing line, and it's called out explicitly at
-cluster_basket_embeddings.py:271-274 and :380-384.
+`cluster_basket_embeddings.assign_new_baskets_to_clusters` and
+`cluster_basket_embeddings_gmm`.
 
 ---
 
 ## 7. How a household joins a need-state that already exists
 
-Two different mechanisms, both in `score_new_baskets.py:224-243`:
+Two different mechanisms, both in `score_new_baskets.main()`:
 
 ```
    NEW basket  (hh 8812, week 202620)
@@ -411,7 +449,7 @@ Two different mechanisms, both in `score_new_baskets.py:224-243`:
    │                                                               │
    ▼ LEIDEN PATH                                     GMM PATH ◄────┘
    assign_new_baskets_to_clusters()                  gmm.predict(X)
-   cluster_basket_embeddings.py:265                  score_new_baskets.py:233
+   assign_new_baskets_to_clusters()                  gmm.predict()
    │                                                 │
    │ find k=15 nearest ALREADY-CLUSTERED             │ direct posterior —
    │ reference baskets (cosine)                      │ no neighbours needed
@@ -421,14 +459,20 @@ Two different mechanisms, both in `score_new_baskets.py:224-243`:
    │ cluster_confidence = fraction of the 15     gmm_confidence
    │ neighbours that agreed
    │   < 0.5 ⇒ basket sits BETWEEN need-states
-   │   (counted and reported, line 329-331)
+   │   (counted and reported)
    ▼
    need_state_cluster
 ```
 
 So a new household attaches to a need-state **through its nearest existing
 households** (Leiden path) or **through the fitted density model** (GMM path).
-Both are run and both columns are written.
+
+`score_new_baskets.py` runs the Leiden path always, and the GMM path only when
+`gmm_basket_model.pkl` exists — which now means only when a run was done with
+`pipeline_main.py --with-gmm`. Note the kNN vote excludes `UNCLUSTERED` (-1)
+reference baskets: "-1" is the ABSENCE of a need-state, and letting a new
+basket be voted into it would invent a need-state that every unplaced basket
+appears to belong to.
 
 ---
 
@@ -457,7 +501,7 @@ Both are run and both columns are written.
           │  │     + global K-means sub-clusters over WHOLE catalog
           ▼  ▼
  ┌──────────────────────────────────────────┐
- │  GRAPH A  — nodes = PRODUCTS (388 feats) │   one per basket
+ │  GRAPH A  — nodes = PRODUCTS (387 feats) │   one per basket
  │             edges = top-10 co-purchase    │   households absent
  └────────────────────┬─────────────────────┘
                       │  BasketGNN: 2×GINEConv → mean-pool → proj
@@ -554,7 +598,7 @@ plausible routes, not forecasts, and check `low_support_steps` first.
 
 ## 9. Footnotes on things that are easy to misread
 
-1. **`distinctiveness` is arguably named backwards.** GraphBuilder.py:287
+1. **`distinctiveness` is arguably named backwards.** `build_product_subclusters`
    computes `1 − d(own centroid)/d(farthest centroid)`, so a **high** value
    means a product sits **close** to its own centroid — i.e. typical of its
    sub-cluster, not distinctive from it. Worth knowing before interpreting
@@ -562,23 +606,43 @@ plausible routes, not forecasts, and check `low_support_steps` first.
 
 2. **Every 2-item basket gets `cp_score = 1.0` for both nodes.** With n=2
    there's one pair, so both raw scores tie, and `_minmax()` maps
-   "all-equal-and-positive" to 1.0 (GraphBuilder.py:431-435). Don't read
+   "all-equal-and-positive" to 1.0 (`GraphBuilder._minmax`). Don't read
    `cp_score` as an absolute popularity signal — it's within-basket-relative
    only.
 
 3. **`GMM_N_COMPONENTS = 30` is still a placeholder**, explicitly labelled as
-   such in the code. `select_k_via_bic()` exists to inform the choice and
-   deliberately does not auto-pick.
+   such in the code, and Stage 2b is off by default because of it
+   (`pipeline_main.py --with-gmm`). `select_k_via_bic()` exists to inform the
+   choice and deliberately does not auto-pick.
 
-   **`LEIDEN_RESOLUTION` is not** — it is **1.5**, chosen from a measured
-   sweep over the real 57.1M-vertex graph, giving 356 need-states at
-   modularity 0.4145. Below 1.0 the graph collapses into one community;
-   1.0–3.0 is a stable plateau. Sweep upward, never downward.
+   **`LEIDEN_RESOLUTION = 1.5`** came from a measured sweep over the real
+   57.1M-vertex graph, giving 356 need-states at modularity 0.4145. Below 1.0
+   the graph collapses into one community; 1.0–3.0 is a stable plateau. Sweep
+   upward, never downward. ⚠ That sweep ran on the pre-2026-09-30 embedding
+   space (see the warning in §3), so **re-sweep before trusting 1.5 again** —
+   the cliff is a property of a specific graph, not of Leiden.
 
 4. **`orders` and `sales_inc_vat` are exported but never consumed** by any
-   Python file (SQL lines 49-50). Need-states here are composition-driven
+   Python file (the export SQL). Need-states here are composition-driven
    only — no spend or frequency signal enters the model.
 
-5. **No theme/category anywhere.** Product sub-clustering (node feature [385])
-   runs globally over the entire catalog with no pre-grouping — it is *derived*
-   structure, not a supplied hierarchy label.
+5. **No theme/category anywhere.** Product sub-clustering runs globally over
+   the entire catalog with no pre-grouping — it is *derived* structure, not a
+   supplied hierarchy label. Since 2026-09-30 the cluster **id** is not a node
+   feature at all; only `distinctiveness`, measured against the same
+   centroids, survives. See §3.
+
+6. **The autoencoder target barely involves the graph.** The loss reconstructs
+   the mean of a basket's node features, and 384 of 387 dimensions *are* the
+   mean product-embedding vector — so MSE is dominated by it, while the two
+   `GINEConv` layers mix in neighbour information the target does not contain.
+   `baseline_mean_embedding.py` measures what that costs by clustering the
+   plain mean product embedding with no GNN at all, through the identical
+   kNN/Leiden/profiling path.
+
+7. **Adjacency `lift` is a configuration-model null**, with within-need-state
+   edge weight INCLUDED in the degree term (self-pairs are dropped from the
+   output, not from `deg`). `export_need_states.py` computes the identical
+   number in SQL so the parquet and the Excel workbook agree, and offers the
+   cross-edges-only reading alongside it as `cross_lift`. Until 2026-09-30
+   those two files reported different quantities under the name `lift`.

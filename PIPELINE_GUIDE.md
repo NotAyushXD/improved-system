@@ -67,8 +67,9 @@ top of `data/ns_household_tpnb_week_agg_train.sql` for the full reasoning.
                                               │
                                               ▼
                                    Stage 3: manually re-upload into
-                                   the warehouse (need_state_cluster,
-                                   need_state_cluster_gmm per basket)
+                                   the warehouse (need_state_cluster;
+                                   need_state_cluster_gmm only with
+                                   pipeline_main.py --with-gmm)
 
  ns_household_tpnb_week_agg_score.sql ──►  score_new_baskets.py
    (later/held-out weeks)                  (scores NEW baskets against
@@ -373,9 +374,21 @@ tables too.
      (`MiniBatchKMeans` over the *entire catalog*, k chosen by silhouette
      score from `SUBCL_K_CANDIDATES = [50, 100, 200, 400]`), a
      "distinctiveness" score (how close each product sits to its assigned
-     centroid vs. the farthest centroid), and per-product average units.
-     Final node feature width: `in_dim = emb_dim + 4`
-     (`[embedding | co-purchase score | sub_cluster_id | distinctiveness | log_units]`).
+     centroid vs. the farthest centroid).
+     Final node feature width: `in_dim = emb_dim + 3`
+     (`[embedding | co-purchase score | distinctiveness | log_units]`).
+     The sub-cluster **id** is not a node feature — it was dropped on
+     2026-09-30 as a ~400-way nominal label flattened onto one scalar, and a
+     deterministic function of the embedding already present in full in the
+     same row. The clustering still runs because `distinctiveness` is measured
+     against its centroids. Per-product average units is no longer built
+     either; it had no reader. See `GraphBuilder.prepare_globals`' docstring
+     for both.
+     ⚠ Product ids are VARCHAR on both sides of the embedding join as of the
+     same date. Before that they were int on the basket side and str on the
+     product side, the lookup matched nothing, and **every node carried an
+     all-zero embedding** — silently. See `CLAUDE.md` §4b.
+     `prepare_globals()` now counts the matches and refuses a zero overlap.
      The co-purchase matrix is kept in its native dtype here (no whole-matrix
      `.astype(float32)` copy) — the per-basket submatrix casts to float32 on
      its own small slice instead, avoiding a redundant multi-GB copy of the
@@ -389,7 +402,7 @@ tables too.
      pipeline.
    - `lmdb_graph_cache.load_or_build_lmdb_cache()` — builds one PyTorch
      Geometric graph per sampled basket via `build_one_graph()` (nodes =
-     products in the basket with the 4 extra features above, edges = each
+     products in the basket with the 3 extra features above, edges = each
      product's top-`TOP_K=10` co-purchase partners **within that basket**,
      edge features `[log(co-purchase count), relative strength vs. that
      node's own strongest link]`, each basket's co-purchase values from a
@@ -462,34 +475,69 @@ upfront:
   Mutual-kNN only keeps an edge when both baskets rank each other in their
   top-K, and a basket left with no edge never becomes a graph vertex at all —
   measured coverage was 41.0% at k=15, 50.2% at k=30, 53.3% at k=50. It never
-  reaches usable. One-directional gives 100% coverage by construction, and `k`
-  then controls density only. `PIPELINE_MIN_GRAPH_COVERAGE` (default 0.95)
-  refuses to cluster a graph that is missing baskets.
+  reaches usable. One-directional gives 100% coverage in practice, and `k`
+  then controls density only. (Not *quite* "by construction": edges with cosine
+  similarity <= 0 are dropped, so a basket whose every neighbour is negatively
+  similar would still fall out. Measured 100% — read the Coverage line rather
+  than assuming.) `PIPELINE_MIN_GRAPH_COVERAGE` (default 0.95) refuses to
+  cluster a graph that is missing baskets.
+
+  ⚠ Those coverage figures were measured on the pre-2026-09-30 embedding space,
+  which had no product semantics in it (`CLAUDE.md` §4b). Neighbour reciprocity
+  is exactly what real product vectors would change. Worth one
+  `--k 15 30 50` probe against the corrected embeddings before treating
+  mutual-kNN as settled.
 
   **Resolution has a cliff.** Below gamma 1.0 the graph collapses into a
   single community (at 0.5, one community held 99.4% of baskets). From 1.0 to
   3.0 there is a wide stable plateau. Sweep upward, never downward:
-  `cluster_leiden_networkit.py --sweep 1.0 1.5 2.0`. Current value 1.5 gives
-  356 need-states, modularity 0.4145, largest community 1.5%.
+  `cluster_leiden_networkit.py --sweep 1.0 1.5 2.0`. The 1.5 that gave 356
+  need-states at modularity 0.4145 was chosen on the pre-2026-09-30 graph —
+  **re-sweep before trusting it.** The cliff is a property of a specific
+  graph, not of Leiden.
 
   Output column: `need_state_cluster` (`-1` means the basket had no edges and
   Leiden could not place it — not a cluster).
-- **2b — GMM** (`cluster_basket_embeddings_gmm`): fits a
+- **2b — GMM** (`cluster_basket_embeddings_gmm`) — **OFF by default since
+  2026-09-30. Pass `pipeline_main.py --with-gmm` to run it.** Fits a
   `GaussianMixture(n_components=GMM_N_COMPONENTS, covariance_type="diag")`
-  directly on the normalized embeddings. `GMM_N_COMPONENTS = 30` in
-  `pipeline_main.py` is explicitly called out as a **placeholder** — swap it
-  for a real best-K selection once available (`select_k_via_bic()` gives a
-  BIC/AIC sweep to eyeball a better value). Saves the fitted model to
-  `data/output/gmm_basket_model.pkl` (needed later to score new baskets
-  directly, since GMM natively supports `.predict()` on new points — Leiden
-  does not). Output columns: `need_state_cluster_gmm`, `gmm_confidence`.
+  directly on the normalized embeddings, and saves the model to
+  `data/output/gmm_basket_model.pkl`. Output columns:
+  `need_state_cluster_gmm`, `gmm_confidence`.
+
+  Why it was turned off: `GMM_N_COMPONENTS = 30` is still a **placeholder**,
+  while Leiden finds ~356 communities. An Adjusted Rand Index between a 30-way
+  and a 356-way partition is driven toward 0 by the granularity gap alone, so
+  Stage 2c cost a full fit over 57.1M x 64 float64 and reported a number that
+  said nothing about whether the two methods agree. Pick a real K with
+  `select_k_via_bic()` before turning it back on.
+
+  Nothing about the GMM code changed, and `score_new_baskets.py` still uses a
+  saved model — which is where GMM genuinely earns its place, since a fitted
+  GMM can `.predict()` a brand-new basket directly where Leiden needs a kNN
+  majority vote.
 - **2c — Compare** (`compare_leiden_gmm`): Adjusted Rand Index between the
   two label sets — close to 1 means they agree, close to 0 means they're
-  finding different structure. Purely diagnostic, printed to console.
+  finding different structure. Purely diagnostic, printed to console. Runs
+  only with `--with-gmm`.
 
-Both label sets are merged (outer join on `basket_id`) into one file —
-neither is discarded, since which one (or how to combine them) isn't decided
-yet.
+With `--with-gmm` both label sets are merged (outer join on `basket_id`) into
+one file — neither is discarded, since which one (or how to combine them)
+isn't decided yet. Without it, the file carries the Leiden columns only.
+
+### Stage 2 control: is the GNN earning its place?
+
+`baseline_mean_embedding.py` clusters the plain **mean product embedding** per
+basket — PCA'd to `OUT_DIM` so the width matches, no GNN, no training, no
+inference pass — through the identical kNN/Leiden/profiling path, tagged
+`meanemb` so no artifact collides.
+
+It exists because the autoencoder target is the mean of the node features, and
+`emb_dim` of `in_dim` dimensions *are* that mean, so MSE is overwhelmingly
+dominated by it and the `GINEConv` layers mix in neighbour information the
+target does not contain. The co-purchase graph barely enters the gradient. If
+the GNN cannot beat this control on `excess` lift (observed minus its own
+permutation null), Stage 1 is elaborate machinery for an average.
 
 ### Stage 3 — Reload into the warehouse (manual)
 
@@ -615,16 +663,37 @@ Nuances worth knowing:
 
 ---
 
-## 7. After clustering: naming/profiling need-states (not yet implemented)
+## 7. After clustering: naming and scoring need-states
 
-`pipeline_main.py`'s closing comment is explicit that **themes, if wanted at
-all, are formed after clustering** — by profiling each `need_state_cluster`'s
-dominant products/category hierarchy — and never fed back in as a pipeline
-input. That profiling step doesn't exist in this repo yet. If/when you build
-it, `ns_product_theme_mapping.sql`'s TPNB→category mapping (currently unused
-by any Python file) is exactly what you'd join against each cluster's basket
-contents to describe what each need-state actually represents in
-human-readable terms.
+**Themes, if wanted at all, are formed AFTER clustering** — by profiling each
+`need_state_cluster`'s over-represented products — and never fed back in as a
+pipeline input. Three scripts do this, and they are where you find out whether
+a run produced anything meaningful:
+
+| script | what it gives you |
+|---|---|
+| `profile_need_states.py` | per (need-state, product) **lift**: the product's share of that need-state's ITEMS over its share of all items. Plus a summary per need-state (size, households, avg basket size, signature coverage) and four banded insight tables. Outputs are named after the label file they describe, so runs accumulate instead of overwriting each other. |
+| `evaluate_run.py` | one row per run appended to `experiment_log.csv` — `median_max_lift`, `pct_lift_over_3`, `median_twin_jaccard`, `largest_share`. This is the scorecard; "did this iteration do better" becomes a table lookup. |
+| `export_need_states.py` | one Excel workbook (plus CSVs) across every discovered run: scorecard, per-need-state summary, per-product detail, adjacency, transitions. |
+
+**Lift is an ITEM-share ratio, deliberately, and that is load-bearing.** Basket
+incidence (`P(product in basket | need-state) / P(product in basket)`) reads
+more naturally and is wrong here: need-states differ enormously in basket size,
+so a 40-item basket has ten times more chances to contain any given product and
+incidence rises for every product at once with trip size. `check_lift_formula`
+in `test_pipeline.py` pins a pure-size null where the true lift is 1.0
+everywhere.
+
+**Always compare against a permutation null.** Shuffle the
+`need_state_cluster` column (preserving the size distribution), re-profile,
+re-score: that is what a *structureless* clustering scores on the same data.
+`median_max_lift ≈ 1.2` means nothing on this dataset, and the null RISES with
+cluster size, so each run needs its own. Full method and the exact commands in
+`BASKET_BANDING_DESIGN.md` §5.
+
+`ns_product_theme_mapping.sql`'s TPNB→category mapping is still unused by any
+Python file; `profile_need_states.py` joins `tpnb → tpna → description` from
+the two lookup extracts instead.
 
 ---
 
@@ -639,7 +708,7 @@ python .\test_pipeline.py --fast       # skip the DuckDB/LMDB/torch functional c
 python .\test_pipeline.py --prod-outputs   # also check real artifacts in data/output
 ```
 
-Six groups, all must pass (exit code 0):
+All groups must pass (exit code 0):
 
 | # | Group | What it protects |
 |---|---|---|
@@ -647,7 +716,12 @@ Six groups, all must pass (exit code 0):
 | 1b | **Config** | Defaults match the original hardcoded values; types are real; **cache fingerprints move when they should and stay put when they shouldn't**; bad values fail at import; `.env` precedence and UTF-8 parsing; `.env.example` documents every key |
 | 2 | **Graph primitives** | `_minmax` edge cases, the memory-safe distance expansion, top-K edge selection, **edge relative-strength scaling**, the **bit-identical** per-basket submatrix rewrite, exact node-feature slot layout, duplicate-product unit summing, **zero/negative quantities (returns)** |
 | 3 | **Co-purchase additivity** | Proves chunked `XᵀX` equals single-shot exactly — every edge feature depends on this and it was previously only a claim in a comment |
-| 7 | **Need-state graph** | Adjacency maths pinned to hand-computed values, year-boundary week ranking, transition counts/probabilities, journey beam search, GMM overlap batch-invariance and column naming |
+| 7 | **Need-state graph** | Adjacency maths pinned to hand-computed values, year-boundary week ranking, transition counts/probabilities, journey beam search (**full-depth-only by default**, `include_partial` for the old mix), GMM overlap batch-invariance and column naming |
+| 7b | **Lift formula** | Lift must be blind to basket size, and must score need-states against LABELLED baskets only |
+| 9 | **Clustering progress** | `_build_igraph`'s vectorised rewrite and the per-iteration Leiden driver, pinned against the implementations they replaced |
+| 9b | **Mean-embedding control** | `baseline_mean_embedding._basket_means` — unembedded products dropped from a basket's mean, not averaged in as zeros; empty baskets keep their row |
+| 9c | **Adjacency parity** | `lift` must be the SAME number in `need_state_adjacency.parquet` and in the Excel export. It was not — two implementations of "observed over expected" had drifted onto different scales under one column name |
+| 10 | **Product key wiring** | The basket side's `tpnb` must actually JOIN to the embedding table, using an **integer** `tpnb` end to end. Also pins the product-index ORDERING, which `copurchase_sparse.npz` depends on and cannot detect a change to |
 | 4-6 | **Functional / parity / basket store** | Real DuckDB + real LMDB on synthetic data; **train/score parity by VALUE, not just width**; basket grain semantics and the `basket_id` format journeys depend on |
 | 8 | **Prod outputs** (opt-in) | Embedding collapse, degenerate clusters, label coverage — things synthetic data structurally cannot catch |
 
@@ -680,17 +754,40 @@ python .\build_product_embeddings.py
 # 4. OPTIONAL — measure per-basket inference cost before committing to it
 python .\benchmark_inference.py --n-baskets 500
 
-# 5. The main run. Tee the log: it is long, and the per-chunk ETA lines
-#    are what you will want to read back.
+# 5. Stage 0/1 + the Stage 2a edge build. Tee the log: it is long, and the
+#    per-chunk ETA lines are what you will want to read back.
+#    THIS WILL STOP at Stage 2a and name the Leiden command — by design.
+#    Clustering is its own process because leidenalg does not finish at this
+#    scale (see §5's Stage 2a notes).
 python .\pipeline_main.py 2>&1 | Tee-Object -FilePath run.log
+
+# 6. Cluster, on all 64 cores. Sweep first — the resolution cliff is a
+#    property of THIS graph, so a value carried over from another run is a
+#    guess.
+python -u .\cluster_leiden_networkit.py --sweep 1.0 1.5 2.0 3.0
+python -u .\cluster_leiden_networkit.py --resolution <pick one from the sweep>
+
+# 7. Rerun. Every cache now matches, so this reaches Stage 2.5 in minutes.
+python .\pipeline_main.py 2>&1 | Tee-Object -FilePath run2.log
 #    -> data/output/basket_need_state_clusters.parquet   (upload to warehouse)
 #    -> data/output/need_state_adjacency.parquet         (Stage 2.5)
 #    -> data/output/need_state_transitions.parquet       (Stage 2.5)
 
-# 6. Confirm the output actually means something
+# 8. Confirm the output actually means something
 python .\test_pipeline.py --fast --prod-outputs
 
-# 7. (Later, periodically) score new weeks without retraining
+# 9. Find out what the need-states ARE, and score the run
+python -u .\profile_need_states.py
+python -u .\evaluate_run.py --clusters <the label file from step 6> --note "what was different"
+#    ...then build the permutation null for this run and compare — see
+#    BASKET_BANDING_DESIGN.md section 5. Observed lift without its own null
+#    is not a result.
+
+# 10. OPTIONAL but recommended once — is the GNN beating a plain average?
+python -u .\baseline_mean_embedding.py
+#    then steps 6/9 again with --tag meanemb / --embeddings, as that script prints
+
+# 11. (Later, periodically) score new weeks without retraining
 python .\score_new_baskets.py --new-transactions ..\data\ns_household_tpnb_week_agg_score
 ```
 
@@ -805,14 +902,22 @@ The sample-then-assign plan was never needed and was not built.
 `assign_new_baskets_to_clusters` remains for its original purpose in
 `score_new_baskets.py`.
 
-**Stage 2b (GMM) is still open**, and again not for memory reasons. sklearn's
-default `init_params='kmeans'` fits a complete k-means over all 57.1M points
-before EM iteration 1, repeated per `n_init` restart — it ran 40+ minutes
-without reaching the first iteration, printing nothing between
-`Initialization 0` and `Iteration 1`. Set
-`PIPELINE_GMM_INIT_PARAMS=k-means++` at this scale, and consider
-`PIPELINE_GMM_N_INIT=1` until the placeholder `GMM_N_COMPONENTS=30` has been
-validated with `select_k_via_bic()`.
+**Stage 2b (GMM) is parked, not blocked** — it is off by default since
+2026-09-30 (`pipeline_main.py --with-gmm` to run it) because at
+`GMM_N_COMPONENTS=30` against ~356 Leiden communities the comparison could
+not mean anything. See the Stage 2b entry above.
+
+If you do turn it on, two settings matter at this scale. sklearn's default
+`init_params='kmeans'` fits a complete k-means over all 57.1M points before
+EM iteration 1, repeated per `n_init` restart — it ran 40+ minutes without
+reaching the first iteration, printing nothing between `Initialization 0` and
+`Iteration 1`. Set `PIPELINE_GMM_INIT_PARAMS=k-means++`, and consider
+`PIPELINE_GMM_N_INIT=1` until `GMM_N_COMPONENTS` has been validated with
+`select_k_via_bic()`. If the fit aborts with "ill-defined empirical
+covariance", raise `PIPELINE_GMM_REG_COVAR` from its 1e-6 default to 1e-4:
+two baskets holding the same product set produce the same embedding, so exact
+duplicate points exist in large numbers and a component landing on a pile of
+them has no variance to estimate.
 
 ### Known data nuance: returns
 
@@ -847,6 +952,19 @@ python .\benchmark_inference.py --n-baskets 500 --remaining-baskets 57115804
 **`reset_inference.py`** — clears orphaned chunk state (see §10b). Dry-run by
 default; refuses to act when a model file exists unless `--force`.
 
+**`audit_product_data.py`** — are the product descriptions trustworthy? They
+feed the embeddings, so a wrong description gives a product a wrong vector as
+well as a wrong label. The frequency table is the informative part: if the
+most-purchased products read as ordinary groceries with matching departments,
+the reference data is sound. Worth five minutes, and worth *more* now that the
+embeddings actually reach the model.
+
+```powershell
+python -u .\audit_product_data.py --top 50
+```
+
+**`baseline_mean_embedding.py`** — the GNN's control. See the end of §5.
+
 ---
 
 ## 12. Key knobs you'll likely want to revisit
@@ -864,8 +982,13 @@ Every one of these now lives in `.env`, not in a source file. Run
 | `PIPELINE_TOP_K` | 10 | ⚠ rebuilds graph cache + forces retrain |
 | `PIPELINE_SUBCL_K_CANDIDATES` | 50,100,200,400 | ⚠ same. On this catalog k=400 was picked at the range ceiling with silhouette still rising — consider extending |
 | `PIPELINE_EPOCHS` / `PIPELINE_LR` | 20 / 1e-4 | ⚠ forces retrain. LR reduced from 1e-3 to prevent divergence |
-| `PIPELINE_LEIDEN_RESOLUTION` | 1.0 | Placeholder — run `sweep_resolution()` first |
-| `PIPELINE_GMM_N_COMPONENTS` | 30 | Placeholder — see `select_k_via_bic()` |
+| `PIPELINE_LEIDEN_RESOLUTION` | 1.0 (1.5 in `.env`) | ⚠ **Re-sweep.** The 1.5 was chosen on the pre-2026-09-30 graph; the cliff is a property of a specific graph. `cluster_leiden_networkit.py --sweep 1.0 1.5 2.0 3.0` |
+| `PIPELINE_BASKET_KNN_K` | 15 (10 in `.env`) | Density only, essentially never coverage, on a one-directional graph |
+| `PIPELINE_USE_MUTUAL_KNN` | true (false in `.env`) | ⚠ Worth one re-probe against the corrected embeddings — the 41/50/53% coverage curve was measured without product semantics |
+| `PIPELINE_GMM_N_COMPONENTS` | 30 | Placeholder, and Stage 2b is off by default — see `select_k_via_bic()` |
+| `PIPELINE_GMM_REG_COVAR` | 1e-6 | Raise to 1e-4 if the GMM fit aborts on a singular covariance |
+| `PIPELINE_GMM_INIT_PARAMS` | `kmeans` | Set `k-means++` at full scale — the default fits a whole k-means before EM iteration 1, per restart |
+| `PIPELINE_LMDB_MAP_SIZE_GB` | 200 | Virtual address space for the LMDB cache, not disk. Was read by nothing until 2026-09-30 |
 | `PIPELINE_TRANSITION_MAX_WEEK_GAP` | `none` here | The only value in `.env` deviating from code default; see §6b |
 | `PIPELINE_NUM_WORKERS` | unset | Platform-aware; leave unset (see §2b) |
 | `PIPELINE_DUCKDB_PATH` | `../data/pipeline.duckdb` | Keep on a fast local disk, not a synced folder |

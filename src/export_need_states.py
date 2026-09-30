@@ -128,7 +128,19 @@ def discover_runs(column: str = "need_state_cluster"):
             print(f"  SKIP {name}: no profile beside it")
             continue
 
-        present = pd.read_parquet(clusters, columns=[column])[column].unique()
+        # Skip cleanly when the label file has no such column, rather than
+        # letting pyarrow raise. This became the NORMAL case on 2026-09-30:
+        # Stage 2b is opt-in, so a default run writes no need_state_cluster_gmm
+        # column at all, and `--column need_state_cluster_gmm` against one used
+        # to die with a bare pyarrow error naming neither the file nor the flag.
+        try:
+            present = pd.read_parquet(clusters, columns=[column])[column].unique()
+        except Exception as e:
+            print(f"  SKIP {name}: no '{column}' column ({type(e).__name__}). "
+                  f"A run without --with-gmm writes Leiden labels only, so "
+                  f"need_state_cluster_gmm will be absent — export with the "
+                  f"default --column need_state_cluster.")
+            continue
         n_labels = int(len(present) - (1 if UNCLUSTERED in present else 0))
         n_summary = len(pd.read_parquet(summary, columns=["need_state"]))
         if n_labels != n_summary:

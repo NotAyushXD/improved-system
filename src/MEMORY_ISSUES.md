@@ -14,6 +14,15 @@ already large.
 No fix ever reduced the amount of data used or the quality of the model —
 every fix is an engineering/storage change, not a data-reduction one.
 
+**One thing this document does NOT cover**, because it is neither memory nor
+speed: until 2026-09-30 the product embedding never reached a single graph
+node. `tpnb` was an int on the basket side and a str on both product sides, so
+the lookup matched nothing and every node carried an all-zero 384-dim vector —
+with `in_dim` still reading 388 and nothing in any log out of place. Every
+measured result predating that fix describes a model with no product semantics
+in it. See `CLAUDE.md` §4b. It is worth knowing here because several of the
+runtime figures below were measured on that model.
+
 **Read this part too:** the speed section near the end
 ([Stage 1 — Inference was going to take nine days](#stage-1--inference-was-going-to-take-nine-days))
 is not a separate topic. That slowdown was *caused by* one of the memory
@@ -533,5 +542,5 @@ hiding inside it stops being a rounding error and becomes the whole runtime.
 | Stage | Issue | Status |
 |---|---|---|
 | Stage 2a | Clustering 57M embeddings | **Fixed, and not for the predicted reason.** Memory was never the constraint (512 GB box; run peaks ~78 GB). The real faults were a mutual-kNN filter silently dropping half the baskets, and single-threaded `leidenalg`. Now one-directional kNN + NetworKit `ParallelLeiden`: 100% coverage, 356 need-states, ~36 min. See the Stage 2 section above. |
-| Stage 2b | GMM over 57M embeddings has not completed | **Open.** Not memory — sklearn's default `init_params='kmeans'` fits a full k-means over all 57.1M points before EM iteration 1, once per `n_init` restart, and ran 40+ minutes without reaching it. `PIPELINE_GMM_INIT_PARAMS=k-means++` exists to skip that; `n_init=3` on an unvalidated placeholder K is poor value. |
+| Stage 2b | GMM over 57M embeddings has not completed | **Parked, deliberately — not a memory problem and no longer on the critical path.** Since 2026-09-30 it is opt-in behind `pipeline_main.py --with-gmm`: at the placeholder `GMM_N_COMPONENTS=30` against ~356 Leiden communities the ARI it fed is driven to ~0 by the granularity gap alone, so the fit bought nothing. If you do run it: sklearn's default `init_params='kmeans'` fits a full k-means over all 57.1M points before EM iteration 1, once per `n_init` restart, and ran 40+ minutes without reaching it — set `PIPELINE_GMM_INIT_PARAMS=k-means++`, and `PIPELINE_GMM_REG_COVAR=1e-4` if the fit aborts on a singular covariance. |
 | Stage 1 | Multi-process inference would cut wall clock further, but each worker needs its own copy of the embedding matrix and co-purchase matrix | **Not built.** Viable on Linux/macOS, where `fork` shares those pages copy-on-write. On Windows each worker gets a full copy — though with 512 GB that is far less of a barrier than this document originally assumed. |

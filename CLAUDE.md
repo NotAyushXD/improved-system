@@ -531,9 +531,17 @@ number. The proper fix is widening the SQL window.
 | What do the source tables contain | `data/TABLE_REFERENCE.md` |
 | **Current state, machine, Stage 2 config** | **this file** |
 
-⚠ `README.md`'s "Current state" section and `GPT_CONTEXT_PROMPT.md` are **out
-of date** as of 2026-09-26. They describe a memory-constrained box, incomplete
-inference, and Stage 2 as unsolved. All three have been superseded — this file
-is the authority on current state. `MEMORY_ISSUES.md` remains accurate as
-*history*; its conclusions about what will and won't fit no longer hold on a
-512 GB machine.
+⚠ `GPT_CONTEXT_PROMPT.md` is **out of date** as of 2026-09-30 and carries a
+warning block saying so. It still describes in_dim 388, a GMM that runs by
+default, and product embeddings that reach the graph. Paste this file alongside
+it if you are briefing anyone (or any model) from it.
+
+`README.md`, `ARCHITECTURE.md`, `PIPELINE_GUIDE.md` and
+`HOUSEHOLD_GRAPH_FLOW.md` were all brought current on 2026-09-30.
+`MEMORY_ISSUES.md` remains accurate as *history*; its conclusions about what
+will and won't fit no longer hold on a 512 GB machine, and its runtime figures
+were measured on the pre-fix model.
+
+`BASKET_BANDING_DESIGN.md`'s **verdict** stands (it was a relative comparison,
+and both sides carried the same defect). Its absolute numbers and per-band
+characterisations do not — see the warning at its head.

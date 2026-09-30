@@ -71,8 +71,38 @@ def load_product_embeddings(path: Path = PRODUCT_EMBEDDINGS_PARQUET) -> pd.DataF
             f"e.g. df = df.rename(columns={{'exported_name': 'expected_name'}})."
         )
 
+    # str, deliberately and load-bearingly. The basket side is cast to VARCHAR
+    # in basket_store.build_baskets_table() to meet this; before 2026-09-30 it
+    # was not, the two key spaces never met, and every product silently got an
+    # all-zero embedding vector. See CLAUDE.md section 4b.
     df["tpnb"] = df["tpnb"].astype(str)
     df["embedding"] = df["embedding"].apply(_parse_embedding_cell)
 
-    print(f"Loaded product_df_2 from {path}: {len(df):,} products")
+    if len(df):
+        widths = df["embedding"].map(len)
+        emb_dim = int(widths.iloc[0])
+        if not (widths == emb_dim).all():
+            # A ragged embedding column is a truncated or malformed export row.
+            # Caught here rather than as a numpy broadcast error deep inside
+            # prepare_globals' emb_matrix assignment, or a vstack failure inside
+            # the sub-clustering, neither of which names the offending product.
+            counts = widths.value_counts()
+            odd = df.loc[widths != emb_dim, "tpnb"].head(5).tolist()
+            raise ValueError(
+                f"{path} has embeddings of inconsistent width — every product must "
+                f"have the same number of floats.\n"
+                f"  widths found (width: n_products): {counts.to_dict()}\n"
+                f"  first few products at an unexpected width: {odd}\n"
+                f"  If the column was exported as a delimited VARCHAR, a truncated "
+                f"row or an embedded delimiter is the usual cause. Re-export, or "
+                f"rebuild with build_product_embeddings.py."
+            )
+        if emb_dim == 0:
+            raise ValueError(
+                f"{path} has zero-length embeddings for every product — the "
+                f"`embedding` column carried no numbers. Check the export format."
+            )
+        print(f"Loaded product_df_2 from {path}: {len(df):,} products x {emb_dim} dims")
+    else:
+        print(f"Loaded product_df_2 from {path}: EMPTY")
     return df

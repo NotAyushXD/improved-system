@@ -142,14 +142,31 @@ def load_globals_and_model():
     lin_key     = next((k for k in state if "conv1.lin" in k and "weight" in k), None)
     edge_dim    = int(state[lin_key].shape[1]) - hidden_dim if lin_key else 2
 
+    # RAISE, not warn.
+    #
+    # This used to print a warning and carry on "using the checkpoint's value",
+    # which cannot work: build_one_graph emits exactly G["in_dim"] columns, so a
+    # mismatch means the first batch of the first chunk dies inside
+    # node_encoder with a bare torch shape error — after prepare_globals has
+    # already spent minutes on the sub-clustering. Fail here, where the two
+    # numbers and their likely cause are still in hand.
     if in_dim_ckpt != G["in_dim"]:
-        print(f"  WARNING: prepare_globals() computed in_dim={G['in_dim']} but the "
-              f"checkpoint expects in_dim={in_dim_ckpt}. If this checkpoint was trained "
-              f"before the theme-free refactor (in_dim was emb_dim+5, now emb_dim+4), "
-              f"it is NOT compatible — retrain rather than continuing. Otherwise this "
-              f"usually means the product embedding table changed since training — "
-              f"using the checkpoint's value, but double check product_embeddings.parquet "
-              f"still matches what training used.")
+        raise ValueError(
+            f"Model/feature width mismatch — this checkpoint cannot score these "
+            f"baskets.\n"
+            f"  checkpoint expects in_dim = {in_dim_ckpt}\n"
+            f"  this run builds  in_dim = {G['in_dim']}  (emb_dim={G['emb_dim']} + 3)\n"
+            f"  Node feature width by era: emb_dim+5 (theme_score, long gone), "
+            f"emb_dim+4 (with sub_cluster_id), emb_dim+3 (current — sub_cluster_id "
+            f"dropped 2026-09-30).\n"
+            f"  If the difference is 1 or 2, the checkpoint predates a feature-layout "
+            f"change and must be retrained: delete "
+            f"{os.path.join(OUTPUT_DIR, 'basket_gnn_model.pt')} and rerun "
+            f"pipeline_main.py.\n"
+            f"  If the widths differ by more, product_embeddings.parquet has a "
+            f"different vector width than the one training used — check it was built "
+            f"by the same build_product_embeddings.py run."
+        )
 
     model = BasketGNN(
         in_dim=in_dim_ckpt, edge_dim=edge_dim,

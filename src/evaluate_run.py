@@ -108,7 +108,22 @@ def score(clusters_path: str, column: str = "need_state_cluster") -> dict:
                 f"first — the scorecard is mostly built from its output."
             )
 
-    clusters = pd.read_parquet(clusters_path, columns=["basket_id", column])
+    # Named error rather than a bare pyarrow one. profile_need_states.py guards
+    # this the same way; evaluate_run did not, and it became reachable on
+    # 2026-09-30 when Stage 2b went opt-in — a default run writes no
+    # need_state_cluster_gmm column at all.
+    try:
+        clusters = pd.read_parquet(clusters_path, columns=["basket_id", column])
+    except Exception as e:
+        available = list(pd.read_parquet(clusters_path).columns)
+        raise SystemExit(
+            f"{clusters_path} has no column {column!r} ({type(e).__name__}).\n"
+            f"  available: {available}\n"
+            f"  A run without `pipeline_main.py --with-gmm` writes Leiden labels "
+            f"only, so need_state_cluster_gmm will be absent. Score with the "
+            f"default --column need_state_cluster."
+        ) from None
+
     profiles = pd.read_parquet(profiles_path)
     summary = pd.read_parquet(summary_path)
 

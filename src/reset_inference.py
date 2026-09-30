@@ -99,7 +99,16 @@ def main():
     print(f"Chunk files : {len(chunk_files):,} matching {os.path.basename(pattern)} "
           f"({total_mb:,.0f} MB)")
 
-    merged = os.path.join(out, "basket_gnn_embeddings.parquet")
+    # The merged filename depends on the TAG. score_new_baskets.py passes
+    # final_path=new_basket_gnn_embeddings.parquet to merge_inference_output,
+    # so `--dataset-tag score` used to delete the TRAINING embeddings — hours
+    # of inference, not the thing that was asked for — and leave the scoring
+    # ones sitting there. Keyed off the tag now.
+    merged = os.path.join(
+        out,
+        "new_basket_gnn_embeddings.parquet" if tag == config.SCORE_DATASET_TAG
+        else "basket_gnn_embeddings.parquet",
+    )
     merged_exists = os.path.exists(merged)
     if merged_exists:
         print(f"Merged file : {merged} ({os.path.getsize(merged)/1e6:,.0f} MB)")
@@ -141,10 +150,14 @@ def main():
         con.execute(f'DROP TABLE IF EXISTS "{chunks_table}"')
         print(f"  dropped {chunks_table} (it will be replanned on the next run)")
 
-    print("\nDone. The next `python pipeline_main.py` will:")
-    print("  - reuse baskets_%s and copurchase_sparse.npz (no rebuild)" % tag)
-    print("  - retrain the GNN and SAVE THE MODEL BEFORE inference")
-    print("  - embed every basket from scratch, resumably this time")
+    if tag == config.SCORE_DATASET_TAG:
+        print("\nDone. The next `python score_new_baskets.py` will re-embed every "
+              "new basket against the SAVED model (it does not train).")
+    else:
+        print("\nDone. The next `python pipeline_main.py` will:")
+        print("  - reuse baskets_%s and copurchase_sparse.npz (no rebuild)" % tag)
+        print("  - retrain the GNN and SAVE THE MODEL BEFORE inference")
+        print("  - embed every basket from scratch, resumably this time")
 
 
 if __name__ == "__main__":

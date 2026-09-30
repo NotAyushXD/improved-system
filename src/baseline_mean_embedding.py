@@ -242,10 +242,33 @@ def main():
     dropped = total_products - total_used
     print(f"  products averaged: {total_used:,} of {total_products:,} "
           f"({dropped:,} had no embedding and were excluded from their basket's mean)")
+
+    # This script does NOT go through prepare_globals, so it does not get
+    # _check_product_key_overlap's guard for free. Same failure mode, same
+    # rule: a total miss is always a bug, never a data property.
+    if total_used == 0:
+        raise ValueError(
+            f"NONE of the {total_products:,} basket-product rows matched the product "
+            f"embedding table, so every basket vector is zero and this control "
+            f"measures nothing.\n"
+            f"  basket-side product id: "
+            f"{type(next(iter(pid2idx), None)).__name__} from DuckDB\n"
+            f"  embedding-side product id: str from parquet_loader\n"
+            f"  Almost always the key TYPE mismatch described in CLAUDE.md section "
+            f"4b: basket_store.build_baskets_table() must CAST(tpnb AS VARCHAR). If "
+            f"baskets_{tag} was built before that fix, rerun pipeline_main.py Stage 0 "
+            f"(it drops and rebuilds the table) before this."
+        )
     if n_empty:
-        print(f"  WARNING: {n_empty:,} baskets ({n_empty / max(n_seen, 1):.2%}) had NO "
-              f"embedded product at all and got a zero vector. They will cluster "
-              f"together as an artifact, not as a need-state.")
+        share = n_empty / max(n_seen, 1)
+        print(f"  WARNING: {n_empty:,} baskets ({share:.2%}) had NO embedded product "
+              f"at all and got a zero vector. They will cluster together as an "
+              f"artifact, not as a need-state.")
+        if share > 0.05:
+            print(f"  That is more than 5% of the population. This control is largely "
+                  f"measuring embedding COVERAGE rather than the method — check that "
+                  f"product_embeddings.parquet covers the same period as the basket "
+                  f"export before comparing it against the GNN.")
 
     with progress_step("merging and writing", 3, 3):
         paths = sorted(glob.glob(os.path.join(chunk_dir, "*.parquet")))

@@ -17,7 +17,7 @@ and `ns_household_tpnb_week_agg_score.sql` read from.
 | `period_number` | int | Retail period (~13/year, ~4 weeks each) |
 | `week_number` | int | **Finest time grain in this table** |
 | `household_number` | bigint | Customer/household identifier |
-| `tpnb` | int | Product identifier (item/barcode grain) |
+| `tpnb` | int | Product identifier (item/barcode grain). **An int here, and a STRING in both product-side extracts** (`ns_tpnb_to_tpna_mapping.sql` and `ns_item_lookup_tpna.sql` both `CAST(tpnb AS STRING)`). That asymmetry cost this project a lot — see the note below the table. |
 | `orders` | bigint | **Count** of separate orders folded into this row — not a preserved order/transaction ID. See "basket grain" below. |
 | `sales_inc_vat` | double | |
 | `quantity` | double | |
@@ -25,6 +25,20 @@ and `ns_household_tpnb_week_agg_score.sql` read from.
 **Grain: one row per `household_number` × `tpnb` × `week_number` (within a
 year).** This is already the finest grain this table offers — there is no
 day-level or transaction-level breakdown underneath it.
+
+> [!WARNING]
+> **`tpnb` being an int here is load-bearing, and it caused a silent
+> pipeline-wide failure.** `ns_household_tpnb_week_agg_train.sql` selects it
+> uncast, so the basket side carried ints, while both product-side extracts
+> cast to STRING and `parquet_loader` casts again with `.astype(str)`. The
+> product-embedding lookup in `GraphBuilder.prepare_globals()` therefore
+> matched **nothing** — every graph node got an all-zero 384-dim vector, with
+> `in_dim` still reading 388 and no line in any log out of place.
+>
+> `basket_store.build_baskets_table()` now does `CAST(tpnb AS VARCHAR)` at the
+> single point where both `products` and `product_uniques` are produced, so
+> the two key spaces meet. **If you add any new extract that joins on `tpnb`,
+> match that: cast to VARCHAR.** See `CLAUDE.md` §4b.
 
 **Why this matters for basket construction:** a "basket" in this pipeline is
 built by grouping this table's rows by household and time window. There is

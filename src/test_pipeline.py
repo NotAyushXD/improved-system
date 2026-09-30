@@ -53,6 +53,17 @@ WHAT IS CHECKED, AND WHY EACH ONE EXISTS
                     reports. Both are pinned against the implementation they
                     replaced — observability was the goal, changed cluster
                     assignments would be a regression.
+ 9b MEAN-EMBEDDING  `baseline_mean_embedding._basket_means`, the control the GNN
+   CONTROL          gets judged against. Products with no embedding must be
+                    DROPPED from a basket's mean, not averaged in as zeros, and
+                    a basket with nothing embedded must keep its row (zero
+                    vector, n_used 0) so the output stays aligned with basket_id.
+ 9c ADJACENCY       `lift` must be the same number in need_state_adjacency.parquet
+   PARITY           and in the Excel export. It was not: one used weight_sum with
+                    within-state edges in the degree, the other n_edges with them
+                    filtered out first, so the two were on different scales under
+                    one column name. Pinned against a 4-edge fixture verifiable
+                    by hand, with `cross_lift` checked to be distinct.
 10 PRODUCT KEY     the basket side's tpnb must actually JOIN to the embedding
    WIRING           table. It did not: `tpnb` is an int in the basket export and
                     a str in both product extracts, so prepare_globals matched
@@ -280,7 +291,9 @@ def check_config():
     cases = [
         ("PIPELINE_TOP_K", "7", True, "changes edges per node"),
         ("PIPELINE_SEED", "99", True, "changes sub-cluster assignment"),
-        ("PIPELINE_SUBCL_K_CANDIDATES", "10,20", True, "changes node features [385],[386]"),
+        ("PIPELINE_SUBCL_K_CANDIDATES", "10,20", True,
+         "moves the k-means centroids, so node feature [emb_dim+1] "
+         "(distinctiveness) changes"),
         ("PIPELINE_EPOCHS", "999", False, "training length does not change graphs"),
         ("PIPELINE_LEIDEN_RESOLUTION", "2.5", False, "clustering runs after graphs are built"),
     ]
@@ -1129,9 +1142,13 @@ def check_need_state_graph():
         print("  build_need_state_transitions: max_week_gap filtering — OK")
 
     # ── journeys ─────────────────────────────────────────────────────────
-    # A deterministic chain yields BOTH the 1-step (0,1) and the 2-step
-    # (0,1,2) path, each with probability 1.0 — so select the full-length
-    # path explicitly rather than assuming it sorts first (it ties).
+    # Selects the full-length path explicitly rather than assuming it sorts
+    # first. That used to matter because partial paths were returned alongside
+    # full ones and a shorter path can never score BELOW its own continuations
+    # (path_prob is a product of values <= 1), so depth-1 rows always topped
+    # the table. Since 2026-09-30 only the deepest beam comes back by default —
+    # see the include_partial check below — but selecting by path is still the
+    # right way to write this: probabilities tie on a deterministic chain.
     j = nsg.possible_journeys(trans, from_need_state=0, depth=3)
     if j.empty:
         ok = _fail("expected at least one journey out of need-state 0")
@@ -1179,6 +1196,52 @@ def check_need_state_graph():
         ok = _fail("exclude_self_loops=True still produced a self-transition step")
     else:
         print("  possible_journeys: exclude_self_loops suppresses standing still — OK")
+
+    # ── include_partial: full-depth by default, the old mix on request ────
+    # path_prob is a PRODUCT of probabilities <= 1, so a k-step path can never
+    # score above its own (k-1)-step prefix. Returning every depth together and
+    # sorting by path_prob therefore put depth-1 rows at the top no matter what
+    # `depth` was asked for, and `depth=3` looked like it had done nothing.
+    branchy = pd.DataFrame({
+        "from_need_state": [0, 0, 1, 2],
+        "to_need_state":   [1, 2, 3, 3],
+        "n_transitions":   [60, 40, 100, 100],
+        "prob":            [0.6, 0.4, 1.0, 1.0],
+        "lift":            [1.0, 1.0, 1.0, 1.0],
+        "avg_week_gap":    [1.0, 1.0, 1.0, 1.0],
+        "low_support":     [False, False, False, False],
+    })
+    deep = nsg.possible_journeys(branchy, from_need_state=0, depth=2)
+    partial = nsg.possible_journeys(branchy, from_need_state=0, depth=2,
+                                    include_partial=True)
+    deep_steps = sorted({int(s) for s in deep["n_steps"]})
+    partial_steps = sorted({int(s) for s in partial["n_steps"]})
+    if deep_steps != [2]:
+        ok = _fail(f"the default should return only full-depth paths; got n_steps "
+                   f"{deep_steps} for depth=2")
+    elif partial_steps != [1, 2]:
+        ok = _fail(f"include_partial=True should also return the shorter paths "
+                   f"visited on the way; got n_steps {partial_steps}")
+    elif int(partial.iloc[0]["n_steps"]) != 1:
+        ok = _fail("include_partial=True should still sort by path_prob, which puts "
+                   "a 1-step path first — that is the behaviour the default avoids")
+    else:
+        print("  possible_journeys: full-depth only by default, include_partial "
+              "restores the mix — OK")
+
+    # A need-state nobody leaves must return its deepest reachable path, not
+    # an empty frame: `deepest` is the beam at the last PRODUCTIVE step.
+    dead_end = pd.DataFrame({
+        "from_need_state": [0], "to_need_state": [1], "n_transitions": [10],
+        "prob": [0.9], "lift": [1.0], "avg_week_gap": [1.0], "low_support": [False],
+    })
+    stub = nsg.possible_journeys(dead_end, from_need_state=0, depth=3)
+    if len(stub) != 1 or tuple(stub.iloc[0]["path"]) != (0, 1):
+        ok = _fail(f"a chain that dies after one step should still return (0,1); "
+                   f"got {[tuple(p) for p in stub['path']]}")
+    else:
+        print("  possible_journeys: a chain shorter than `depth` returns what "
+              "exists, not nothing — OK")
 
     # ── adjacency, hand-computed ─────────────────────────────────────────
     # clusters: 1_1,2_1 -> ns0 ; 3_1,4_1 -> ns1
@@ -2611,6 +2674,131 @@ def check_clustering_progress():
 # ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
+# 9c. ADJACENCY PARITY (pandas vs SQL)
+# ─────────────────────────────────────────────
+
+def check_adjacency_parity():
+    """
+    need_state_adjacency.parquet and the Excel workbook must report the SAME
+    `lift` for the same pair.
+
+    They did not, until 2026-09-30. Two implementations of "observed over
+    expected" existed:
+
+      need_state_graph.build_need_state_adjacency()  weight_sum, and
+          WITHIN-state edges included in the degree term
+      export_need_states.adjacency()                 n_edges, and within-state
+          edges filtered out BEFORE the degree was computed
+
+    Most edges in a kNN graph are within-state, so the second denominator was
+    several times smaller and the two columns were on different scales under
+    one name. Both were defensible; having both silently was not. The export
+    now computes the configuration-model version as `lift` and keeps its old
+    quantity as `cross_lift`.
+
+    Nothing about that is visible from either file alone, and a drift would
+    not crash — it would just put two different numbers in front of whoever
+    reads the workbook. So it is pinned here, against a fixture small enough
+    to verify by hand:
+
+        clusters : 1_1, 2_1 -> ns0 ;  3_1, 4_1 -> ns1
+        edges    : (1_1,3_1,w=1) (2_1,3_1,w=2) (1_1,4_1,w=3)  cross 0-1
+                   (1_1,2_1,w=4)                              within ns0
+        pairs    : (0,0) w=4 n=1 ; (0,1) w=6 n=3
+        deg(0)   = 4 + 6 + 4 = 14      (the self-pair counts at BOTH endpoints)
+        deg(1)   = 6
+        total_w  = 10
+        expected(0,1) = 14 * 6 / (2 * 10) = 4.2
+        lift          = 6 / 4.2          = 1.428571
+    """
+    print()
+    print("=" * 70)
+    print("9c. ADJACENCY PARITY: pandas and SQL must agree on `lift`")
+    print("=" * 70)
+
+    import need_state_graph as nsg
+    import export_need_states as ens
+    import duckdb_manager
+
+    ok = True
+    edges_path = Path("test_adjacency_edges.parquet")
+
+    clusters = pd.DataFrame({
+        "basket_id": ["1_1", "2_1", "3_1", "4_1"],
+        "need_state_cluster": [0, 0, 1, 1],
+    })
+    edges = pd.DataFrame({
+        "basket_a": ["1_1", "2_1", "1_1", "1_1"],
+        "basket_b": ["3_1", "3_1", "4_1", "2_1"],
+        "weight":   [1.0, 2.0, 3.0, 4.0],
+    })
+
+    try:
+        edges.to_parquet(edges_path, index=False)
+
+        pandas_adj = nsg.build_need_state_adjacency(edges, clusters)
+        con = duckdb_manager.get_connection()
+        sql_adj = ens.adjacency(con, str(edges_path), clusters, top_n=100)
+
+        hand_computed = 6.0 / 4.2
+        p_row = pandas_adj[(pandas_adj["need_state_a"] == 0)
+                           & (pandas_adj["need_state_b"] == 1)]
+        s_row = sql_adj[(sql_adj["need_state_a"] == 0) & (sql_adj["need_state_b"] == 1)]
+
+        if p_row.empty or s_row.empty:
+            ok = _fail(f"pair (0,1) missing — pandas rows {len(pandas_adj)}, "
+                       f"sql rows {len(sql_adj)}")
+        else:
+            p_lift = float(p_row.iloc[0]["lift"])
+            s_lift = float(s_row.iloc[0]["lift"])
+            # SQL rounds to 3 dp on the way out, so compare at that tolerance.
+            if not np.isclose(p_lift, hand_computed, atol=1e-6):
+                ok = _fail(f"pandas lift is {p_lift:.6f}, hand-computed "
+                           f"{hand_computed:.6f} — build_need_state_adjacency's "
+                           f"configuration-model null has changed")
+            elif not np.isclose(s_lift, hand_computed, atol=1e-3):
+                ok = _fail(f"SQL lift is {s_lift:.6f} but pandas and the hand "
+                           f"calculation give {hand_computed:.6f}. The two "
+                           f"implementations have drifted again — most likely the "
+                           f"SQL is filtering within-state pairs before computing "
+                           f"`deg`, or using n_edges where pandas uses weight_sum.")
+            else:
+                print(f"  lift(0,1) = {hand_computed:.6f} from the hand calculation, "
+                      f"pandas AND SQL — OK")
+
+            if "cross_lift" not in sql_adj.columns:
+                ok = _fail("the export lost its `cross_lift` column — the "
+                           "cross-edges-only reading is still wanted, just not "
+                           "under the name `lift`")
+            else:
+                # Cross-only: m = 3 edges, deg(0) = deg(1) = 3, so
+                # (3/3) / ((3/6)*(3/6)*2) = 1 / 0.5 = 2.0
+                cross = float(s_row.iloc[0]["cross_lift"])
+                if not np.isclose(cross, 2.0, atol=1e-3):
+                    ok = _fail(f"cross_lift should be 2.0 on this fixture "
+                               f"(m=3, deg=3/3), got {cross}")
+                elif np.isclose(cross, p_lift, atol=1e-3):
+                    ok = _fail("cross_lift equals lift, so the two nulls are no "
+                               "longer distinct and one of them is mislabelled")
+                else:
+                    print(f"  cross_lift = {cross:.3f}, distinct from lift "
+                          f"{p_lift:.3f} as intended — OK")
+
+        if (pandas_adj["need_state_a"] == pandas_adj["need_state_b"]).any():
+            ok = _fail("pandas adjacency emitted a self-pair — they belong in the "
+                       "degree term but not in the output")
+        elif (sql_adj["need_state_a"] == sql_adj["need_state_b"]).any():
+            ok = _fail("SQL adjacency emitted a self-pair")
+        else:
+            print("  self-pairs counted in `deg`, excluded from both outputs — OK")
+    finally:
+        edges_path.unlink(missing_ok=True)
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
+# ─────────────────────────────────────────────
 # 9b. MEAN-EMBEDDING CONTROL
 # ─────────────────────────────────────────────
 
@@ -2990,6 +3178,8 @@ def main():
         checks.append(("functional / parity / basket store", check_functional))
         checks.append(("product key wiring / embeddings reach the graph",
                        check_product_key_wiring))
+        # Needs DuckDB (the SQL half), so it lives in the non-fast group.
+        checks.append(("adjacency parity / pandas vs SQL", check_adjacency_parity))
     if args.prod_outputs:
         checks.append(("prod outputs", check_prod_outputs))
 

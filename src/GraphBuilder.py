@@ -23,9 +23,16 @@ Summary of the theme-free architecture:
     purely co-purchase-derived signal.
   - There is no theme_ids array, no theme_score node feature, and no
     product_theme parameter anywhere in this file.
-  - Node feature layout is now: [product_embedding] + [cp_score] +
-    [sub_cluster_id] + [distinctiveness] + [log_units]  ->  in_dim = D + 4
-    (previously D + 5, with the removed dimension being theme_score).
+  - Node feature layout is: [product_embedding] + [cp_score] +
+    [distinctiveness] + [log_units]  ->  in_dim = D + 3.
+    History, because it matters for reading any cached artifact: D + 5 when
+    theme_score existed, D + 4 after it went, D + 3 since 2026-09-30 when
+    sub_cluster_id was dropped (see prepare_globals' docstring — it was a
+    ~400-way nominal label flattened onto one scalar, and a deterministic
+    function of the embedding already present in full in the same row).
+  - Product ids are VARCHAR on both sides of the embedding join. They were
+    not until 2026-09-30, and the mismatch meant the product embedding never
+    reached a single node — see _check_product_key_overlap.
   - Training-graph construction (build once) lives in lmdb_graph_cache.py,
     caching to LMDB rather than one big in-memory list. Inference
     (run_inference / _embed_basket_chunk, below) builds a REAL per-basket
@@ -39,8 +46,9 @@ Summary of the theme-free architecture:
     function, used everywhere.
 
 IMPORTANT — this is a breaking change to cached artifacts. in_dim changed
-(D+5 -> D+4) and the sub-clustering algorithm changed (per-theme KMeans ->
-global MiniBatchKMeans), so every previously-cached file is stale and
+(D+5 -> D+4 -> D+3), the node feature VALUES changed (product embeddings now
+actually reach the nodes), and the sub-clustering algorithm changed (per-theme
+KMeans -> global MiniBatchKMeans), so every previously-cached file is stale and
 incompatible:
     product_subclusters.pkl, basket_gnn_model.pt, copurchase_sparse.npz,
     product_id_to_index.pkl, product_units_avg.pkl
@@ -290,7 +298,13 @@ def build_product_subclusters(product_embedding):
 
     Returns
     -------
-    product_subcluster     : dict  tpnb -> normalised sub-cluster id float [0,1]
+    product_subcluster     : dict  tpnb -> normalised sub-cluster id float [0,1].
+                             DISCARDED by prepare_globals since 2026-09-30 — it
+                             is not a node feature any more. Still returned
+                             because the labels are what distinctiveness is
+                             measured against, and because a caller wanting to
+                             PROFILE need-states by product group would want
+                             them. See prepare_globals' docstring.
     product_distinctiveness: dict  tpnb -> float [0,1]
     best_k                  : int  (for reference/logging)
     """
@@ -479,12 +493,26 @@ def prepare_globals(product_embedding, product_id_to_index,
     product is of its neighbourhood — a density property that is not linearly
     recoverable from the vector itself.
 
+    `product_units_avg` is currently UNUSED — see the comment beside
+    distinctiveness_arr below. It stays in the signature because
+    product_units_avg.pkl is part of the on-disk contract score_new_baskets.py
+    reads, and because the queued units-vs-typical-units feature needs exactly
+    this argument.
+
     No theme/category parameter anywhere in this function's signature —
     need-states are discovered downstream of basket embeddings; nothing
     here segments products by category first.
     """
     print("  Building embedding matrix...")
     n_products = len(product_id_to_index)
+    if not product_embedding:
+        # Otherwise this is a bare StopIteration out of next(iter(...)) two
+        # lines down, which says nothing about what is actually wrong.
+        raise ValueError(
+            "product_embedding is empty — no product vectors were loaded. Run "
+            "build_product_embeddings.py, and check that the parquet it wrote "
+            "under PIPELINE_OUTPUT_DIR is non-empty."
+        )
     sample_emb = next(iter(product_embedding.values()))
     emb_dim    = len(sample_emb)
 
