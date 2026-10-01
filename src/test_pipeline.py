@@ -53,6 +53,15 @@ WHAT IS CHECKED, AND WHY EACH ONE EXISTS
                     reports. Both are pinned against the implementation they
                     replaced — observability was the goal, changed cluster
                     assignments would be a regression.
+ 7c SCORECARD      evaluate_run.py's three guards against misreading the log:
+                    the lift-basis warning must fire whenever ANY row is not on
+                    the current basis (it used to `.dropna()` the legacy rows
+                    away, and it treated an ALL-stale log as safe when that is
+                    the worst case — four of seven log shapes were silent);
+                    `excess` must reproduce the published observed-minus-own-null
+                    figures; and rows with no null must sort LAST, since an
+                    unranked row at the top of a "best first" table is worse
+                    than no sort.
  9b MEAN-EMBEDDING  `baseline_mean_embedding._basket_means`, the control the GNN
    CONTROL          gets judged against. Products with no embedding must be
                     DROPPED from a basket's mean, not averaged in as zeros, and
@@ -2674,6 +2683,151 @@ def check_clustering_progress():
 # ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
+# 7c. SCORECARD — basis warning, excess, sort order
+# ─────────────────────────────────────────────
+
+def check_scorecard():
+    """
+    evaluate_run.py's three guards against reading the log wrong.
+
+    1. THE BASIS WARNING MUST FIRE WHENEVER ANY ROW IS NOT ON THE CURRENT
+       BASIS. This is the one that was broken. The check used to be
+       `len(set(log["lift_basis"].dropna())) > 1`, which failed two ways:
+         * `.dropna()` discarded legacy rows, so a log of 4 pre-fix rows plus
+           1 current row collapsed to a single basis and printed nothing —
+           precisely the state a part-way migration sits in;
+         * "more than one distinct basis" treats an ALL-stale log as safe,
+           when it is the worst case: the inflation differs per run (1.00x for
+           a run that labelled everything, 3.07x for one that labelled ~12% of
+           the item-rows), so such a log looks internally rankable and is not.
+           That is exactly the 1.949-vs-5.03 pair in SEED_HISTORY.
+       Four of the seven log shapes below were silent misses.
+
+    2. `excess` = observed − this run's OWN null, and must reproduce the
+       published figures. Raw median_max_lift carries a cluster-size-dependent
+       floor (nulls measured 1.199 to 1.261), so it is not comparable across
+       runs; excess is. Pinned against BASKET_BANDING_DESIGN.md section 6.
+
+    3. Rows with no null must sort LAST, not first and not interleaved. An
+       unranked row sitting at the top of a table sorted "best first" is worse
+       than no sort at all.
+    """
+    print()
+    print("=" * 70)
+    print("7c. SCORECARD: lift-basis warning, excess, sort order")
+    print("=" * 70)
+
+    import tempfile
+
+    import evaluate_run as er
+
+    ok = True
+
+    # ── 1. the basis verdict, over every log shape that can occur ────────
+    UNRECORDED = "(pre-fix, unrecorded)"
+
+    def verdict(col_present, values, n_rows):
+        """Mirrors show()'s decision, without capturing its stdout."""
+        if col_present:
+            bases = sorted({UNRECORDED if pd.isna(v) else str(v) for v in values})
+        else:
+            bases = [UNRECORDED] if n_rows else []
+        stale = [b for b in bases if b != er.LIFT_BASIS]
+        if stale and er.LIFT_BASIS in bases:
+            return "MIXED"
+        return "ALL-STALE" if stale else "silent"
+
+    shapes = [
+        ("4 pre-fix rows, no lift_basis column", False, [], 4, "ALL-STALE"),
+        ("4 legacy + 1 current", True, [None] * 4 + [er.LIFT_BASIS], 5, "MIXED"),
+        ("--seed-history on a fresh log: 2 population", True, ["population"] * 2, 2, "ALL-STALE"),
+        ("2 population + 2 current", True, ["population"] * 2 + [er.LIFT_BASIS] * 2, 4, "MIXED"),
+        ("legacy + population, none current", True, [None, "population"], 2, "ALL-STALE"),
+        ("fully re-scored: 4 current", True, [er.LIFT_BASIS] * 4, 4, "silent"),
+        ("empty log", False, [], 0, "silent"),
+    ]
+    basis_ok = True
+    for label, present, vals, n, want in shapes:
+        got = verdict(present, vals, n)
+        if got != want:
+            basis_ok = False
+            ok = _fail(f"basis verdict for '{label}': got {got}, expected {want}")
+    # The whole point is that a stale row cannot hide. Assert the two shapes a
+    # migration actually passes through are NOT silent, explicitly — this is
+    # the regression itself, not a derived property.
+    for label, present, vals, n, _ in shapes[:2]:
+        if verdict(present, vals, n) == "silent":
+            basis_ok = False
+            ok = _fail(f"'{label}' is silent — this is the regression that let a "
+                       f"mixed-basis log be read as a ranking")
+    if basis_ok:
+        print(f"  lift-basis verdict correct on all {len(shapes)} log shapes "
+              f"(warns unless every row is '{er.LIFT_BASIS}') — OK")
+
+    # ── 2. excess, against the published figures ─────────────────────────
+    published = [("baseline", 1.949, 1.255, 0.694), ("M 11-20", 1.811, 1.234, 0.577),
+                 ("L 21+", 1.732, 1.261, 0.471), ("S <=10", 1.639, 1.199, 0.440)]
+    excess_ok = True
+    for name, obs, null, want in published:
+        row = er.attach_null({"run": name, "median_max_lift": obs},
+                             {"run": f"{name}_SHUFFLED", "median_max_lift": null})
+        if abs(row["excess"] - want) > 1e-9:
+            excess_ok = False
+            ok = _fail(f"excess for {name}: {obs} - {null} gave {row['excess']}, "
+                       f"BASKET_BANDING_DESIGN.md section 6 says {want}")
+        elif row["null_run"] != f"{name}_SHUFFLED":
+            excess_ok = False
+            ok = _fail("attach_null dropped the null's provenance (null_run)")
+        elif row["null_median_max_lift"] != null:
+            excess_ok = False
+            ok = _fail("attach_null dropped null_median_max_lift")
+    if excess_ok:
+        print(f"  excess reproduces all {len(published)} published figures, with "
+              f"null provenance retained — OK")
+
+    # ── 3. sort order, through a real append() round-trip ─────────────────
+    with tempfile.TemporaryDirectory() as td:
+        log_path = str(Path(td) / "experiment_log.csv")
+
+        # A legacy CSV with no excess and no lift_basis column at all — the
+        # shape append() actually has to migrate.
+        pd.DataFrame([
+            {"run": "legacy_a", "median_max_lift": 9.9},
+            {"run": "legacy_b", "median_max_lift": 5.0},
+        ]).to_csv(log_path, index=False)
+
+        er.append(er.attach_null(
+            {"run": "scored_low", "median_max_lift": 1.6, "lift_basis": er.LIFT_BASIS},
+            {"run": "scored_low_SHUFFLED", "median_max_lift": 1.2}), log_path)
+        out = er.append(er.attach_null(
+            {"run": "scored_high", "median_max_lift": 1.9, "lift_basis": er.LIFT_BASIS},
+            {"run": "scored_high_SHUFFLED", "median_max_lift": 1.25}), log_path)
+
+        order = out["run"].tolist()
+        # excess: scored_high 0.65, scored_low 0.40, legacies NaN.
+        # A median_max_lift sort would have put legacy_a (9.9) first.
+        if order[:2] != ["scored_high", "scored_low"]:
+            ok = _fail(f"log should be ordered by excess (scored_high, scored_low, "
+                       f"then the un-nulled rows); got {order}")
+        elif set(order[2:]) != {"legacy_a", "legacy_b"}:
+            ok = _fail(f"rows with no null must sort LAST; got {order}")
+        elif order[0] == "legacy_a":
+            ok = _fail("a 9.9 median_max_lift with no null sorted first — the sort is "
+                       "still on median_max_lift")
+        elif not out.loc[out["run"] == "legacy_a", "excess"].isna().all():
+            ok = _fail("legacy rows must have NaN excess, not 0")
+        elif list(out.columns) != er.COLUMNS:
+            ok = _fail(f"append() did not normalise the legacy CSV to COLUMNS; got "
+                       f"{list(out.columns)}")
+        else:
+            print("  append(): excess-descending, un-nulled rows last, legacy CSV "
+                  "migrated to the full column set — OK")
+
+    print("PASSED" if ok else "FAILED")
+    return ok
+
+
+# ─────────────────────────────────────────────
 # 9c. ADJACENCY PARITY (pandas vs SQL)
 # ─────────────────────────────────────────────
 
@@ -3169,6 +3323,7 @@ def main():
         ("co-purchase additivity", check_copurchase_chunk_additivity),
         ("need-state graph", check_need_state_graph),
         ("lift formula / profile baseline", check_lift_formula),
+        ("scorecard / basis warning, excess, sort order", check_scorecard),
         ("clustering progress / graph build / Leiden parity", check_clustering_progress),
         ("graph coverage / no silent label loss", check_graph_coverage),
         ("label cache / no stale Leiden labels", check_label_cache),

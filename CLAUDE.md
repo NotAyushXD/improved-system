@@ -448,8 +448,11 @@ no lift number in this repository describes the model as it now stands. Order:
 
 # 3. the only thing that says whether it worked
 .\.venv\Scripts\python.exe -u .\profile_need_states.py
-.\.venv\Scripts\python.exe -u .\evaluate_run.py --clusters <labels> --note "post embedding fix"
-#    plus its OWN permutation null — the floor moves with cluster size
+#    Each run needs its OWN null: the floor moves with cluster size (measured
+#    1.199-1.261), so raw median_max_lift is not comparable across runs.
+#    --null-clusters scores the null and records excess = observed - null.
+.\.venv\Scripts\python.exe -u .\profile_need_states.py --clusters <shuffled labels>
+.\.venv\Scripts\python.exe -u .\evaluate_run.py --clusters <labels> --null-clusters <shuffled labels> --note "post embedding fix"
 ```
 
 `copurchase_sparse.npz` and `product_subclusters.pkl` survive the fix (the

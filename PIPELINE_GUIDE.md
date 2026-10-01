@@ -673,7 +673,7 @@ a run produced anything meaningful:
 | script | what it gives you |
 |---|---|
 | `profile_need_states.py` | per (need-state, product) **lift**: the product's share of that need-state's ITEMS over its share of all items. Plus a summary per need-state (size, households, avg basket size, signature coverage) and four banded insight tables. Outputs are named after the label file they describe, so runs accumulate instead of overwriting each other. |
-| `evaluate_run.py` | one row per run appended to `experiment_log.csv` — `median_max_lift`, `pct_lift_over_3`, `median_twin_jaccard`, `largest_share`. This is the scorecard; "did this iteration do better" becomes a table lookup. |
+| `evaluate_run.py` | one row per run appended to `experiment_log.csv`. Pass `--null-clusters <shuffled labels>` and it scores the null too and records **`excess`** = observed − that run's own null. `excess` is the headline and the sort key; rows without a null get none and sort last. This is the scorecard; "did this iteration do better" becomes a table lookup. |
 | `export_need_states.py` | one Excel workbook (plus CSVs) across every discovered run: scorecard, per-need-state summary, per-product detail, adjacency, transitions. |
 
 **Lift is an ITEM-share ratio, deliberately, and that is load-bearing.** Basket
@@ -778,10 +778,13 @@ python .\test_pipeline.py --fast --prod-outputs
 
 # 9. Find out what the need-states ARE, and score the run
 python -u .\profile_need_states.py
-python -u .\evaluate_run.py --clusters <the label file from step 6> --note "what was different"
-#    ...then build the permutation null for this run and compare — see
-#    BASKET_BANDING_DESIGN.md section 5. Observed lift without its own null
-#    is not a result.
+#    Build this run's permutation null first (shuffle the non-UNCLUSTERED
+#    labels, keep the size distribution), profile it, then score both in one
+#    call. `excess` = observed - its OWN null is the comparable number;
+#    observed lift alone is not a result. Commands: evaluate_run.py's
+#    docstring, method: BASKET_BANDING_DESIGN.md section 5.
+python -u .\profile_need_states.py --clusters <shuffled labels>
+python -u .\evaluate_run.py --clusters <the label file from step 6> --null-clusters <shuffled labels> --note "what was different"
 
 # 10. OPTIONAL but recommended once — is the GNN beating a plain average?
 python -u .\baseline_mean_embedding.py

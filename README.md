@@ -50,7 +50,10 @@ python .\test_pipeline.py --fast --prod-outputs   # confirm the output means som
 
 # Find out what the need-states ARE. Without this they are just integers.
 python -u .\profile_need_states.py
-python -u .\evaluate_run.py --clusters <the label file> --note "what was different"
+# Build this run's permutation null, profile it, then score both together.
+# `excess` (observed minus its OWN null) is the only lift number comparable
+# across runs — raw lift has a cluster-size-dependent floor.
+python -u .\evaluate_run.py --clusters <labels> --null-clusters <shuffled labels> --note "what was different"
 ```
 
 `cluster_basket_embeddings.py --build-edges` rebuilds *only* the kNN graph,
